@@ -17,20 +17,18 @@ import type { TaskFilters, TaskId } from '../../tasks/types';
  * Outcome of parsing a submitted form.
  *
  * - `ok: true` — `value` is the typed, validated input, ready for the service call.
- * - `ok: false` — `errors` maps a field name to its exact user-facing message, and `values` holds
- *   what the page re-renders. `values` never contains a password.
+ * - `ok: false` — `errors` maps a field of the re-render values `V` to its exact user-facing
+ *   message, and `values` holds what the page re-renders. `values` never contains a password.
  *
- * Error keys are deliberately widened from `keyof V` to `keyof T | keyof V`: the sign-up form's
- * re-render values (`{ email; next }`) carry no password, yet its `password` field needs an inline
- * message. For the task form the input and value types share their keys, so the widening changes
- * nothing there.
+ * A form that shows a message beside a field its values never re-render, such as the sign-up
+ * password, refines the failure branch in its own module instead of widening this shared type.
  *
  * @typeParam T - The validated input type.
  * @typeParam V - The raw re-render values type.
  */
 export type FormResult<T, V> =
   | { ok: true; value: T }
-  | { ok: false; errors: Partial<Record<keyof T | keyof V, string>>; values: V };
+  | { ok: false; errors: Partial<Record<keyof V, string>>; values: V };
 
 /** Inline message for a status that is not one of the task status labels. */
 export const INVALID_STATUS_MESSAGE = 'Choose a valid status.';
@@ -67,6 +65,23 @@ export function readField(source: unknown, name: string): string | undefined {
     throw new BadRequestError();
   }
   return value;
+}
+
+/**
+ * Rejects text that PostgreSQL cannot store.
+ *
+ * PostgreSQL `text`, whether a column or a bound parameter, cannot hold U+0000, so a field that
+ * reaches SQL with one would fail in the database (SQLSTATE 22021) after the request had been
+ * accepted. Rejecting it here makes it the malformed request it is: a 400 before any write, so
+ * no data changes.
+ *
+ * @param text - A submitted value that will be bound to a SQL parameter.
+ * @throws {@link BadRequestError} when `text` contains U+0000.
+ */
+export function assertStorableText(text: string): void {
+  if (text.includes('\u0000')) {
+    throw new BadRequestError();
+  }
 }
 
 /**

@@ -3,11 +3,17 @@
  *
  * The function is pure. Every field-level problem is returned as an inline message, all of them at
  * once, together with the raw submitted strings so the page can be re-rendered with the entered
- * values and nothing saved. Only a malformed body, a repeated or non-string field, throws
- * `BadRequestError` (400), through {@link readField}.
+ * values and nothing saved. Only a malformed body throws `BadRequestError` (400): a repeated or
+ * non-string field, through {@link readField}, or a title or description containing U+0000,
+ * which PostgreSQL text cannot store, through {@link assertStorableText}.
  */
 
-import { INVALID_PRIORITY_MESSAGE, INVALID_STATUS_MESSAGE, readField } from './params';
+import {
+  assertStorableText,
+  INVALID_PRIORITY_MESSAGE,
+  INVALID_STATUS_MESSAGE,
+  readField,
+} from './params';
 import type { FormResult } from './params';
 import {
   DEFAULT_PRIORITY,
@@ -91,7 +97,8 @@ function codePointLength(text: string): number {
  * @param body - `req.body` from `express.urlencoded({ extended: false })`, typed as `unknown`.
  * @returns `{ ok: true, value }` with the trimmed title and the other fields as validated, or
  *   `{ ok: false, errors, values }` with every failed field's message and the raw submitted values.
- * @throws `BadRequestError` when a field is repeated or otherwise not a single string.
+ * @throws `BadRequestError` when a field is repeated or otherwise not a single string, or when
+ *   the title or description contains U+0000.
  */
 export function parseTaskForm(body: unknown): FormResult<TaskInput, TaskFormValues> {
   const values: TaskFormValues = {
@@ -101,6 +108,11 @@ export function parseTaskForm(body: unknown): FormResult<TaskInput, TaskFormValu
     priority: readField(body, 'priority') ?? '',
     dueDate: readField(body, 'dueDate') ?? '',
   };
+  // A malformed request returns 400 and changes no data. PostgreSQL text cannot store U+0000, so
+  // a title or description holding one is malformed rather than an inline error. The other
+  // fields reach SQL only as an exact label or a valid date, so they need no such check.
+  assertStorableText(values.title);
+  assertStorableText(values.description);
   const errors: Partial<Record<keyof TaskFormValues, string>> = {};
 
   const title = values.title.trim();
