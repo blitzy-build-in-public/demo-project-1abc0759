@@ -95,7 +95,8 @@ async function rollBack(client: PoolClient): Promise<boolean> {
  * also when nothing was pending. A failure is not logged here; it is rethrown for the caller to
  * log. The lock is always released and the client returned exactly once. When the unlock itself
  * fails, that is logged as `migration unlock failed` and the connection is destroyed instead,
- * which ends its session and so frees the lock.
+ * which ends its session and so frees the lock. A logger that throws while reporting the unlock
+ * failure prevents neither that release nor the run's own outcome: its error is dropped.
  *
  * @param pool - Pool to check the runner's client out of.
  * @param logger - Receives the `migrations applied` and `migration unlock failed` entries.
@@ -146,18 +147,30 @@ export async function runMigrations(
     logger.info('migrations applied', { count: applied.length, versions: applied.join(',') });
     return applied;
   } finally {
-    if (locked) {
-      try {
-        await query(client, UNLOCK_SQL, []);
-      } catch (err) {
-        logger.error('migration unlock failed', err);
-        destroyConnection = true;
+    // The release sits in its own `finally`, so nothing on the unlock path can skip it.
+    try {
+      if (locked) {
+        try {
+          await query(client, UNLOCK_SQL, []);
+        } catch (err) {
+          // Destroying the connection ends its session and so frees the lock. It is decided
+          // before the failure is logged, so a failing logger cannot keep the lock held.
+          destroyConnection = true;
+          try {
+            logger.error('migration unlock failed', err);
+          } catch {
+            // Dropped on purpose: the unlock failure is already handled by destroying the
+            // connection, and the run's own outcome (the applied versions, or the migration
+            // error already in flight) must stand rather than be replaced by the logger's.
+          }
+        }
       }
-    }
-    if (destroyConnection) {
-      client.release(true);
-    } else {
-      client.release();
+    } finally {
+      if (destroyConnection) {
+        client.release(true);
+      } else {
+        client.release();
+      }
     }
   }
 }
