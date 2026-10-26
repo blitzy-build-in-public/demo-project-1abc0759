@@ -37,8 +37,8 @@ const UNREACHABLE_MESSAGE =
  *
  * @returns Resolves once the database is fully migrated and the pool is closed.
  * @throws Error from the `_test` guard when `DATABASE_URL` is unset, unparseable, not a
- *   `postgres://` or `postgresql://` URL, or names a database whose name does not end in `_test`;
- *   no connection is opened in that case.
+ *   `postgres://` or `postgresql://` URL, contains a raw space or a malformed percent-escape, or
+ *   names a database whose name does not end in `_test`; no connection is opened in that case.
  * @throws Error with the unreachable-database message, keeping the data-access error as `cause`,
  *   when the database cannot be reached.
  * @throws Any other migration failure, unchanged.

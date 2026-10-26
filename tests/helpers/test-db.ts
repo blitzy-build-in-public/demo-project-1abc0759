@@ -29,18 +29,34 @@ const TEST_DATABASE_SUFFIX = '_test';
 const POSTGRES_PROTOCOLS: readonly string[] = ['postgres:', 'postgresql:'];
 
 /**
+ * Matches a raw space anywhere in a connection string, or a `%` not followed by two hex digits,
+ * including a `%` or `%X` at the very end.
+ *
+ * `pg`'s connection-string parser re-encodes a string containing either before it reads the
+ * database: it applies `encodeURI` and restores only `%25` followed by two decimal digits, so an
+ * escape such as `%5F` survives as the literal text `%5F` in the database name. The name checked
+ * here would then not be the name `pg` connects to, so the guard refuses such strings outright.
+ * A `%` or `%X` at the very end is left alone by that rewrite but is no valid escape either, so
+ * it is refused with the rest.
+ */
+const DRIVER_REWRITTEN_URL = / |%(?![0-9a-f]{2})/i;
+
+/**
  * Returns `url` once it is a `postgres://` or `postgresql://` URL naming a database whose name
  * ends in `_test`, and throws otherwise.
  *
  * This is the guard that keeps resets and fixtures away from development and production data.
- * Only the scheme and the name are checked: an unreachable URL such as
+ * Only the scheme, the encoding and the name are checked: an unreachable URL such as
  * `postgres://tasktracker:x@127.0.0.1:1/unreachable_test` passes, which the database-unavailable
- * tests rely on. No message includes the user name, the password or the URL itself.
+ * tests rely on. A URL that `pg` would re-encode before reading its database, because it holds a
+ * raw space or a malformed percent-escape, is refused, so the name checked is the name `pg`
+ * connects to. No message includes the user name, the password or the URL itself.
  *
  * @param url - A PostgreSQL connection string, usually `process.env.DATABASE_URL`.
  * @returns `url`, unchanged.
  * @throws Error when `url` is missing or empty, cannot be parsed as a URL, is not a
- *   `postgres://` or `postgresql://` URL, or names a database whose name does not end in `_test`.
+ *   `postgres://` or `postgresql://` URL, contains a raw space or a `%` not followed by two hex
+ *   digits, or names a database whose name does not end in `_test`.
  */
 export function assertTestDatabaseUrl(url: string | undefined): string {
   if (url === undefined || url === '') {
@@ -58,6 +74,15 @@ export function assertTestDatabaseUrl(url: string | undefined): string {
   if (!POSTGRES_PROTOCOLS.includes(parsed.protocol)) {
     throw new Error('DATABASE_URL must be a postgres:// connection string');
   }
+  // With rewrites refused, `pg` parses this exact string with the same WHATWG parser. `_test` is
+  // all unreserved characters, so `pg`'s `decodeURI` of the path and the `decodeURIComponent`
+  // below reach the same verdict on the suffix.
+  if (DRIVER_REWRITTEN_URL.test(url)) {
+    throw new Error(
+      'DATABASE_URL must not contain a raw space or a malformed percent-escape; ' +
+        'encode them as %20 and %25',
+    );
+  }
   let name: string;
   try {
     name = decodeURIComponent(parsed.pathname.slice(1));
@@ -74,7 +99,7 @@ export function assertTestDatabaseUrl(url: string | undefined): string {
  * Returns `process.env.DATABASE_URL` after {@link assertTestDatabaseUrl} has accepted it.
  *
  * @returns The test database connection string.
- * @throws Error when the variable is unset or does not name a `_test` database.
+ * @throws Error when the variable is unset or {@link assertTestDatabaseUrl} refuses its value.
  */
 export function testDatabaseUrl(): string {
   return assertTestDatabaseUrl(process.env.DATABASE_URL);
@@ -144,10 +169,21 @@ export async function sql<R>(
 export const FIXTURE_PASSWORD_HASH = `$2b$12$${'N'.repeat(53)}`;
 
 /**
+ * The default fixture instant, `2026-10-21T09:00:00.000Z`, as epoch milliseconds. A number cannot
+ * be mutated, so every default fixture timestamp is a fresh `Date` built from it.
+ */
+const FIXTURE_TIME_MS = Date.parse('2026-10-21T09:00:00.000Z');
+
+/**
  * Default instant for fixture timestamps: `2026-10-21T09:00:00.000Z`, the same instant a new
  * `FakeClock` starts at, so fixtures and application writes line up by default.
+ *
+ * The fixture defaults never read this object: they build a fresh `Date` from the same instant
+ * on every call, so a test that mutates it through `setTime` or a setter cannot change any other
+ * fixture. `Object.freeze` would not prevent that, because Date setters change internal state
+ * rather than properties.
  */
-export const FIXTURE_TIME = new Date('2026-10-21T09:00:00.000Z');
+export const FIXTURE_TIME = new Date(FIXTURE_TIME_MS);
 
 /** A row holding only an identity value. */
 interface IdRow {
@@ -203,7 +239,7 @@ export interface TaskFixture {
   priority?: TaskPriority;
   /** Default `null` (no due date). */
   dueDate?: IsoDate | null;
-  /** Default {@link FIXTURE_TIME}. */
+  /** Default: a fresh `Date` at `2026-10-21T09:00:00.000Z`, the {@link FIXTURE_TIME} instant. */
   createdAt?: Date;
   /** Default: the later of `createdAt` and `completedAt`. */
   updatedAt?: Date;
@@ -229,9 +265,10 @@ function laterOf(a: Date, b: Date | null): Date {
  * Inserts a task for `ownerId` directly, bypassing the task service and its rules.
  *
  * Defaults: title `'Task'`, description `''`, status `'To do'`, priority `'Medium'`, no due date,
- * `createdAt` {@link FIXTURE_TIME}, `completedAt` equal to `createdAt` for a `Done` task and
- * `null` otherwise, and `updatedAt` the later of `createdAt` and `completedAt`. The defaults
- * always satisfy the table's checks.
+ * `createdAt` a fresh `Date` at `2026-10-21T09:00:00.000Z` (the {@link FIXTURE_TIME} instant,
+ * built anew on each call), `completedAt` equal to `createdAt` for a `Done` task and `null`
+ * otherwise, and `updatedAt` the later of `createdAt` and `completedAt`. The defaults always
+ * satisfy the table's checks.
  *
  * Explicit values are written verbatim, `completedAt: null` on a `Done` task included, so schema
  * tests can provoke check violations through this helper.
@@ -248,7 +285,8 @@ export async function insertTask(
   partial: TaskFixture = {},
 ): Promise<TaskRecord> {
   const status: TaskStatus = partial.status ?? 'To do';
-  const createdAt = partial.createdAt ?? FIXTURE_TIME;
+  // A fresh Date per call: the exported FIXTURE_TIME is mutable and is never shared with a row.
+  const createdAt = partial.createdAt ?? new Date(FIXTURE_TIME_MS);
   // `undefined` means "use the default"; an explicit `null` is kept, even for a `Done` task.
   const completedAt =
     partial.completedAt !== undefined
