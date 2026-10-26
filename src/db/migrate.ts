@@ -14,7 +14,7 @@ import path from 'node:path';
 import type { Pool, PoolClient } from 'pg';
 
 import type { Logger } from '../shared/logger';
-import { query } from './query';
+import { checkOut, query } from './query';
 
 /**
  * Takes the runner's session-level advisory lock, blocking until any other runner releases it.
@@ -104,15 +104,17 @@ async function rollBack(client: PoolClient): Promise<boolean> {
  * @returns The versions applied by this call, in the order they were applied; empty when none
  *   were pending.
  * @throws The first error met: checking out the client, taking the lock, reading the directory
- *   or a file, or running a migration (mapped to `DatabaseUnavailableError` by `query` when the
- *   database cannot be reached).
+ *   or a file, or running a migration. A database that cannot be reached, whether at checkout or
+ *   mid-run, surfaces as `DatabaseUnavailableError`.
  */
 export async function runMigrations(
   pool: Pool,
   logger: Logger,
   dir: string = path.join(__dirname, 'migrations'),
 ): Promise<string[]> {
-  const client = await pool.connect();
+  // Not `pool.connect()`: an unreachable database must surface as `DatabaseUnavailableError`
+  // already at checkout, like every other data-access failure to connect.
+  const client = await checkOut(pool);
   let locked = false;
   let destroyConnection = false;
   try {

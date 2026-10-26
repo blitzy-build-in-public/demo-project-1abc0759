@@ -173,8 +173,15 @@ export async function query<R>(
   return rows as R[];
 }
 
-/** Checks a client out of the pool, mapping a failure to connect. */
-async function checkOut(pool: Pool): Promise<PoolClient> {
+/**
+ * Checks one client out of `pool`, for statements that must share a database session.
+ *
+ * @param pool - The pool to check a client out of.
+ * @returns The client; the caller releases it exactly once.
+ * @throws {@link DatabaseUnavailableError} when the database cannot be reached; any other
+ *   failure to connect unchanged.
+ */
+export async function checkOut(pool: Pool): Promise<PoolClient> {
   try {
     return await pool.connect();
   } catch (err) {
