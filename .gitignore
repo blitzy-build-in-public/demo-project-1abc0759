@@ -1,0 +1,13 @@
+# Dependencies
+node_modules/
+
+# Build output (npm run build)
+dist/
+
+# Local environment, holds secrets; .env.example stays tracked
+.env
+
+# Test and coverage output
+coverage/
+test-results/
+playwright-report/
