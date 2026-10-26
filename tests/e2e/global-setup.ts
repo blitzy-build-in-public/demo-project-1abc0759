@@ -22,8 +22,9 @@ import { assertTestDatabaseUrl, createTestPool, truncateAll } from '../helpers/t
  * returned.
  *
  * @param _config - The resolved Playwright configuration; not needed by this setup.
- * @throws The guard's error for a missing or non-`_test` URL, or the first migration or
- *   truncation error; Playwright then aborts the run before any test starts.
+ * @throws The guard's error for a URL that is missing, not `postgres://` or `postgresql://`, or
+ *   not a `_test` database, or the first migration or truncation error; Playwright then aborts
+ *   the run before any test starts.
  */
 export default async function globalSetup(_config: FullConfig): Promise<void> {
   const url = assertTestDatabaseUrl(process.env.DATABASE_URL);

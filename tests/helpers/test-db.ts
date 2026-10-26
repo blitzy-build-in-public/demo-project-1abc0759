@@ -25,18 +25,22 @@ import { CaptureLogger } from './capture-logger';
 /** Suffix every database name must carry before a test may connect to it. */
 const TEST_DATABASE_SUFFIX = '_test';
 
+/** URL schemes whose database `pg` takes from the path, the only part the name check reads. */
+const POSTGRES_PROTOCOLS: readonly string[] = ['postgres:', 'postgresql:'];
+
 /**
- * Returns `url` once it names a database whose name ends in `_test`, and throws otherwise.
+ * Returns `url` once it is a `postgres://` or `postgresql://` URL naming a database whose name
+ * ends in `_test`, and throws otherwise.
  *
  * This is the guard that keeps resets and fixtures away from development and production data.
- * Only the name is checked: an unreachable URL such as
+ * Only the scheme and the name are checked: an unreachable URL such as
  * `postgres://tasktracker:x@127.0.0.1:1/unreachable_test` passes, which the database-unavailable
  * tests rely on. No message includes the user name, the password or the URL itself.
  *
  * @param url - A PostgreSQL connection string, usually `process.env.DATABASE_URL`.
  * @returns `url`, unchanged.
- * @throws Error when `url` is missing or empty, cannot be parsed as a URL, or names a database
- *   whose name does not end in `_test`.
+ * @throws Error when `url` is missing or empty, cannot be parsed as a URL, is not a
+ *   `postgres://` or `postgresql://` URL, or names a database whose name does not end in `_test`.
  */
 export function assertTestDatabaseUrl(url: string | undefined): string {
   if (url === undefined || url === '') {
@@ -48,6 +52,11 @@ export function assertTestDatabaseUrl(url: string | undefined): string {
   } catch {
     // The parser's own error quotes the input, which may carry the password.
     throw new Error('DATABASE_URL is not a valid URL');
+  }
+  // `pg` reads a `socket:` URL's database from its `db` query parameter rather than the path, so
+  // only schemes whose database is the path can be name-checked.
+  if (!POSTGRES_PROTOCOLS.includes(parsed.protocol)) {
+    throw new Error('DATABASE_URL must be a postgres:// connection string');
   }
   let name: string;
   try {
