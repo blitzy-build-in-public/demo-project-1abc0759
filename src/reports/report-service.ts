@@ -1,9 +1,10 @@
 /**
  * Report service: the summary, the completions per day and the CSV export for one user.
  *
- * It holds no state. Each method issues one owner-scoped read through `dal.tasks` and hands the
- * rows to the pure rules in `./summary`, `./completions` and `./csv`; the aggregation itself runs
- * in SQL. The report module reads task data only through `TasksRepo`, never through the task
+ * It holds no state. `summary`, `completions` and `exportCsv` each issue one owner-scoped read
+ * through `dal.tasks` and hand the rows to the pure rules in `./summary`, `./completions` and
+ * `./csv`; the aggregation itself runs in SQL. `today` takes no owner and reads only the injected
+ * clock. The report module reads task data only through `TasksRepo`, never through the task
  * module, so the auth, task and report modules stay independent of each other.
  *
  * Inputs are trusted: the web layer validates ranges with `parseDateRange` and statuses with
@@ -27,8 +28,9 @@ import type { SummaryReport } from './summary';
 /**
  * The reports available to a signed-in user, each scoped to the owner it is given.
  *
- * Every method passes `ownerId` straight to the repository, which filters on `owner_id`, so no
- * report ever includes another user's tasks.
+ * `summary`, `completions` and `exportCsv` pass `ownerId` straight to the repository, which
+ * filters on `owner_id`, so no report ever includes another user's tasks. `today` takes no owner
+ * and reads only the injected clock.
  */
 export interface ReportService {
   /**

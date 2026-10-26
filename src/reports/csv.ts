@@ -2,7 +2,7 @@
  * CSV assembly for the task export, following RFC 4180.
  *
  * Every function is pure: the report service passes in the owner-scoped task records it has read
- * and sends the returned string as the response body. Records are separated by CRLF, every record
+ * and returns the built CSV for the web layer to send. Records are separated by CRLF, every record
  * (the header included) ends with CRLF, and a field is quoted exactly when RFC 4180 requires it.
  */
 
@@ -45,8 +45,8 @@ const NEEDS_QUOTING = /[",\r\n]/;
  *
  * Cells beginning with `=`, `+`, `-`, `@`, tab or CR are deliberately written unchanged, with no
  * prefix to neutralise spreadsheet formulas: exported values must equal the stored task data, which
- * prefixing would alter, and the file holds only the requesting user's own task text, so any formula
- * in it was written by the person who opens it.
+ * prefixing would alter, and the file holds only the requesting user's own task text, so any
+ * formula in it was written by the person who opens it.
  *
  * @param value - The field's text exactly as it should read after parsing.
  * @returns The field as written in the file.
@@ -63,8 +63,8 @@ export function escapeCsvField(value: string): string {
  *
  * Text and labels are copied exactly as stored, line breaks included. The due date stays the stored
  * `YYYY-MM-DD` text, and both timestamps are ISO 8601 UTC with milliseconds (for example
- * `2026-10-21T09:15:30.123Z`), which equals the stored `timestamptz(3)` value. A missing due date or
- * completion time is an empty field. The owner and the update time are never exported.
+ * `2026-10-21T09:15:30.123Z`), which equals the stored `timestamptz(3)` value. A missing due date
+ * or completion time is an empty field. The owner and the update time are never exported.
  *
  * @param task - An owner-scoped task record.
  * @returns The unescaped field values; {@link buildCsv} applies the quoting.

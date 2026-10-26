@@ -24,8 +24,10 @@ export type TaskId = number;
 /**
  * The credentials needed to check a login, returned only by `UsersRepo.findCredentialsByEmail`.
  *
- * This is the only record that carries the password hash. It must never reach the web layer,
- * templates or logs; `AuthenticatedUser` is the shape passed upward instead.
+ * This is the only repository read result shape that carries the password hash, since no other
+ * repository function selects `password_hash`. It must never reach the web layer, templates or
+ * logs; `AuthenticatedUser` is the shape passed upward instead. {@link NewUserRow} also carries a
+ * hash, but only as the insert input to `UsersRepo.insert`.
  */
 export interface UserCredentials {
   /** The user's id. */

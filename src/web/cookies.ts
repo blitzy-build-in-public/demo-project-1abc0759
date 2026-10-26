@@ -25,10 +25,11 @@ export const CSRF_COOKIE = 'csrf';
 /**
  * Options for setting the session cookie at login.
  *
- * `Max-Age` mirrors the 8-hour absolute session limit, so the browser drops the cookie no later
- * than the server-side record expires. Express converts the millisecond `maxAge` into
- * `Max-Age=28800` plus a matching `Expires`. Signing requires the app to mount
- * `cookieParser(SESSION_SECRET)`.
+ * `Max-Age` mirrors only the 8-hour absolute session limit, so the cookie never outlives that cap.
+ * The 30-minute idle expiry is enforced server-side, so the session can end earlier while the
+ * browser still holds the cookie; the server then rejects that cookie and clears it. Express
+ * converts the millisecond `maxAge` into `Max-Age=28800` plus a matching `Expires`. Signing
+ * requires the app to mount `cookieParser(SESSION_SECRET)`.
  *
  * @param config - The application configuration; `isProduction` adds `Secure`.
  * @returns `HttpOnly; SameSite=Lax; Path=/; Max-Age=28800`, signed, plus `Secure` in production.

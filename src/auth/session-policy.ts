@@ -4,7 +4,9 @@
  *
  * This module is the single source of both limits. The auth service passes them to
  * `SessionsRepo.touchIfActive` as `{ absoluteMs, idleMs }`, so the SQL never hard-codes a duration.
- * Every function is pure and takes the current time as a parameter.
+ * Every function is pure: none performs I/O or reads a clock. `isSessionActive` receives the
+ * current time from its caller, and `computeExpiresAt` works only from the session's stored
+ * instants.
  */
 
 /** Maximum total age of a session: 8 hours, in milliseconds. */
