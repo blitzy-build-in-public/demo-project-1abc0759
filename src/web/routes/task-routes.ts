@@ -137,7 +137,9 @@ function toFormValues(task: Task): TaskFormValues {
  */
 export function createTaskRouter(deps: { tasks: TaskService; csrf: Csrf }): Router {
   const { tasks, csrf } = deps;
-  const router = express.Router();
+  // Exact matching, as the application sets for itself: a router does not inherit it, and
+  // `/TASKS` or `/tasks/new/` must reach the 404 handler rather than a route.
+  const router = express.Router({ caseSensitive: true, strict: true });
   // The session guard runs before the token check, so an unauthenticated POST is sent to the
   // login page rather than answered 403.
   const protectedPost = [requireAuth, csrf.verify('session')];

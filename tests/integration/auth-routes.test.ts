@@ -4,9 +4,11 @@
  *
  * Covered: sign-up and login success with the stored session row, cookie attributes per
  * `NODE_ENV`, validation and duplicate emails, the generic invalid-credentials answer, the
- * lockout timeline under the fake clock, login serialisation within one instance and across two
- * (two instances with separate pools are how replicas are emulated, plan 0.9.2), CSRF on every
- * form, the return path, logout, and signed-in users kept away from the anonymous pages.
+ * lockout timeline under the fake clock, the lockout key across email spellings (ASCII case
+ * variants share the account's key, and U+0130 variants never reach the account), login
+ * serialisation within one instance and across two (two instances with separate pools are how
+ * replicas are emulated, plan 0.9.2), CSRF on every form, the return path, logout, and signed-in
+ * users kept away from the anonymous pages.
  *
  * Every sign-up is a real cost-12 bcrypt hash and every login a compare, so each test signs up
  * at most two users. Messages are asserted verbatim against local constants, not the
@@ -203,8 +205,11 @@ beforeEach(async () => {
 });
 
 afterAll(async () => {
-  await app.close();
-  await pool.end();
+  try {
+    await app.close();
+  } finally {
+    await pool.end();
+  }
 });
 
 /**
@@ -480,6 +485,137 @@ describe('lockout timeline (SC2, plan 0.3.4)', () => {
     const res = await attempt(password);
     expect(res.status).toBe(303);
     expect(res.location).toBe('/tasks');
+  });
+});
+
+describe('lockout key across email spellings (plan 0.3.4)', () => {
+  // JavaScript lower-cases 'İ' (U+0130) to 'i' plus U+0307, while PostgreSQL's lower() gives a
+  // plain 'i'. A login that locked on the first and looked the account up with the second let
+  // spellings such as 'vİctim@example.com' reach victim@example.com under a fresh lockout key,
+  // and log in while that email was locked.
+
+  /** The registered account's email, which is also its lockout key. */
+  const CANONICAL_EMAIL = 'victim@example.com';
+
+  /** Gap between consecutive attempts, well inside the 15-minute lockout window. */
+  const ATTEMPT_GAP_MS = 1_000;
+
+  /**
+   * Spellings of {@link CANONICAL_EMAIL} with U+0130 in place of 'i'. PostgreSQL's `lower()`
+   * folds each to the canonical email, while {@link lockoutKey} gives a different, non-ASCII key.
+   */
+  const U0130_VARIANTS: readonly string[] = [
+    'v\u0130ctim@example.com',
+    'vict\u0130m@example.com',
+    'v\u0130ct\u0130m@example.com',
+    'V\u0130CT\u0130M@EXAMPLE.COM',
+  ];
+
+  /** The signed-up account and the anonymous client every attempt of a case posts from. */
+  interface Victim {
+    client: HttpClient;
+    token: string;
+    password: string;
+    userId: number;
+  }
+
+  /** Signs the canonical email up through the form, so its hash is a real cost-12 one. */
+  async function signUpVictim(): Promise<Victim> {
+    const password = newPassword();
+    const client = newClient(app);
+    expect((await signUp(client, CANONICAL_EMAIL, password)).status).toBe(303);
+    const userId = await userIdOf(pool, CANONICAL_EMAIL);
+    return { client, token: await fetchAnonToken(client), password, userId };
+  }
+
+  /** Posts one login for `email`, a second after the previous attempt. */
+  function attemptAfterGap(victim: Victim, email: string, password: string): Promise<HttpResult> {
+    clock.advance(ATTEMPT_GAP_MS);
+    return victim.client.post('/login', { email, password }, { csrf: victim.token });
+  }
+
+  /** Fails one login for `email` with a wrong password, a second after the previous attempt. */
+  async function failLogin(victim: Victim, email: string): Promise<void> {
+    const res = await attemptAfterGap(victim, email, newPassword());
+    expect(res.status).toBe(422);
+    expect(res.body).toContain(INVALID_CREDENTIALS);
+  }
+
+  test.each(U0130_VARIANTS)(
+    'PostgreSQL lower() folds %j to the canonical email, but the lockout key does not',
+    async (variant) => {
+      const rows = await sql<{ lowered: string }>(pool, 'SELECT lower($1::text) AS lowered', [
+        variant,
+      ]);
+      expect(rows).toEqual([{ lowered: CANONICAL_EMAIL }]);
+      expect(lockoutKey(variant)).not.toBe(CANONICAL_EMAIL);
+    },
+  );
+
+  test.each(U0130_VARIANTS)(
+    'refuses %j with the correct password while the canonical email is locked',
+    async (variant) => {
+      const victim = await signUpVictim();
+      for (let failure = 1; failure <= 5; failure += 1) {
+        await failLogin(victim, CANONICAL_EMAIL);
+      }
+      const canonicalRows = await loginAttemptRows(pool, CANONICAL_EMAIL);
+      expect(canonicalRows).toHaveLength(5);
+
+      // Either refusal will do here; the unknown-email cases below pin down which one it is.
+      const refused = await attemptAfterGap(victim, variant, victim.password);
+      expect([422, 429]).toContain(refused.status);
+      expect(refused.body).toContain(refused.status === 429 ? LOCKED_OUT : INVALID_CREDENTIALS);
+      expect(cookieNamed(refused, 'sid')).toBeUndefined();
+      expect(await countRows(pool, 'sessions')).toBe(0);
+
+      const locked = await attemptAfterGap(victim, CANONICAL_EMAIL, victim.password);
+      expect(locked.status).toBe(429);
+      expect(locked.body).toContain(LOCKED_OUT);
+      expect(await countRows(pool, 'sessions')).toBe(0);
+      expect(await loginAttemptRows(pool, CANONICAL_EMAIL)).toEqual(canonicalRows);
+    },
+  );
+
+  test.each(U0130_VARIANTS)(
+    'treats %j with the correct password as an unknown email under its own key',
+    async (variant) => {
+      const victim = await signUpVictim();
+      await failLogin(victim, CANONICAL_EMAIL);
+      const canonicalRows = await loginAttemptRows(pool, CANONICAL_EMAIL);
+      expect(canonicalRows).toHaveLength(1);
+
+      const res = await attemptAfterGap(victim, variant, victim.password);
+      expect(res.status).toBe(422);
+      expect(res.body).toContain(INVALID_CREDENTIALS);
+
+      const variantRows = await loginAttemptRows(pool, lockoutKey(variant));
+      expect(variantRows).toHaveLength(1);
+      expect(variantRows[0]?.failedAt).toEqual(clock.now());
+      expect(await countRows(pool, 'login_attempts')).toBe(2);
+      expect(await countRows(pool, 'sessions')).toBe(0);
+      expect(await loginAttemptRows(pool, CANONICAL_EMAIL)).toEqual(canonicalRows);
+    },
+  );
+
+  test('logs in with an ASCII case variant and clears the canonical failures', async () => {
+    const victim = await signUpVictim();
+    await failLogin(victim, CANONICAL_EMAIL);
+    await failLogin(victim, 'Victim@Example.com');
+    expect(await loginAttemptRows(pool, CANONICAL_EMAIL)).toHaveLength(2);
+
+    const res = await attemptAfterGap(victim, '  VICTIM@Example.COM  ', victim.password);
+    expect(res.status).toBe(303);
+    expect(res.location).toBe('/tasks');
+    expect(cookieNamed(res, 'sid')).toBeDefined();
+    expect(await sessionsForUser(pool, victim.userId)).toHaveLength(1);
+    expect(await countRows(pool, 'sessions')).toBe(1);
+    expect(await loginAttemptRows(pool, CANONICAL_EMAIL)).toEqual([]);
+    expect(await countRows(pool, 'login_attempts')).toBe(0);
+    // The new session is the canonical account's: the task list names its email.
+    const tasks = await victim.client.get('/tasks');
+    expect(tasks.status).toBe(200);
+    expect(tasks.body).toContain(`Signed in as ${CANONICAL_EMAIL}`);
   });
 });
 

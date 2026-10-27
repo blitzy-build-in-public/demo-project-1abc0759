@@ -269,6 +269,17 @@ export class HttpClient {
   }
 
   /**
+   * Sends an `OPTIONS` request with no body, carrying the jar's cookies like any other request.
+   *
+   * @param path - Path and query, resolved against the base URL.
+   * @throws Error, as a rejected promise and with nothing sent, when `path` resolves outside the
+   *   base URL's origin; TypeError when it does not resolve to a URL.
+   */
+  options(path: string): Promise<HttpResult> {
+    return this.request('OPTIONS', path, {});
+  }
+
+  /**
    * Posts `fields` as an `application/x-www-form-urlencoded` form.
    *
    * An array value is sent as one parameter per element, which produces repeated parameters.

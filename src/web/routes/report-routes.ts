@@ -81,7 +81,9 @@ function readRangeQuery(query: unknown): { from: string | undefined; to: string 
  */
 export function createReportRouter(deps: { reports: ReportService }): Router {
   const { reports } = deps;
-  const router = express.Router();
+  // Exact matching, as the application sets for itself: a router does not inherit it, and
+  // `/REPORTS` or `/reports/export/` must reach the 404 handler rather than a route.
+  const router = express.Router({ caseSensitive: true, strict: true });
 
   router.get(
     '/reports',

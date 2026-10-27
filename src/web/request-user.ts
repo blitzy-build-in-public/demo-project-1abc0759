@@ -8,9 +8,9 @@
  * presence is the single signal of a signed-in request for `requireAuth`, `noStore`, CSRF binding
  * and the routers.
  *
- * {@link AuthenticatedUser} carries no password, hash or raw token. Its `sessionId` is the hex
- * session-token hash, used only inside the CSRF HMAC and never rendered into a page, redirect or
- * log.
+ * {@link AuthenticatedUser} excludes the plaintext password, the password hash and the raw session
+ * token. It does contain one internal hash, `sessionId`, the hex session-token hash, used only as
+ * the CSRF binding inside the CSRF HMAC and never rendered into a page or redirect, nor logged.
  *
  * Files that read or write `req.user` import this module for its side effect (for example
  * `import '../request-user';` from `middleware/` or `routes/`), so the dependency stays explicit

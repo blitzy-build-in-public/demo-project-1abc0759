@@ -35,7 +35,10 @@ const NON_ASCII_PATTERN = /[^\u0000-\u007f]/;
 /**
  * The signed-in user attached to a request once its session has been authenticated.
  *
- * It deliberately carries no password or hash field, so templates can never receive one.
+ * It deliberately excludes the plaintext password, the password hash and the raw session token, so
+ * templates can never receive them. It does contain one internal hash, `sessionId`, the hex
+ * session-token hash, used only as the CSRF binding inside the CSRF HMAC and never rendered into a
+ * page or redirect, nor logged.
  */
 export interface AuthenticatedUser {
   /** The user's id, the owner key for every task operation. */

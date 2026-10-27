@@ -26,7 +26,9 @@ import { createAuthRouter } from './web/routes/auth-routes';
 import { createReportRouter } from './web/routes/report-routes';
 import { createTaskRouter } from './web/routes/task-routes';
 
-/** Body size limit for `application/x-www-form-urlencoded` forms; larger bodies are answered 413. */
+/**
+ * Body size limit for `application/x-www-form-urlencoded` forms; larger bodies are answered 413.
+ */
 const FORM_BODY_LIMIT = '100kb';
 
 /**
@@ -58,7 +60,9 @@ export interface AppDeps {
  *
  * Settings: flat (`simple`) query-string parsing, so nested `qs` objects never reach a handler
  * and a repeated parameter arrives as an array, which the parameter validators reject with 400;
- * and no `X-Powered-By` header.
+ * no `X-Powered-By` header; and exact routing (case-sensitive and strict, here and in every
+ * router), so a route or the `/static` mount matches only its own lower-case path and a variant
+ * such as `/TASKS`, `/tasks/` or `/STATIC/app.css` is answered 404 "Page not found.".
  *
  * Middleware runs in this order, and the order is binding:
  * 1. `/static` assets, followed by the 404 handler at the same mount, ahead of every cookie and
@@ -73,11 +77,13 @@ export interface AppDeps {
  *    `req.user` is set and to `anon` otherwise, so it must follow `loadSession`.
  * 6. `noStore`: `Cache-Control: no-store` on every signed-in response, set before any route,
  *    404 or error page responds.
- * 7. `GET /`: 302 to `/tasks`.
- * 8. The auth, task and report routers, mounted at the root; each declares its full paths and
+ * 7. The 404 handler for every `OPTIONS` request, ahead of every route: no route accepts the
+ *    method, and Express's automatic `OPTIONS` answer (200 with an `Allow` list) never runs.
+ * 8. `GET /`: 302 to `/tasks`.
+ * 9. The auth, task and report routers, mounted at the root; each declares its full paths and
  *    applies its own session guard.
- * 9. The 404 handler for any other path or method.
- * 10. The error handler, last: the only place errors become responses, always with fixed
+ * 10. The 404 handler for any other path or method.
+ * 11. The error handler, last: the only place errors become responses, always with fixed
  *     messages, so Express's default handler and its stack traces are never reached.
  *
  * @param deps - Configuration, clock, logger and the three services.
@@ -89,6 +95,10 @@ export function createApp(deps: AppDeps): Express {
 
   app.set('query parser', 'simple');
   app.disable('x-powered-by');
+  // Read once, when the first `app.use` below creates the application router, so they must be
+  // set first. Each router sets the same options itself, because routers do not inherit them.
+  app.set('case sensitive routing', true);
+  app.set('strict routing', true);
 
   // Static assets are served before cookie parsing and session loading, so they never touch the
   // session. The 404 handler mounted with them ends every request under /static that
@@ -109,6 +119,17 @@ export function createApp(deps: AppDeps): Express {
   const csrf = createCsrf(config.sessionSecret, config);
   app.use(csrf.prepare);
   app.use(noStore);
+
+  // No route accepts OPTIONS, yet Express 4 answers it itself once a router holds a route for the
+  // path: 200 with an `Allow` header listing that route's methods. Ending every OPTIONS request at
+  // the 404 handler here, before any route, answers it like PUT or DELETE and lists no methods.
+  app.use((req, res, next): void => {
+    if (req.method === 'OPTIONS') {
+      notFoundHandler(req, res, next);
+      return;
+    }
+    next();
+  });
 
   app.get('/', (_req, res): void => {
     res.redirect(302, '/tasks');

@@ -38,10 +38,12 @@ import {
   countRows,
   createTestPool,
   insertLoginFailures,
+  insertTask,
   insertUser,
   loginAttemptRows,
   sessionsForUser,
   truncateAll,
+  userIdByEmail,
 } from '../helpers/test-db';
 
 /**
@@ -53,8 +55,13 @@ const UNREACHABLE = 'postgres://tasktracker:x@127.0.0.1:1/unreachable_test';
 /** The database name inside {@link UNREACHABLE}; no failure page may reveal it. */
 const UNREACHABLE_DB_NAME = 'unreachable_test';
 
-/** A password that meets the sign-up policy, used by every account in this file. */
-const PASSWORD = 'Failure-test-passw0rd';
+/**
+ * The password of every account in this file, generated once per run so no fixed secret is
+ * committed. The `Failure1-` prefix supplies the letter and digit the sign-up policy requires,
+ * and the 24 hex characters bring it to 33 ASCII characters, within the policy's minimum of 10
+ * characters and maximum of 72 bytes.
+ */
+const PASSWORD = `Failure1-${randomBytes(12).toString('hex')}`;
 
 const MINUTE_MS = 60_000;
 const HOUR_MS = 3_600_000;
@@ -186,7 +193,21 @@ describe('failure responses and the purge failure policy', () => {
   });
 
   afterAll(async () => {
-    await Promise.all(cleanups.map((cleanup) => cleanup()));
+    // Every registered cleanup is attempted before any failure is reported, so one that rejects
+    // cannot leave the other instance or a pool open. The async wrapper turns a synchronous throw
+    // into a rejection, which allSettled collects like the rest.
+    const results = await Promise.allSettled(
+      cleanups.map(async (cleanup): Promise<void> => cleanup()),
+    );
+    const reasons = results
+      .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
+      .map((result): unknown => result.reason);
+    if (reasons.length === 1) {
+      throw reasons[0];
+    }
+    if (reasons.length > 1) {
+      throw new AggregateError(reasons, `failures teardown: ${reasons.length} cleanups failed`);
+    }
   });
 
   beforeEach(async () => {
@@ -266,6 +287,131 @@ describe('failure responses and the purge failure policy', () => {
 
         expectFailurePage(res, 404, 'Page not found.');
         expect(errorEntries(healthyLog)).toEqual([]);
+      },
+    );
+
+    /** Every path a route declares, by any method. No route accepts OPTIONS on any of them. */
+    const ROUTE_PATHS: readonly string[] = [
+      '/signup',
+      '/login',
+      '/logout',
+      '/tasks',
+      '/tasks/new',
+      '/tasks/1/edit',
+      '/tasks/1/status',
+      '/tasks/1/delete',
+      '/reports',
+      '/reports/export',
+    ];
+
+    // A signed-in 404 carries `Cache-Control: no-store` like every signed-in response, which
+    // also shows that the session was recognised.
+    const OPTIONS_CASES = ROUTE_PATHS.flatMap(
+      (path) =>
+        [
+          { path, who: 'anonymous', cacheControl: null },
+          { path, who: 'signed in', cacheControl: 'no-store' },
+        ] as const,
+    );
+
+    it.each(OPTIONS_CASES)(
+      'answers OPTIONS $path ($who) with 404 "Page not found." and no Allow list',
+      async ({ path, who, cacheControl }) => {
+        const client =
+          who === 'signed in'
+            ? await signUpAndLogIn(healthy, 'options@example.com')
+            : healthy.client();
+
+        const res = await client.options(path);
+
+        expectFailurePage(res, 404, 'Page not found.');
+        expect(res.headers.get('allow')).toBeNull();
+        expect(res.headers.get('cache-control')).toBe(cacheControl);
+        expect(errorEntries(healthyLog)).toEqual([]);
+      },
+    );
+
+    /** A case or trailing-slash variant of a path the application serves. */
+    interface PathVariant {
+      /** The path as sent. */
+      variant: string;
+      /** The served path it imitates. `:id` stands for the id of a task the client owns. */
+      exact: string;
+    }
+
+    // Each variant is followed by its exact path on the same client, so the 404 comes from the
+    // path alone and not from a missing session, task or asset.
+    const ANONYMOUS_VARIANTS: readonly (PathVariant & { exactStatus: number })[] = [
+      { variant: '/TASKS', exact: '/tasks', exactStatus: 302 },
+      { variant: '/signup/', exact: '/signup', exactStatus: 200 },
+      { variant: '/LOGIN', exact: '/login', exactStatus: 200 },
+      { variant: '/STATIC/app.css', exact: '/static/app.css', exactStatus: 200 },
+      { variant: '/Static/app.css', exact: '/static/app.css', exactStatus: 200 },
+    ];
+
+    it.each(ANONYMOUS_VARIANTS)(
+      'answers an anonymous GET $variant with 404 "Page not found.", unlike $exact',
+      async ({ variant, exact, exactStatus }) => {
+        const client = healthy.client();
+
+        const res = await client.get(variant);
+
+        expectFailurePage(res, 404, 'Page not found.');
+        expect(errorEntries(healthyLog)).toEqual([]);
+        expect((await client.get(exact)).status).toBe(exactStatus);
+      },
+    );
+
+    const SIGNED_IN_VARIANTS: readonly PathVariant[] = [
+      { variant: '/TASKS', exact: '/tasks' },
+      { variant: '/tasks/', exact: '/tasks' },
+      { variant: '/tasks/new/', exact: '/tasks/new' },
+      { variant: '/TASKS/NEW', exact: '/tasks/new' },
+      { variant: '/tasks/:id/edit/', exact: '/tasks/:id/edit' },
+      { variant: '/tasks/:id/EDIT', exact: '/tasks/:id/edit' },
+      { variant: '/reports/', exact: '/reports' },
+      { variant: '/REPORTS', exact: '/reports' },
+      { variant: '/reports/export/', exact: '/reports/export' },
+      { variant: '/Reports/Export', exact: '/reports/export' },
+    ];
+
+    it.each(SIGNED_IN_VARIANTS)(
+      'answers a signed-in GET $variant with 404 "Page not found.", unlike $exact',
+      async ({ variant, exact }) => {
+        const email = 'path-variant@example.com';
+        const client = await signUpAndLogIn(healthy, email);
+        const ownerId = await userIdByEmail(pool, email);
+        if (ownerId === null) {
+          throw new Error('the signed-up user was not stored');
+        }
+        const task = await insertTask(pool, ownerId);
+        const withTaskId = (path: string): string => path.replace(':id', String(task.id));
+
+        const res = await client.get(withTaskId(variant));
+
+        expectFailurePage(res, 404, 'Page not found.');
+        expect(errorEntries(healthyLog)).toEqual([]);
+        expect((await client.get(withTaskId(exact))).status).toBe(200);
+      },
+    );
+
+    it.each(['/TASKS/NEW/', '/tasks/new/', '/TASKS/NEW'])(
+      'answers a signed-in POST %s with 404 "Page not found." and creates no task',
+      async (variant) => {
+        const client = await signUpAndLogIn(healthy, 'post-variant@example.com');
+        const csrf = await taskFormToken(client);
+        const before = await countRows(pool, 'tasks');
+
+        const res = await client.post(variant, VALID_TASK_FIELDS, { csrf });
+
+        expectFailurePage(res, 404, 'Page not found.');
+        expect(await countRows(pool, 'tasks')).toBe(before);
+        expect(errorEntries(healthyLog)).toEqual([]);
+
+        // Control: the same session, token and fields do create a task through the exact path.
+        const created = await client.post('/tasks/new', VALID_TASK_FIELDS, { csrf });
+        expect(created.status).toBe(303);
+        expect(await countRows(pool, 'tasks')).toBe(before + 1);
       },
     );
   });

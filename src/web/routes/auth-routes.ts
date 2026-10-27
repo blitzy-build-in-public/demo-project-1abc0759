@@ -137,7 +137,9 @@ export function createAuthRouter(deps: {
   csrf: Csrf;
 }): Router {
   const { auth, config, csrf } = deps;
-  const router = express.Router();
+  // Exact matching, as the application sets for itself: a router does not inherit it, and
+  // `/LOGIN` or `/signup/` must reach the 404 handler rather than a route.
+  const router = express.Router({ caseSensitive: true, strict: true });
 
   // Every page renders the token `csrf.prepare` bound to `anon` for this anonymous response.
   function renderSignUp(

@@ -49,9 +49,10 @@ function startsWithSingleSlash(value: string): boolean {
 }
 
 /**
- * Whether a resolved pathname reaches one of {@link EXCLUDED_PATHS}. Express routing is
- * case-insensitive and non-strict by default, so `/LOGIN` and `/login/` reach the login route too:
- * the comparison lower-cases the path and drops one trailing slash.
+ * Whether a resolved pathname names one of {@link EXCLUDED_PATHS}, ignoring case and one trailing
+ * slash. Routing matches paths exactly, so `/LOGIN` or `/login/` reaches only the 404 page; the
+ * comparison rejects such variants as well, so a login never ends on a 404 page and the user lands
+ * on {@link DEFAULT_RETURN_PATH} instead.
  */
 function isExcludedTarget(pathname: string): boolean {
   const lower = pathname.toLowerCase();
