@@ -108,13 +108,15 @@ export const notFoundHandler: RequestHandler = (_req, res): void => {
  * Creates the error middleware: the only place where an error becomes an HTTP response. It must
  * be mounted last.
  *
- * | Error | Status | Message | Logged |
- * |-------|--------|---------|--------|
- * | {@link HttpError} (`BadRequestError`, `NotFoundError`, `CsrfError`) | `err.status` | `err.publicMessage` | No |
- * | Express or body-parser 4xx: `entity.too.large` or 413 | 413 | "Bad request." | No |
- * | Any other Express or body-parser 4xx | 400 | "Bad request." | No |
- * | {@link DatabaseUnavailableError} | 503 | "Service temporarily unavailable" | `database unavailable` |
- * | Anything else | 500 | "Something went wrong." | `unexpected error` |
+ * How each error is answered and logged:
+ *
+ * - {@link HttpError} (`BadRequestError`, `NotFoundError`, `CsrfError`): `err.status`,
+ *   `err.publicMessage`, not logged.
+ * - Express or body-parser 4xx that is `entity.too.large` or 413: 413, "Bad request.", not logged.
+ * - Any other Express or body-parser 4xx: 400, "Bad request.", not logged.
+ * - {@link DatabaseUnavailableError}: 503, "Service temporarily unavailable", logged as
+ *   `database unavailable`.
+ * - Anything else: 500, "Something went wrong.", logged as `unexpected error`.
  *
  * Only the 503 and 500 cases are logged, at `error` level, with the error and the request's
  * `method` and `path` (the path without its query string). Bodies, headers, cookies, query
@@ -123,7 +125,11 @@ export const notFoundHandler: RequestHandler = (_req, res): void => {
  * When the response headers were already sent, the error is logged by the same rule and the
  * response is destroyed instead of rendered.
  *
- * @param logger - Receives the 503 and 500 entries.
+ * Logging is best-effort: a logger failure never changes the response. When `logger.error`
+ * throws, for example because its output stream failed, the throw is discarded and the same
+ * fixed page is sent, or the same response destroyed, as if the entry had been written.
+ *
+ * @param logger - Receives the 503 and 500 entries. A throw from it never changes the response.
  * @returns A four-parameter Express error handler.
  */
 export function createErrorHandler(logger: Logger): ErrorRequestHandler {
@@ -131,7 +137,14 @@ export function createErrorHandler(logger: Logger): ErrorRequestHandler {
   return (err: unknown, req: Request, res: Response, _next: NextFunction): void => {
     const outcome = classify(err);
     if (outcome.logMsg !== null) {
-      logger.error(outcome.logMsg, err, { method: req.method, path: req.path });
+      try {
+        logger.error(outcome.logMsg, err, { method: req.method, path: req.path });
+      } catch {
+        // Dropped, neither rethrown nor passed to `next`: either would reach Express's default
+        // handler, which replaces the fixed page or the destroy below with its own page and prints
+        // the stack outside the logger. The logger is the only reporting channel, so a failure to
+        // write to it has nowhere left to be reported.
+      }
     }
     if (res.headersSent) {
       // Not delegated with `next(err)`: Express's default handler would print the stack to the

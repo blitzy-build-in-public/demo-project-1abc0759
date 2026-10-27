@@ -16,6 +16,14 @@
  * every read of an error or field is guarded against throwing getters and proxies, values are
  * reduced to strings and finite numbers, and a line that cannot be serialized is replaced by a
  * reduced one.
+ *
+ * A logger can also be given values to redact ({@link LoggerOptions}): the process entry points
+ * pass the database user name and password, because PostgreSQL quotes the user name, which can
+ * be an email address, in its own messages, for example
+ * `password authentication failed for user "…"` (SQLSTATE 28P01). Every occurrence is replaced by
+ * `[redacted]` in a logged error's message and stack, the only parts of a line that carry driver
+ * text, before the line is serialized, so a JSON string escape can never hide one. Everything
+ * else is written as given.
  */
 
 /**
@@ -61,6 +69,25 @@ const UNREADABLE_MESSAGE = '[unreadable message]';
 
 /** `msg` of a line whose `msg` could not be serialized. */
 const UNSERIALIZABLE_MSG = '[unserializable msg]';
+
+/** Text that stands in for each occurrence of a redacted value. */
+const REDACTED = '[redacted]';
+
+/** `err.message` when redacting it failed, so that the unredacted text is never written. */
+const UNREDACTABLE_MESSAGE = '[unredactable message]';
+
+/** Options of {@link createLogger}. */
+export interface LoggerOptions {
+  /**
+   * Values to replace by `[redacted]` wherever they occur in a logged error's `message` and
+   * `stack`, such as the database user name and password. Empty strings are ignored, and with
+   * none left every line is written exactly as without this option. Nothing else in a line is
+   * redacted: `time`, `level`, `msg`, the fields and the error's `name` and `code` are values the
+   * code produces, and rewriting them would corrupt the line whenever a credential equals one of
+   * them, such as a user named `error` or a password of `28P01`.
+   */
+  redact?: readonly string[];
+}
 
 /**
  * Runs one property read and returns {@link UNREADABLE} when it throws. A getter, a proxy
@@ -150,6 +177,45 @@ function serializeError(err: unknown): SerializedError {
 }
 
 /**
+ * Builds one pattern matching any of `values`, or returns `null` when no non-empty value is
+ * given. Each value is escaped, so it matches only as literal text. The alternatives are the
+ * distinct values longest first, so a value that contains another is replaced whole rather than
+ * in part, and a single pass never matches inside a {@link REDACTED} marker it has just written.
+ */
+function redactionPattern(values: readonly string[]): RegExp | null {
+  const distinct = [...new Set(values)]
+    .filter((value) => typeof value === 'string' && value !== '')
+    .sort((a, b) => b.length - a.length);
+  if (distinct.length === 0) {
+    return null;
+  }
+  const alternatives = distinct.map((value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  return new RegExp(alternatives.join('|'), 'g');
+}
+
+/**
+ * Replaces every match of `pattern` in the error's `message` and `stack`, the only values of a
+ * line that carry driver text, in place. A replacement that fails, which only a text near the
+ * engine's maximum string length can cause, gives a fixed `message` and drops the `stack`, so an
+ * unredacted value is never written and this function never throws.
+ */
+function redactError(serialized: SerializedError, pattern: RegExp): void {
+  try {
+    serialized.message = serialized.message.replace(pattern, REDACTED);
+  } catch {
+    serialized.message = UNREDACTABLE_MESSAGE;
+  }
+  if (serialized.stack === undefined) {
+    return;
+  }
+  try {
+    serialized.stack = serialized.stack.replace(pattern, REDACTED);
+  } catch {
+    serialized.stack = undefined;
+  }
+}
+
+/**
  * Starts an entry in its fixed key order and copies the caller's primitive fields into it.
  * The `typeof` check backs the {@link LogFields} type against a caller that casts. A field
  * whose read throws is dropped, and no field is copied when the keys cannot be listed (a
@@ -213,9 +279,15 @@ function serializeEntry(entry: Record<string, unknown>): string {
  * Creates a logger that writes one JSON line per call to `out`.
  *
  * @param out Destination stream; defaults to the process's standard output.
+ * @param options Values to redact from logged errors' message and stack; none by default.
  * @returns A {@link Logger} whose methods write synchronously and never buffer or filter.
  */
-export function createLogger(out: NodeJS.WritableStream = process.stdout): Logger {
+export function createLogger(
+  out: NodeJS.WritableStream = process.stdout,
+  options: LoggerOptions = {},
+): Logger {
+  // Built once, so every line is redacted by the same pattern; `null` leaves lines unchanged.
+  const pattern = redactionPattern(options.redact ?? []);
   // Serialization is guarded; `out.write` is not, so stream failures surface as the stream
   // reports them.
   const writeLine = (entry: Record<string, unknown>): void => {
@@ -229,7 +301,11 @@ export function createLogger(out: NodeJS.WritableStream = process.stdout): Logge
     error(msg: string, err?: unknown, fields?: LogFields): void {
       const entry = buildEntry('error', msg, fields);
       if (err !== undefined) {
-        entry.err = serializeError(err);
+        const serialized = serializeError(err);
+        if (pattern !== null) {
+          redactError(serialized, pattern);
+        }
+        entry.err = serialized;
       }
       writeLine(entry);
     },

@@ -1,5 +1,6 @@
 /**
- * Integration tests for the migrated schema against real PostgreSQL 16 (plan 0.5.2, 0.9.2).
+ * Integration tests for the migrated schema against real PostgreSQL 16 (plan 0.5.2, 0.9.2), and
+ * for the code that applies that schema and reports its failures.
  *
  * They check that the four versioned migrations apply exactly once, that the database itself
  * enforces every planned index, CHECK constraint and the case-insensitive email uniqueness, and
@@ -10,17 +11,50 @@
  * Check fixtures are raw INSERTs with every column and timestamp bound explicitly, never the
  * database's `now()`: the helper defaults deliberately satisfy every check.
  *
+ * The suites before `database schema` cover that code without the test database, so they need no
+ * truncation:
+ * - the migration runner, against a fake pool: the client goes back with a plain `release()`
+ *   after a clean run and is destroyed once when the advisory unlock fails, whatever the logger
+ *   does, and a connection the server ends mid-migration rejects with the emitted error as its
+ *   cause instead of crashing the process;
+ * - the migration CLI's `main`: the `DATABASE_URL` user name and password redacted from every
+ *   logged error, exit codes 0, 1 and 2, and `--help` and rejected arguments that neither read
+ *   `DATABASE_URL` nor connect. Its runner is a spy scoped to those tests, never a module mock,
+ *   so every other suite here runs the real runner;
+ * - the pool's connection teardown, against a fake PostgreSQL server: a connection pg rejects
+ *   closes its socket at once, and a connected client keeps its socket;
+ * - the logger's serialisation of errors and fields, its guards against hostile inputs (throwing
+ *   getters, proxies, cyclic and BigInt values) and its redaction of the values it is given.
+ *
+ * They live here because this is the suite of the migration bootstrap, and the runner, its CLI,
+ * the pool and the logger are what that bootstrap runs on. Each restores what it changes: the
+ * environment, standard output, the timers, its spies and `process.exitCode`.
+ *
  * The final describe drops the `public` schema and rebuilds it from two pools at once, the way
  * replicas start together. It must stay last in this file, and it leaves the schema fully
  * migrated for the suites that follow in the same run.
  */
 
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
+import { EventEmitter } from 'node:events';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:net';
+import type { AddressInfo, Server, Socket } from 'node:net';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { Writable } from 'node:stream';
+import { setTimeout as delay } from 'node:timers/promises';
 
-import type { Pool } from 'pg';
+import type { Pool, PoolClient } from 'pg';
 
 import { runMigrations } from '../../src/db/migrate';
+import * as migrateModule from '../../src/db/migrate';
+import { main as runMigrateCli } from '../../src/db/migrate-cli';
 import { createPool } from '../../src/db/pool';
+import * as poolModule from '../../src/db/pool';
+import { DatabaseUnavailableError } from '../../src/shared/errors';
+import { createLogger } from '../../src/shared/logger';
+import type { LogFields, Logger, LoggerOptions } from '../../src/shared/logger';
 
 import { CaptureLogger } from '../helpers/capture-logger';
 import {
@@ -36,6 +70,1328 @@ import {
   testDatabaseUrl,
   truncateAll,
 } from '../helpers/test-db';
+
+describe('runMigrations client release', () => {
+  const LOCK_SQL = 'SELECT pg_advisory_lock(7253, 1)';
+  const UNLOCK_SQL = 'SELECT pg_advisory_unlock(7253, 1)';
+  const MIGRATION_VERSION = '0001_x';
+  const MIGRATION_SQL = 'CREATE TABLE widgets (id integer);';
+  const NOT_QUERYABLE_MESSAGE = 'Client has encountered a connection error and is not queryable';
+
+  /** Which statements the fake client rejects. */
+  interface FailurePlan {
+    migration: boolean;
+    unlock: boolean;
+    /**
+     * When set, the connection is lost while the migration file's SQL runs: the client emits this
+     * error from outside any statement, as pg does from its socket, and then refuses that statement
+     * and every later one with pg's "not queryable" error.
+     */
+    connectionLost?: Error;
+  }
+
+  /** A fake pool whose one client records its statements and every `release` call. */
+  interface FakeDatabase {
+    pool: Pool;
+    client: EventEmitter;
+    statements: string[];
+    releaseCalls: unknown[][];
+  }
+
+  /**
+   * Builds a pool whose `connect()` resolves one fake client. The client answers every statement
+   * with no rows, except that it rejects the migration file's SQL with `migrationFailure` and the
+   * unlock with `unlockFailure` when `fail` says so, and behaves as a dead client once
+   * `fail.connectionLost` has been emitted.
+   */
+  function createFakeDatabase(
+    fail: FailurePlan,
+    migrationFailure: Error,
+    unlockFailure: Error,
+  ): FakeDatabase {
+    const statements: string[] = [];
+    const releaseCalls: unknown[][] = [];
+    const events = new EventEmitter();
+    let lost = false;
+    const client = Object.assign(events, {
+      async query(statement: string): Promise<{ rows: unknown[] }> {
+        statements.push(statement);
+        const connectionError = fail.connectionLost;
+        if (connectionError !== undefined && statement === MIGRATION_SQL) {
+          lost = true;
+          // Emitted from a later macrotask, where nothing catches it: with no `error` listener on
+          // the client, it is an uncaught exception, as it would crash the process.
+          await new Promise<void>((resolve) => {
+            setImmediate(() => {
+              resolve();
+              events.emit('error', connectionError);
+            });
+          });
+        }
+        if (lost) {
+          throw new Error(NOT_QUERYABLE_MESSAGE);
+        }
+        if (fail.migration && statement === MIGRATION_SQL) {
+          throw migrationFailure;
+        }
+        if (fail.unlock && statement === UNLOCK_SQL) {
+          throw unlockFailure;
+        }
+        return { rows: [] };
+      },
+      release(...args: unknown[]): void {
+        releaseCalls.push(args);
+      },
+    });
+    const pool = {
+      async connect(): Promise<PoolClient> {
+        // Only `query`, `release` and the `error` event are used by the runner and `checkOut`, so
+        // the fake stands in for the client.
+        return client as unknown as PoolClient;
+      },
+    };
+    return { pool: pool as unknown as Pool, client, statements, releaseCalls };
+  }
+
+  /** One `error` call as the logger received it. */
+  interface LoggedError {
+    msg: string;
+    err: unknown;
+  }
+
+  /** A logger that records every call and, when asked to, throws from `error` after recording. */
+  class RecordingLogger implements Logger {
+    readonly infos: Array<{ msg: string; fields: LogFields | undefined }> = [];
+
+    readonly errors: LoggedError[] = [];
+
+    constructor(private readonly errorThrows: boolean) {}
+
+    info(msg: string, fields?: LogFields): void {
+      this.infos.push({ msg, fields });
+    }
+
+    error(msg: string, err?: unknown): void {
+      this.errors.push({ msg, err });
+      if (this.errorThrows) {
+        throw new Error('log sink failed');
+      }
+    }
+  }
+
+  let dir: string;
+  let migrationError: Error;
+  let unlockError: Error;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(path.join(tmpdir(), 'migrate-runner-'));
+    migrationError = new Error('syntax error at or near "CREATE"');
+    unlockError = new Error('unlock rejected');
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  /** Writes the single migration file `0001_x.sql` into the temporary directory. */
+  async function writeMigration(): Promise<void> {
+    await writeFile(path.join(dir, `${MIGRATION_VERSION}.sql`), MIGRATION_SQL, 'utf8');
+  }
+
+  test.each([
+    { files: 0, expected: [] },
+    { files: 1, expected: [MIGRATION_VERSION] },
+  ])(
+    'returns the client with a plain release() after a clean run of $files file(s)',
+    async ({ files, expected }) => {
+      if (files === 1) {
+        await writeMigration();
+      }
+      const db = createFakeDatabase(
+        { migration: false, unlock: false },
+        migrationError,
+        unlockError,
+      );
+      const logger = new RecordingLogger(false);
+
+      await expect(runMigrations(db.pool, logger, dir)).resolves.toEqual(expected);
+
+      expect(db.releaseCalls).toEqual([[]]);
+      expect(db.statements[0]).toBe(LOCK_SQL);
+      expect(db.statements.at(-1)).toBe(UNLOCK_SQL);
+      expect(logger.errors).toEqual([]);
+      expect(logger.infos).toEqual([
+        { msg: 'migrations applied', fields: { count: files, versions: expected.join(',') } },
+      ]);
+    },
+  );
+
+  test.each([{ loggerThrows: true }, { loggerThrows: false }])(
+    'destroys the connection once and keeps the applied list when the unlock fails ' +
+      '(logger throws: $loggerThrows)',
+    async ({ loggerThrows }) => {
+      await writeMigration();
+      const db = createFakeDatabase(
+        { migration: false, unlock: true },
+        migrationError,
+        unlockError,
+      );
+      const logger = new RecordingLogger(loggerThrows);
+
+      await expect(runMigrations(db.pool, logger, dir)).resolves.toEqual([MIGRATION_VERSION]);
+
+      expect(db.releaseCalls).toEqual([[true]]);
+      expect(logger.errors).toHaveLength(1);
+      expect(logger.errors[0]?.msg).toBe('migration unlock failed');
+      expect(logger.errors[0]?.err).toBe(unlockError);
+    },
+  );
+
+  test.each([{ loggerThrows: true }, { loggerThrows: false }])(
+    'destroys the connection once and rethrows the original migration error when the unlock ' +
+      'also fails (logger throws: $loggerThrows)',
+    async ({ loggerThrows }) => {
+      await writeMigration();
+      const db = createFakeDatabase(
+        { migration: true, unlock: true },
+        migrationError,
+        unlockError,
+      );
+      const logger = new RecordingLogger(loggerThrows);
+
+      await expect(runMigrations(db.pool, logger, dir)).rejects.toBe(migrationError);
+
+      expect(db.releaseCalls).toEqual([[true]]);
+      expect(db.statements).toContain('ROLLBACK');
+      expect(db.statements.at(-1)).toBe(UNLOCK_SQL);
+      expect(logger.errors).toHaveLength(1);
+      expect(logger.errors[0]?.msg).toBe('migration unlock failed');
+      expect(logger.errors[0]?.err).toBe(unlockError);
+      expect(logger.infos).toEqual([]);
+    },
+  );
+
+  test(
+    'survives a connection the server ends mid-migration, rejects with the emitted error as ' +
+      'cause and destroys the connection',
+    async () => {
+      await writeMigration();
+      const terminated = Object.assign(
+        new Error('terminating connection due to administrator command'),
+        { code: '57P01' },
+      );
+      const db = createFakeDatabase(
+        { migration: false, unlock: false, connectionLost: terminated },
+        migrationError,
+        unlockError,
+      );
+      const logger = new RecordingLogger(false);
+
+      const failure: unknown = await runMigrations(db.pool, logger, dir).then(
+        () => undefined,
+        (err: unknown) => err,
+      );
+
+      expect(failure).toBeInstanceOf(DatabaseUnavailableError);
+      expect(failure instanceof Error ? failure.cause : undefined).toBe(terminated);
+      expect(db.releaseCalls).toEqual([[true]]);
+      expect(db.client.listenerCount('error')).toBe(0);
+      expect(db.statements.slice(-2)).toEqual(['ROLLBACK', UNLOCK_SQL]);
+      expect(logger.infos).toEqual([]);
+    },
+  );
+});
+
+describe('migrate CLI main', () => {
+  /** The role name as PostgreSQL quotes it in messages: percent-decoded. */
+  const EMAIL_ROLE = 'alice@example.com';
+
+  /** The same role name as written in a connection string. */
+  const ENCODED_ROLE = 'alice%40example.com';
+
+  /** Assembled at run time, so no connection string with a literal password sits in the source. */
+  const PASSWORD = ['plain', 'test', 'word'].join('');
+
+  /** Host, port and database of every test URL; no connection is ever opened to it. */
+  const DATABASE = 'localhost:5432/tasktracker_test';
+
+  const MARKER = '[redacted]';
+
+  /** A driver error shaped like the one `pg` raises when password authentication fails. */
+  function authFailure(role: string): Error {
+    return Object.assign(new Error(`password authentication failed for user "${role}"`), {
+      name: 'error',
+      code: '28P01',
+    });
+  }
+
+  const originalEnv = process.env;
+  let chunks: string[];
+  let stdoutWrite: jest.SpiedFunction<typeof process.stdout.write>;
+  let mockedRunMigrations: jest.SpiedFunction<typeof migrateModule.runMigrations>;
+
+  /** Everything written to standard output since the test began. */
+  function capturedText(): string {
+    return chunks.join('');
+  }
+
+  /** The captured output parsed as JSON lines. */
+  function capturedEntries(): Record<string, unknown>[] {
+    return capturedText()
+      .split('\n')
+      .filter((line) => line !== '')
+      .map((line): Record<string, unknown> => {
+        const parsed: unknown = JSON.parse(line);
+        if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+          throw new Error('migrate-cli test: a log line is not a JSON object');
+        }
+        return parsed as Record<string, unknown>;
+      });
+  }
+
+  beforeEach(() => {
+    process.env = { ...originalEnv };
+    chunks = [];
+    // A spy restored after each test rather than a module mock, which would replace the runner
+    // for every suite in this file: the schema suites run the real one. It resolves with nothing
+    // applied unless a test gives it another implementation, so no test here reaches a database.
+    mockedRunMigrations = jest.spyOn(migrateModule, 'runMigrations').mockResolvedValue([]);
+    stdoutWrite = jest
+      .spyOn(process.stdout, 'write')
+      .mockImplementation((chunk: string | Uint8Array): boolean => {
+        chunks.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8'));
+        return true;
+      });
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
+    stdoutWrite.mockRestore();
+    mockedRunMigrations.mockRestore();
+    // main() reports through process.exitCode; left set, it would become Jest's own exit code.
+    process.exitCode = undefined;
+  });
+
+  test.each([
+    ['user-info part', `postgres://${ENCODED_ROLE}:${PASSWORD}@${DATABASE}`],
+    [
+      'user and password query parameters',
+      `postgres://${DATABASE}?user=${ENCODED_ROLE}&password=${PASSWORD}`,
+    ],
+  ])(
+    'redacts the user name and password given in the %s, keeping the error code',
+    async (_form: string, databaseUrl: string): Promise<void> => {
+      process.env.DATABASE_URL = databaseUrl;
+      mockedRunMigrations.mockImplementation(
+        async (_pool: Pool, logger: Logger): Promise<string[]> => {
+          logger.error('migration unlock failed', authFailure(EMAIL_ROLE));
+          throw authFailure(EMAIL_ROLE);
+        },
+      );
+
+      await runMigrateCli();
+
+      expect(process.exitCode).toBe(1);
+      const entries = capturedEntries();
+      expect(entries.map((entry) => entry.msg)).toEqual([
+        'migration unlock failed',
+        'migration failed',
+      ]);
+      for (const entry of entries) {
+        expect(entry).toMatchObject({
+          level: 'error',
+          err: {
+            name: 'error',
+            code: '28P01',
+            message: `password authentication failed for user "${MARKER}"`,
+            stack: expect.stringContaining(MARKER),
+          },
+        });
+      }
+      const text = capturedText();
+      expect(text).not.toContain(EMAIL_ROLE);
+      expect(text).not.toContain(ENCODED_ROLE);
+      expect(text).not.toContain(PASSWORD);
+    },
+  );
+
+  test('redacts values only, so a user name equal to a log key keeps the line intact', async () => {
+    process.env.DATABASE_URL = `postgres://level:${PASSWORD}@${DATABASE}`;
+    mockedRunMigrations.mockRejectedValue(authFailure('level'));
+
+    await runMigrateCli();
+
+    expect(process.exitCode).toBe(1);
+    expect(capturedEntries()).toEqual([
+      expect.objectContaining({
+        level: 'error',
+        msg: 'migration failed',
+        err: expect.objectContaining({
+          code: '28P01',
+          message: `password authentication failed for user "${MARKER}"`,
+        }),
+      }),
+    ]);
+  });
+
+  test.each([
+    ['the level, the error name and the error code', 'error', '28P01'],
+    ['the message text', 'migration', PASSWORD],
+  ])(
+    'redacts only the error text, so credentials equal to %s keep them intact',
+    async (_collision: string, user: string, password: string): Promise<void> => {
+      process.env.DATABASE_URL = `postgres://${user}:${password}@${DATABASE}`;
+      mockedRunMigrations.mockRejectedValue(authFailure(user));
+
+      await runMigrateCli();
+
+      expect(process.exitCode).toBe(1);
+      expect(capturedEntries()).toEqual([
+        expect.objectContaining({
+          level: 'error',
+          msg: 'migration failed',
+          err: expect.objectContaining({
+            name: 'error',
+            code: '28P01',
+            message: `password authentication failed for user "${MARKER}"`,
+            stack: expect.stringContaining(`for user "${MARKER}"`),
+          }),
+        }),
+      ]);
+    },
+  );
+
+  test('forwards a line that holds no credential unchanged and exits 0', async () => {
+    process.env.DATABASE_URL = `postgres://${ENCODED_ROLE}:${PASSWORD}@${DATABASE}`;
+    mockedRunMigrations.mockImplementation(
+      async (_pool: Pool, logger: Logger): Promise<string[]> => {
+        logger.info('migrations applied', { count: 1, versions: '0001_create_users' });
+        return ['0001_create_users'];
+      },
+    );
+
+    await runMigrateCli();
+
+    expect(process.exitCode).toBe(0);
+    expect(capturedEntries()).toEqual([
+      {
+        time: expect.any(String),
+        level: 'info',
+        msg: 'migrations applied',
+        count: 1,
+        versions: '0001_create_users',
+      },
+    ]);
+  });
+
+  test('logs only the fixed configuration message when DATABASE_URL is unset', async () => {
+    delete process.env.DATABASE_URL;
+
+    await runMigrateCli();
+
+    expect(process.exitCode).toBe(1);
+    expect(mockedRunMigrations).not.toHaveBeenCalled();
+    expect(capturedEntries()).toEqual([
+      {
+        time: expect.any(String),
+        level: 'error',
+        msg: 'DATABASE_URL must be a postgres:// connection string',
+      },
+    ]);
+  });
+
+  describe('command-line arguments', () => {
+    /** A connection string with its password, as a user might mistype it onto the command line. */
+    const URL_ARGUMENT = `postgres://${ENCODED_ROLE}:${PASSWORD}@${DATABASE}`;
+
+    let createPoolSpy: jest.SpiedFunction<typeof poolModule.createPool>;
+
+    beforeEach(() => {
+      createPoolSpy = jest.spyOn(poolModule, 'createPool');
+    });
+
+    afterEach(() => {
+      createPoolSpy.mockRestore();
+    });
+
+    test.each([
+      [['--help'], 'unset', undefined],
+      [['-h'], 'unset', undefined],
+      [['--help'], 'invalid', 'not a url'],
+      [['-h'], 'invalid', 'not a url'],
+      [['--help'], 'valid', URL_ARGUMENT],
+    ])(
+      '%j prints the usage and exits 0 without reading DATABASE_URL (%s) or connecting',
+      async (args: string[], _state: string, databaseUrl: string | undefined): Promise<void> => {
+        if (databaseUrl === undefined) {
+          delete process.env.DATABASE_URL;
+        } else {
+          process.env.DATABASE_URL = databaseUrl;
+        }
+
+        await runMigrateCli(args);
+
+        expect(process.exitCode).toBe(0);
+        const text = capturedText();
+        expect(text).toContain('Usage: node dist/db/migrate-cli.js [--help]');
+        expect(text).toContain('DATABASE_URL');
+        expect(text).toContain('-h, --help');
+        // Usage text only: no configuration error and no migration outcome is logged.
+        expect(text).not.toContain('"level"');
+        for (const line of text.split('\n')) {
+          expect(line.length).toBeLessThanOrEqual(100);
+        }
+        expect(mockedRunMigrations).not.toHaveBeenCalled();
+        expect(createPoolSpy).not.toHaveBeenCalled();
+      },
+    );
+
+    test.each([
+      ['an unknown option', ['--bogus'], '--bogus'],
+      ['a positional connection string', [URL_ARGUMENT], URL_ARGUMENT],
+      ['an unknown option holding a connection string', [`--url=${URL_ARGUMENT}`], '--url'],
+      ['a value given to --help', ['--help=1'], '--help=1'],
+      ['--help with a positional argument', ['--help', 'extra'], 'extra'],
+    ])(
+      'rejects %s with one fixed line and exit code 2, echoing none of it',
+      async (_case: string, args: string[], echoed: string): Promise<void> => {
+        // Valid, so a run that read it would go on to the runner.
+        process.env.DATABASE_URL = URL_ARGUMENT;
+
+        await runMigrateCli(args);
+
+        expect(process.exitCode).toBe(2);
+        expect(capturedEntries()).toEqual([
+          {
+            time: expect.any(String),
+            level: 'error',
+            msg: 'invalid arguments; run with --help for usage',
+          },
+        ]);
+        const text = capturedText();
+        expect(text).not.toContain(echoed);
+        expect(text).not.toContain(PASSWORD);
+        expect(mockedRunMigrations).not.toHaveBeenCalled();
+        expect(createPoolSpy).not.toHaveBeenCalled();
+      },
+    );
+  });
+});
+
+describe('createPool connection teardown', () => {
+  /**
+   * How the fake server answers a start-up packet: `scram` asks for SCRAM-SHA-256 and answers the
+   * client's first SASL message, so a client without a password fails on its own side; `trust`
+   * accepts the client at once.
+   */
+  type Handshake = 'scram' | 'trust';
+
+  /** One connection the fake server accepted, seen from the server side. */
+  interface FakeConnection {
+    /** Frontend messages in arrival order: `startup`, then each message's type byte. */
+    readonly received: string[];
+    /** Resolves once the server-side socket has closed, with whether it closed on an error. */
+    readonly closed: Promise<{ hadError: boolean }>;
+    /** Whether the server-side socket has closed. */
+    isClosed(): boolean;
+  }
+
+  /** How long a closed socket may take to reach the server before the test fails. */
+  const PROMPT_CLOSE_MS = 1_000;
+
+  /** How long an open socket is watched to confirm that nothing closes it. */
+  const STAYS_OPEN_MS = 200;
+
+  /** How long to wait after a close for any `error` event it could have caused. */
+  const SETTLE_MS = 50;
+
+  /** pg's message when SCRAM authentication starts with no password to use. */
+  const NO_PASSWORD_ERROR = 'SASL: SCRAM-SERVER-FIRST-MESSAGE: client password must be a string';
+
+  /** A big-endian 32-bit integer, the width of every length and code in the protocol. */
+  function int32(value: number): Buffer {
+    const buffer = Buffer.alloc(4);
+    buffer.writeInt32BE(value);
+    return buffer;
+  }
+
+  /** A backend message: its type byte, its length including itself, and its body. */
+  function backendMessage(type: string, body: Buffer): Buffer {
+    return Buffer.concat([Buffer.from(type, 'latin1'), int32(body.length + 4), body]);
+  }
+
+  /** AuthenticationSASL offering SCRAM-SHA-256, the request a SCRAM server sends first. */
+  const AUTHENTICATION_SASL = backendMessage(
+    'R',
+    Buffer.concat([int32(10), Buffer.from('SCRAM-SHA-256\0\0', 'latin1')]),
+  );
+
+  /** AuthenticationSASLContinue carrying a server-first message. */
+  const AUTHENTICATION_SASL_CONTINUE = backendMessage(
+    'R',
+    Buffer.concat([int32(11), Buffer.from('r=fakenonce,s=c2FsdA==,i=4096', 'latin1')]),
+  );
+
+  /** AuthenticationOk followed by ReadyForQuery (idle), which completes a connection. */
+  const AUTHENTICATED_AND_READY = Buffer.concat([
+    backendMessage('R', int32(0)),
+    backendMessage('Z', Buffer.from('I', 'latin1')),
+  ]);
+
+  /** Serves one accepted socket with the protocol subset `handshake` needs. */
+  function serveConnection(socket: Socket, handshake: Handshake): FakeConnection {
+    const received: string[] = [];
+    let isClosed = false;
+    const closed = new Promise<{ hadError: boolean }>((resolve) => {
+      socket.once('close', (hadError: boolean): void => {
+        isClosed = true;
+        resolve({ hadError });
+      });
+    });
+    // A reset from the client is recorded, so the tests' `received` and `hadError` checks fail on
+    // it rather than the run failing on an unhandled `error` event.
+    socket.on('error', (err: Error): void => {
+      received.push(`socket error ${err.message}`);
+    });
+
+    let pending = Buffer.alloc(0);
+    let typed = false;
+    socket.on('data', (chunk: Buffer): void => {
+      pending = Buffer.concat([pending, chunk]);
+      for (;;) {
+        // The start-up packet has no type byte; every later frontend message starts with one.
+        const headerLength = typed ? 5 : 4;
+        if (pending.length < headerLength) {
+          return;
+        }
+        const messageLength = typed ? pending.readInt32BE(1) + 1 : pending.readInt32BE(0);
+        if (pending.length < messageLength) {
+          return;
+        }
+        const type = typed ? pending.toString('latin1', 0, 1) : 'startup';
+        pending = pending.subarray(messageLength);
+        typed = true;
+        received.push(type);
+
+        if (type === 'startup') {
+          socket.write(handshake === 'scram' ? AUTHENTICATION_SASL : AUTHENTICATED_AND_READY);
+        } else if (type === 'p' && handshake === 'scram') {
+          socket.write(AUTHENTICATION_SASL_CONTINUE);
+        }
+      }
+    });
+
+    return { received, closed, isClosed: (): boolean => isClosed };
+  }
+
+  /** A minimal PostgreSQL server on 127.0.0.1 that records what each connection receives. */
+  class FakePgServer {
+    private readonly connections: FakeConnection[] = [];
+
+    private readonly sockets = new Set<Socket>();
+
+    private readonly server: Server;
+
+    /** Creates a server that answers every connection with `handshake`; call `listen` next. */
+    constructor(handshake: Handshake) {
+      this.server = createServer((socket: Socket): void => {
+        this.sockets.add(socket);
+        socket.once('close', (): void => {
+          this.sockets.delete(socket);
+        });
+        this.connections.push(serveConnection(socket, handshake));
+      });
+    }
+
+    /** Listens on an ephemeral port and resolves with it. */
+    async listen(): Promise<number> {
+      await new Promise<void>((resolve, reject) => {
+        this.server.once('error', reject);
+        this.server.listen(0, '127.0.0.1', (): void => {
+          this.server.off('error', reject);
+          resolve();
+        });
+      });
+      const address: AddressInfo | string | null = this.server.address();
+      if (address === null || typeof address === 'string') {
+        throw new Error('fake server is not listening on a TCP port');
+      }
+      return address.port;
+    }
+
+    /** The single connection accepted so far; throws unless exactly one was accepted. */
+    onlyConnection(): FakeConnection {
+      const [connection, ...others] = this.connections;
+      if (connection === undefined || others.length > 0) {
+        throw new Error(`fake server accepted ${this.connections.length} connections, not 1`);
+      }
+      return connection;
+    }
+
+    /** Destroys every open socket and stops listening. */
+    async close(): Promise<void> {
+      for (const socket of this.sockets) {
+        socket.destroy();
+      }
+      await new Promise<void>((resolve, reject) => {
+        this.server.close((err?: Error): void => (err === undefined ? resolve() : reject(err)));
+      });
+    }
+  }
+
+  /** Resolves with `promise`'s value, or rejects once `ms` milliseconds pass first. */
+  async function within<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout((): void => reject(new Error(`${what} took longer than ${ms} ms`)), ms);
+    });
+    try {
+      return await Promise.race([promise, timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  const originalEnv = process.env;
+  let servers: FakePgServer[];
+
+  /** Starts a fake server for this test and returns a password-less URL for it. */
+  async function fakeServerUrl(handshake: Handshake): Promise<[FakePgServer, string]> {
+    const server = new FakePgServer(handshake);
+    servers.push(server);
+    const port = await server.listen();
+    return [server, `postgres://alice@127.0.0.1:${port}/db`];
+  }
+
+  beforeEach(() => {
+    servers = [];
+    // The URL carries no password, so none may come from the environment either: pg falls back
+    // to PGPASSWORD, then to the pgpass file, which here is a path that does not exist. SSL
+    // stays off so the start-up packet is the first thing the fake server reads.
+    process.env = {
+      ...originalEnv,
+      PGPASSFILE: path.join(tmpdir(), `pool-test-no-pgpass-${randomUUID()}`),
+    };
+    delete process.env.PGPASSWORD;
+    delete process.env.PGSSLMODE;
+  });
+
+  afterEach(async () => {
+    process.env = originalEnv;
+    await Promise.all(servers.map((server) => server.close()));
+  });
+
+  test('a connection pg rejects itself closes its socket at once and logs nothing', async () => {
+    const [server, url] = await fakeServerUrl('scram');
+    const logger = new CaptureLogger();
+    const pool = createPool(url, logger);
+
+    await expect(pool.connect()).rejects.toThrow(NO_PASSWORD_ERROR);
+
+    const connection = server.onlyConnection();
+    // Without the teardown the socket would stay open until the server's authentication timeout.
+    await expect(within(connection.closed, PROMPT_CLOSE_MS, 'socket close')).resolves.toEqual({
+      hadError: false,
+    });
+    // A plain end of file: no Terminate message was sent in the middle of authentication.
+    expect(connection.received).toEqual(['startup', 'p']);
+
+    await delay(SETTLE_MS);
+    await expect(pool.end()).resolves.toBeUndefined();
+    expect(logger.entries()).toEqual([]);
+  });
+
+  test('a connected client keeps its socket, also after a refused second connect', async () => {
+    const [server, url] = await fakeServerUrl('trust');
+    const logger = new CaptureLogger();
+    const pool = createPool(url, logger);
+
+    const client = await pool.connect();
+    const connection = server.onlyConnection();
+    await delay(STAYS_OPEN_MS);
+    expect(connection.isClosed()).toBe(false);
+
+    // pg refuses to reuse a client; that refusal must not close the live socket.
+    await expect(client.connect()).rejects.toThrow('Client has already been connected');
+    await delay(STAYS_OPEN_MS);
+    expect(connection.isClosed()).toBe(false);
+
+    client.release();
+    await delay(STAYS_OPEN_MS);
+    expect(connection.isClosed()).toBe(false);
+
+    await pool.end();
+    await expect(within(connection.closed, PROMPT_CLOSE_MS, 'socket close')).resolves.toEqual({
+      hadError: false,
+    });
+    expect(connection.received).toEqual(['startup', 'X']);
+    expect(logger.entries()).toEqual([]);
+  });
+});
+
+/** Clock reading during every logger test, so whole lines can be compared byte for byte. */
+const LOG_NOW = '2026-01-02T03:04:05.678Z';
+
+/** The only keys a serialized error may carry. */
+const LOG_ERR_KEYS: readonly string[] = ['name', 'message', 'code', 'stack'];
+
+/** A logger writing into memory, and the text it has written so far. */
+interface LogCapture {
+  logger: Logger;
+  text(): string;
+}
+
+/** Creates a logger over a synchronous in-memory stream, with `options` when given. */
+function captureLog(options?: LoggerOptions): LogCapture {
+  const chunks: string[] = [];
+  const sink = new Writable({
+    write(
+      chunk: unknown,
+      _encoding: BufferEncoding,
+      callback: (error?: Error | null) => void,
+    ): void {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk));
+      callback();
+    },
+  });
+  return { logger: createLogger(sink, options), text: () => chunks.join('') };
+}
+
+/** Asserts that `text` is exactly one newline-terminated line and returns it parsed. */
+function parseOnlyLogLine(text: string): Record<string, unknown> {
+  const lines = text.split('\n');
+  expect(lines).toHaveLength(2);
+  expect(lines[1]).toBe('');
+  const parsed: unknown = JSON.parse(lines[0] ?? '');
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error('log line is not a JSON object');
+  }
+  return { ...parsed };
+}
+
+/** Throws from a getter or a proxy trap. */
+function hostileRead(): never {
+  throw new Error('hostile read');
+}
+
+/** Returns a plain object that contains itself, which `JSON.stringify` rejects. */
+function cyclicObject(): Record<string, unknown> {
+  const value: Record<string, unknown> = {};
+  value.self = value;
+  return value;
+}
+
+/** Returns `new Error('original failure')` with its `key` property redefined. */
+function errorWith(key: string, descriptor: PropertyDescriptor, cause?: unknown): Error {
+  const err =
+    cause === undefined
+      ? new Error('original failure')
+      : new Error('original failure', { cause });
+  Object.defineProperty(err, key, { configurable: true, ...descriptor });
+  return err;
+}
+
+/** Returns an `Error` proxy that is already revoked, so every operation on it throws. */
+function revokedProxy(): object {
+  const { proxy, revoke } = Proxy.revocable(new Error('original failure'), {});
+  revoke();
+  return proxy;
+}
+
+/**
+ * Registers the hooks of one logger describe: the clock fixed at {@link LOG_NOW} for each test,
+ * then real timers and every spy restored after it. Each logger describe calls it itself, so the
+ * pool, runner and schema suites in this file keep real timers.
+ */
+function useLogClock(): void {
+  beforeEach(() => {
+    jest.useFakeTimers({ now: new Date(LOG_NOW) });
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+    jest.restoreAllMocks();
+  });
+}
+
+describe('createLogger error()', () => {
+  useLogClock();
+
+  test.each<[string, () => unknown, Record<string, unknown>]>([
+    [
+      'throwing code getter',
+      () => errorWith('code', { get: hostileRead }),
+      { name: 'Error', message: 'original failure', stack: expect.any(String) },
+    ],
+    [
+      'throwing code getter, readable cause.code',
+      () => errorWith('code', { get: hostileRead }, { code: 'ECONNREFUSED' }),
+      {
+        name: 'Error',
+        message: 'original failure',
+        code: 'ECONNREFUSED',
+        stack: expect.any(String),
+      },
+    ],
+    [
+      'throwing cause getter',
+      () => errorWith('cause', { get: hostileRead }),
+      { name: 'Error', message: 'original failure', stack: expect.any(String) },
+    ],
+    [
+      'throwing cause.code getter',
+      () =>
+        new Error('original failure', {
+          cause: Object.defineProperty({}, 'code', { get: hostileRead }),
+        }),
+      { name: 'Error', message: 'original failure', stack: expect.any(String) },
+    ],
+    [
+      'proxy whose has trap throws',
+      () => new Proxy(new Error('original failure'), { has: hostileRead }),
+      { name: 'Error', message: 'original failure', stack: expect.any(String) },
+    ],
+    [
+      'proxy whose get trap throws',
+      () => new Proxy(new Error('original failure'), { get: hostileRead }),
+      { message: '[unreadable message]' },
+    ],
+    [
+      'proxy whose getPrototypeOf trap throws',
+      () => new Proxy(new Error('original failure'), { getPrototypeOf: hostileRead }),
+      { message: 'Error: original failure' },
+    ],
+    ['revoked proxy', revokedProxy, { message: '[unprintable object]' }],
+    [
+      'number name',
+      () => errorWith('name', { value: 42 }),
+      { message: 'original failure', stack: expect.any(String) },
+    ],
+    [
+      'cyclic name',
+      () => errorWith('name', { value: cyclicObject() }),
+      { message: 'original failure', stack: expect.any(String) },
+    ],
+    [
+      'BigInt name',
+      () => errorWith('name', { value: 10n }),
+      { message: 'original failure', stack: expect.any(String) },
+    ],
+    // V8 formats `stack` on its first read from `name` and `message`. Where either throws when
+    // read or converted to text (here and in two `message` rows below), so does reading
+    // `stack`, and it is omitted as well.
+    [
+      'throwing name getter',
+      () => errorWith('name', { get: hostileRead }),
+      { message: 'original failure' },
+    ],
+    [
+      'cyclic message',
+      () => errorWith('message', { value: cyclicObject() }),
+      { name: 'Error', message: '[object Object]', stack: expect.any(String) },
+    ],
+    [
+      'BigInt message',
+      () => errorWith('message', { value: 10n }),
+      { name: 'Error', message: '10', stack: expect.any(String) },
+    ],
+    [
+      'prototype-less object message',
+      () => errorWith('message', { value: Object.create(null) }),
+      { name: 'Error', message: '[unprintable object]' },
+    ],
+    [
+      'throwing message getter',
+      () => errorWith('message', { get: hostileRead }),
+      { name: 'Error', message: '[unreadable message]' },
+    ],
+    [
+      'cyclic stack',
+      () => errorWith('stack', { value: cyclicObject() }),
+      { name: 'Error', message: 'original failure' },
+    ],
+    [
+      'throwing stack getter',
+      () => errorWith('stack', { get: hostileRead }),
+      { name: 'Error', message: 'original failure' },
+    ],
+    [
+      'BigInt code',
+      () => errorWith('code', { value: 10n }),
+      { name: 'Error', message: 'original failure', stack: expect.any(String) },
+    ],
+    [
+      'NaN code',
+      () => errorWith('code', { value: Number.NaN }),
+      { name: 'Error', message: 'original failure', stack: expect.any(String) },
+    ],
+    [
+      'Infinity code, readable cause.code',
+      () => errorWith('code', { value: Number.POSITIVE_INFINITY }, { code: '57P01' }),
+      { name: 'Error', message: 'original failure', code: '57P01', stack: expect.any(String) },
+    ],
+    [
+      'cyclic cause',
+      () => errorWith('cause', { value: cyclicObject() }),
+      { name: 'Error', message: 'original failure', stack: expect.any(String) },
+    ],
+  ])('reduces an error with a %s to primitives in one line', (_label, makeErr, expected) => {
+    const { logger, text } = captureLog();
+    const err = makeErr();
+
+    expect(() => logger.error('failure', err)).not.toThrow();
+
+    const entry = parseOnlyLogLine(text());
+    expect(Object.keys(entry)).toEqual(['time', 'level', 'msg', 'err']);
+    const reduced = entry.err;
+    if (typeof reduced !== 'object' || reduced === null || Array.isArray(reduced)) {
+      throw new Error('err is not a JSON object');
+    }
+    const reducedEntries: [string, unknown][] = Object.entries(reduced);
+    for (const [key, value] of reducedEntries) {
+      expect(LOG_ERR_KEYS).toContain(key);
+      expect(
+        typeof value === 'string' || (typeof value === 'number' && Number.isFinite(value)),
+      ).toBe(true);
+    }
+    expect(reduced).toEqual(expected);
+  });
+
+  test.each<[string, unknown]>([
+    ['cyclic object', cyclicObject()],
+    ['BigInt', 10n],
+    ['object whose toJSON throws', { toJSON: hostileRead }],
+  ])('replaces a cast %s msg that cannot be serialized', (_label, msg) => {
+    const { logger, text } = captureLog();
+    const err = errorWith('stack', { value: 'Error: original failure\n    at handler' });
+
+    expect(() => logger.error(msg as string, err, { method: 'GET' })).not.toThrow();
+
+    // Only the guaranteed primitives survive: the caller's fields are dropped with the msg.
+    expect(text()).toBe(
+      `${JSON.stringify({
+        time: LOG_NOW,
+        level: 'error',
+        msg: '[unserializable msg]',
+        err: {
+          name: 'Error',
+          message: 'original failure',
+          stack: 'Error: original failure\n    at handler',
+        },
+      })}\n`,
+    );
+  });
+
+  test('writes time, level and a fixed msg when the reduced line cannot be serialized', () => {
+    const { logger, text } = captureLog();
+    // Stands in for output longer than the engine's maximum string length.
+    jest
+      .spyOn(JSON, 'stringify')
+      .mockImplementationOnce(() => {
+        throw new RangeError('Invalid string length');
+      })
+      .mockImplementationOnce(() => {
+        throw new RangeError('Invalid string length');
+      });
+
+    expect(() => logger.error('migration failed', new Error('original failure'))).not.toThrow();
+
+    expect(text()).toBe(`{"time":"${LOG_NOW}","level":"error","msg":"[unserializable msg]"}\n`);
+  });
+});
+
+describe('createLogger fields', () => {
+  useLogClock();
+
+  test.each<[string, () => unknown, string]>([
+    [
+      'a throwing getter drops that field only',
+      () =>
+        Object.defineProperty({ method: 'GET' }, 'path', { enumerable: true, get: hostileRead }),
+      `{"time":"${LOG_NOW}","level":"info","msg":"event","method":"GET"}\n`,
+    ],
+    [
+      'a proxy whose ownKeys trap throws drops every field',
+      () => new Proxy({ method: 'GET' }, { ownKeys: hostileRead }),
+      `{"time":"${LOG_NOW}","level":"info","msg":"event"}\n`,
+    ],
+    [
+      'a proxy whose get trap throws drops every field',
+      () => new Proxy({ method: 'GET', path: '/tasks' }, { get: hostileRead }),
+      `{"time":"${LOG_NOW}","level":"info","msg":"event"}\n`,
+    ],
+    [
+      'a revoked proxy drops every field',
+      revokedProxy,
+      `{"time":"${LOG_NOW}","level":"info","msg":"event"}\n`,
+    ],
+  ])('%s', (_label, makeFields, expected) => {
+    const { logger, text } = captureLog();
+    const fields = makeFields() as LogFields;
+
+    expect(() => logger.info('event', fields)).not.toThrow();
+
+    expect(text()).toBe(expected);
+  });
+});
+
+describe('createLogger ordinary inputs', () => {
+  useLogClock();
+
+  /** A pg driver error: its `detail` and `query` carry row values and SQL text. */
+  function driverError(message: string, code: string): Error {
+    return Object.assign(new Error(message), {
+      code,
+      detail: 'Key (lower(email))=(alice@example.com) already exists.',
+      query: 'INSERT INTO users (email, password_hash) VALUES ($1, $2)',
+      stack: `Error: ${message}\n    at driver`,
+    });
+  }
+
+  /** `DatabaseUnavailableError` wrapping a driver error, as the query helper builds it. */
+  function unavailable(): Error {
+    const err = new DatabaseUnavailableError('Database unavailable', {
+      cause: driverError('connect ECONNREFUSED 127.0.0.1:5432', 'ECONNREFUSED'),
+    });
+    err.stack = 'DatabaseUnavailableError: Database unavailable\n    at query';
+    return err;
+  }
+
+  test.each<[string, (logger: Logger) => void, Record<string, unknown>]>([
+    [
+      'info with fields',
+      (logger) => logger.info('server listening', { port: 3000 }),
+      { time: LOG_NOW, level: 'info', msg: 'server listening', port: 3000 },
+    ],
+    [
+      'error without err',
+      (logger) => logger.error('configuration invalid'),
+      { time: LOG_NOW, level: 'error', msg: 'configuration invalid' },
+    ],
+    [
+      'DatabaseUnavailableError reporting cause.code, with request fields',
+      (logger) =>
+        logger.error('database unavailable', unavailable(), { method: 'GET', path: '/tasks' }),
+      {
+        time: LOG_NOW,
+        level: 'error',
+        msg: 'database unavailable',
+        method: 'GET',
+        path: '/tasks',
+        err: {
+          name: 'DatabaseUnavailableError',
+          message: 'Database unavailable',
+          code: 'ECONNREFUSED',
+          stack: 'DatabaseUnavailableError: Database unavailable\n    at query',
+        },
+      },
+    ],
+    [
+      'driver error with its own code',
+      (logger) =>
+        logger.error(
+          'unexpected error',
+          driverError('duplicate key value violates unique constraint', '23505'),
+        ),
+      {
+        time: LOG_NOW,
+        level: 'error',
+        msg: 'unexpected error',
+        err: {
+          name: 'Error',
+          message: 'duplicate key value violates unique constraint',
+          code: '23505',
+          stack: 'Error: duplicate key value violates unique constraint\n    at driver',
+        },
+      },
+    ],
+    [
+      'thrown non-Error value',
+      (logger) => logger.error('purge failed', 'socket closed'),
+      { time: LOG_NOW, level: 'error', msg: 'purge failed', err: { message: 'socket closed' } },
+    ],
+    [
+      'reserved field names',
+      (logger) =>
+        logger.error('purge failed', undefined, {
+          time: 'forged',
+          level: 'forged',
+          msg: 'forged',
+          err: 'forged',
+          method: 'POST',
+        }),
+      { time: LOG_NOW, level: 'error', msg: 'purge failed', method: 'POST' },
+    ],
+  ])('writes %s exactly as before', (_label, call, expected) => {
+    const { logger, text } = captureLog();
+
+    call(logger);
+
+    // `expected` lists the keys in the logger's fixed order, so this compares bytes and order.
+    expect(text()).toBe(`${JSON.stringify(expected)}\n`);
+  });
+});
+
+describe('createLogger redaction', () => {
+  useLogClock();
+
+  /** A database role name as PostgreSQL quotes it in messages: percent-decoded. */
+  const ROLE = 'alice@example.com';
+  /** The same role name as written in a connection string. */
+  const ENCODED_ROLE = 'alice%40example.com';
+  /** Assembled at run time, so no literal password sits in the source. */
+  const PASSWORD = ['plain', 'test', 'word'].join('');
+  const MARKER = '[redacted]';
+
+  /** A driver error shaped like the one `pg` raises, with `name`, `code` and a fixed stack. */
+  function driverFailure(message: string): Error {
+    return Object.assign(new Error(message), {
+      name: 'error',
+      code: '28P01',
+      stack: `error: ${message}\n    at connect`,
+    });
+  }
+
+  /** The line `logger.error('migration failed', driverFailure(message))` is expected to write. */
+  function migrationFailedLine(message: string): Record<string, unknown> {
+    return {
+      time: LOG_NOW,
+      level: 'error',
+      msg: 'migration failed',
+      err: { name: 'error', message, code: '28P01', stack: `error: ${message}\n    at connect` },
+    };
+  }
+
+  test.each<[string, readonly string[], (logger: Logger) => void, Record<string, unknown>]>([
+    [
+      'the user name, as quoted and as written, and the password in the message and stack',
+      [ROLE, ENCODED_ROLE, PASSWORD],
+      (logger) =>
+        logger.error(
+          'migration failed',
+          driverFailure(`authentication failed for user "${ROLE}" (${ENCODED_ROLE}:${PASSWORD})`),
+        ),
+      migrationFailedLine(`authentication failed for user "${MARKER}" (${MARKER}:${MARKER})`),
+    ],
+    [
+      'a value that contains another whole, whatever order they are given in',
+      ['alice', ROLE],
+      (logger) =>
+        logger.error('migration failed', driverFailure(`failed for user "${ROLE}" (alice)`)),
+      migrationFailedLine(`failed for user "${MARKER}" (${MARKER})`),
+    ],
+    [
+      'in a single pass, never inside a marker it has just written',
+      ['redacted', 'alice'],
+      (logger) => logger.error('migration failed', driverFailure('alice redacted')),
+      migrationFailedLine(`${MARKER} ${MARKER}`),
+    ],
+    [
+      'values holding regular-expression metacharacters as literal text only',
+      ['.', '(w)+', 'a$&b'],
+      (logger) => logger.error('migration failed', driverFailure('x.y (w)+ ww a$&b')),
+      migrationFailedLine(`x${MARKER}y ${MARKER} ww ${MARKER}`),
+    ],
+    [
+      'only the error text, so values equal to the time, level, msg, fields, name or code stay',
+      [LOG_NOW, 'error', 'migration failed', '28P01', 'GET', '/tasks'],
+      (logger) =>
+        logger.error('migration failed', driverFailure('failed for user "error"'), {
+          method: 'GET',
+          path: '/tasks',
+        }),
+      {
+        time: LOG_NOW,
+        level: 'error',
+        msg: 'migration failed',
+        method: 'GET',
+        path: '/tasks',
+        err: {
+          name: 'error',
+          message: `failed for user "${MARKER}"`,
+          code: '28P01',
+          // The stack is driver text throughout, its `name: message` head included.
+          stack: `${MARKER}: failed for user "${MARKER}"\n    at connect`,
+        },
+      },
+    ],
+    [
+      'the message of a thrown non-Error value',
+      [PASSWORD],
+      (logger) => logger.error('purge failed', `socket closed for ${PASSWORD}`),
+      {
+        time: LOG_NOW,
+        level: 'error',
+        msg: 'purge failed',
+        err: { message: `socket closed for ${MARKER}` },
+      },
+    ],
+    [
+      'nothing from an info line, whose fields the code produces',
+      [ROLE],
+      (logger) => logger.info('migrations applied', { count: 1, versions: ROLE }),
+      { time: LOG_NOW, level: 'info', msg: 'migrations applied', count: 1, versions: ROLE },
+    ],
+  ])('redacts %s', (_label, redact, call, expected) => {
+    const { logger, text } = captureLog({ redact });
+
+    call(logger);
+
+    // `expected` lists the keys in the logger's fixed order, so this compares bytes and order.
+    expect(text()).toBe(`${JSON.stringify(expected)}\n`);
+  });
+
+  test.each<[string, LoggerOptions]>([
+    ['an empty options object', {}],
+    ['an empty redact list', { redact: [] }],
+    ['only empty strings to redact', { redact: ['', ''] }],
+    ['a value that never occurs', { redact: ['absent-value'] }],
+  ])('writes exactly the lines of a logger without options given %s', (_label, options) => {
+    const calls = (logger: Logger): void => {
+      logger.info('server listening', { port: 3000 });
+      logger.error('configuration invalid');
+      logger.error('migration failed', driverFailure(`failed for user "${ROLE}"`));
+      logger.error('purge failed', 'socket closed', { method: 'GET' });
+    };
+    const plain = captureLog();
+    const configured = captureLog(options);
+
+    calls(plain.logger);
+    calls(configured.logger);
+
+    expect(configured.text()).toBe(plain.text());
+    expect(configured.text().split('\n')).toHaveLength(5);
+  });
+
+  test('writes a fixed message and drops the stack when a replacement fails', () => {
+    const { logger, text } = captureLog({ redact: [PASSWORD] });
+    const err = driverFailure(`failed for ${PASSWORD}`);
+    // Stands in for a replacement whose result exceeds the engine's maximum string length. The
+    // spy is removed before any assertion runs, since the matchers replace text themselves.
+    const replace = jest.spyOn(String.prototype, 'replace').mockImplementation(() => {
+      throw new RangeError('Invalid string length');
+    });
+    let thrown: unknown = null;
+    try {
+      logger.error('migration failed', err);
+    } catch (caught) {
+      thrown = caught;
+    } finally {
+      replace.mockRestore();
+    }
+
+    expect(thrown).toBeNull();
+
+    expect(text()).toBe(
+      `${JSON.stringify({
+        time: LOG_NOW,
+        level: 'error',
+        msg: 'migration failed',
+        err: { name: 'error', message: '[unredactable message]', code: '28P01' },
+      })}\n`,
+    );
+  });
+});
 
 /** Every migration version in application order: each file's name without `.sql`. */
 const ALL_VERSIONS: readonly string[] = [

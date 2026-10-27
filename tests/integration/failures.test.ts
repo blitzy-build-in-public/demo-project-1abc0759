@@ -7,26 +7,43 @@
  *   both processes keep serving.
  * - 404 "Page not found.", 400 and 413 "Bad request." and 500 "Something went wrong.", none of
  *   them carrying a stack frame, SQL text or driver detail, and no malformed request changing data.
+ *   A logger that throws changes no response: the 500 and 503 pages are still sent, a response
+ *   whose headers were already sent is still cut off, and nothing is printed to the console.
  * - The purge job: a failed run resolves and logs `purge failed`, the same job's next run against
  *   a reachable database purges and logs its counts, and a run never overlaps another.
+ * - The server's start-up and shutdown, running `main()` from `src/server.ts` in this process:
+ *   a failed authentication of an email-shaped database role logs `migration failed` once with
+ *   the role and password redacted and exits 1 without listening; a log write that throws at
+ *   start-up still releases the port, the purge job, the signal handlers and the pool and exits
+ *   1, and one that throws during a shutdown still closes everything and exits 0 exactly once,
+ *   neither leaving an unhandled rejection.
  *
  * The unreachable instance points at port 1 on the loopback interface, which refuses at once
  * (`ECONNREFUSED`), so no case waits on the pool's 5-second connection timeout.
  */
 
 import { randomBytes, randomUUID } from 'node:crypto';
+import http from 'node:http';
+import net from 'node:net';
 import { runInThisContext } from 'node:vm';
 
+import express from 'express';
 import type { Pool } from 'pg';
 
 import { createAuthService } from '../../src/auth/auth-service';
 import type { AuthService, PurgeResult } from '../../src/auth/auth-service';
 import { createDataAccess } from '../../src/db/data-access';
 import { createPool } from '../../src/db/pool';
+import * as poolModule from '../../src/db/pool';
 import { createSessionsRepo } from '../../src/db/sessions-repo';
 import { createPurgeJob } from '../../src/purge-job';
 import type { PurgeJob } from '../../src/purge-job';
+import * as purgeJobModule from '../../src/purge-job';
 import type { ReportService } from '../../src/reports/report-service';
+import { main as startServer } from '../../src/server';
+import { DatabaseUnavailableError } from '../../src/shared/errors';
+import type { LogFields } from '../../src/shared/logger';
+import { createErrorHandler } from '../../src/web/middleware/error-handler';
 
 import { CaptureLogger } from '../helpers/capture-logger';
 import type { CapturedEntry } from '../helpers/capture-logger';
@@ -35,6 +52,7 @@ import type { HttpClient, HttpResult } from '../helpers/http-client';
 import { startTestApp } from '../helpers/test-app';
 import type { TestApp } from '../helpers/test-app';
 import {
+  assertTestDatabaseUrl,
   countRows,
   createTestPool,
   insertLoginFailures,
@@ -523,6 +541,248 @@ describe('failure responses and the purge failure policy', () => {
     });
   });
 
+  describe('a failing logger', () => {
+    /** What every `error` call of a {@link ThrowingLogger} fails with; no response may carry it. */
+    const LOG_SINK_FAILURE = 'log sink failed';
+
+    /** The text the partial route sends before it fails; the connection is cut right after it. */
+    const PARTIAL_BODY = 'partial';
+
+    /** One call the error handler made to {@link ThrowingLogger.error}. */
+    interface LogAttempt {
+      msg: string;
+      fields: LogFields | undefined;
+    }
+
+    /**
+     * A logger whose `error` throws, as the production logger does when its output stream's
+     * `write` throws. Each attempt is recorded first, so a case can show that the handler did try
+     * to log, under its usual event name and fields.
+     */
+    class ThrowingLogger extends CaptureLogger {
+      /** Every `error` call, in order. */
+      readonly attempts: LogAttempt[] = [];
+
+      override error(msg: string, _err?: unknown, fields?: LogFields): void {
+        this.attempts.push({ msg, fields });
+        throw new Error(LOG_SINK_FAILURE);
+      }
+    }
+
+    /** Resolves one macrotask later, after anything Express defers with `setImmediate`. */
+    function nextMacrotask(): Promise<void> {
+      return new Promise<void>((resolve) => setImmediate(resolve));
+    }
+
+    /** Drops every open connection, then closes `server`. */
+    function stopServer(server: http.Server): Promise<void> {
+      server.closeAllConnections();
+      return new Promise<void>((resolve, reject): void => {
+        server.close((err?: Error): void => {
+          if (err) {
+            reject(err);
+          } else {
+            resolve();
+          }
+        });
+      });
+    }
+
+    /**
+     * Starts a minimal application on an ephemeral loopback port. Its only route, `GET /partial`,
+     * sends status 200 and {@link PARTIAL_BODY}, then fails with `failure()`; the production error
+     * handler, logging to `logger`, is mounted after it.
+     */
+    async function startPartialApp(
+      logger: ThrowingLogger,
+      failure: () => Error,
+    ): Promise<{ server: http.Server; origin: string }> {
+      const app = express();
+      // Outside the `test` mode, Express's default handler prints the stack with console.error, as
+      // on a development or production server. Under Jest's NODE_ENV=test it would stay silent.
+      app.set('env', 'development');
+      app.get('/partial', (_req, res, next): void => {
+        res.status(200);
+        // The failure is raised once the text is flushed, so the client already holds the headers
+        // and the partial body when the connection is cut.
+        res.write(PARTIAL_BODY, (): void => {
+          next(failure());
+        });
+      });
+      app.use(createErrorHandler(logger));
+
+      const server = http.createServer(app);
+      await new Promise<void>((resolve, reject): void => {
+        server.once('error', reject);
+        server.listen(0, '127.0.0.1', (): void => {
+          server.off('error', reject);
+          resolve();
+        });
+      });
+      const address = server.address();
+      if (address === null || typeof address === 'string') {
+        await stopServer(server);
+        throw new Error('the partial app has no TCP address');
+      }
+      return { server, origin: `http://127.0.0.1:${address.port}` };
+    }
+
+    /** What a client received: the status, whether the response ended normally, and its text. */
+    interface RawResponse {
+      status: number | null;
+      complete: boolean;
+      body: string;
+    }
+
+    /**
+     * Sends `GET url` on a connection of its own and settles once the response ends or the
+     * connection fails; it never rejects. A response cut off mid-body settles with
+     * `complete: false` and the text received before the cut.
+     */
+    function getRaw(url: string): Promise<RawResponse> {
+      return new Promise<RawResponse>((resolve): void => {
+        const chunks: Buffer[] = [];
+        let status: number | null = null;
+        let settled = false;
+        const settle = (complete: boolean): void => {
+          if (!settled) {
+            settled = true;
+            resolve({ status, complete, body: Buffer.concat(chunks).toString('utf8') });
+          }
+        };
+        const req = http.get(url, { agent: false }, (res): void => {
+          status = res.statusCode ?? null;
+          res.on('data', (chunk: Buffer): void => {
+            chunks.push(chunk);
+          });
+          res.on('end', (): void => settle(res.complete));
+          res.on('error', (): void => settle(false));
+          res.on('close', (): void => settle(res.complete));
+        });
+        req.on('error', (): void => settle(false));
+      });
+    }
+
+    /** Fails as an unexpected server error would. */
+    const failRead = (): never => {
+      throw new Error('report read failed');
+    };
+    const failingReports: ReportService = {
+      today: () => '2026-10-21',
+      summary: async () => failRead(),
+      completions: async () => failRead(),
+      exportCsv: async () => failRead(),
+    };
+
+    // Express's default handler, once reached, reports the error with console.error.
+    let consoleError: jest.SpiedFunction<typeof console.error>;
+
+    beforeEach(() => {
+      // Silenced, so a regression fails on the assertions below instead of printing a stack.
+      consoleError = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    });
+
+    afterEach(() => {
+      consoleError.mockRestore();
+    });
+
+    /** A request that fails before any byte of its response is sent. */
+    interface UnsentCase {
+      status: 500 | 503;
+      message: string;
+      logMsg: 'unexpected error' | 'database unavailable';
+      method: 'GET' | 'POST';
+      path: string;
+      /** Starts the instance the request fails on. */
+      start(logger: ThrowingLogger): Promise<TestApp>;
+      /** Sends the failing request. */
+      send(app: TestApp): Promise<HttpResult>;
+    }
+
+    const UNSENT_CASES: readonly UnsentCase[] = [
+      {
+        status: 500,
+        message: 'Something went wrong.',
+        logMsg: 'unexpected error',
+        method: 'GET',
+        path: '/reports',
+        start: (logger) => startTestApp({ clock, logger, overrides: { reports: failingReports } }),
+        send: async (app) => {
+          const client = await signUpAndLogIn(app, 'failing-logger@example.com');
+          return client.get('/reports');
+        },
+      },
+      {
+        status: 503,
+        message: 'Service temporarily unavailable',
+        logMsg: 'database unavailable',
+        method: 'POST',
+        path: '/login',
+        start: (logger) => startTestApp({ clock, logger, databaseUrl: UNREACHABLE }),
+        send: async (app) => {
+          const client = app.client();
+          // No `sid` cookie, so the login page needs no database and carries the anonymous token.
+          expect((await client.get('/login')).status).toBe(200);
+          return client.post('/login', { email: 'failing-logger@example.com', password: PASSWORD });
+        },
+      },
+    ];
+
+    it.each(UNSENT_CASES)(
+      'still answers $status "$message" when logging the failure throws',
+      async ({ status, message, logMsg, method, path, start, send }) => {
+        const logger = new ThrowingLogger();
+        const app = await start(logger);
+        try {
+          const res = await send(app);
+
+          // `<pre>` opens the stack trace that Express's default page shows outside production.
+          expectFailurePage(res, status, message, [LOG_SINK_FAILURE, '<pre>']);
+          expect(logger.attempts).toEqual([{ msg: logMsg, fields: { method, path } }]);
+          await nextMacrotask();
+          expect(consoleError).not.toHaveBeenCalled();
+        } finally {
+          await app.close();
+        }
+      },
+    );
+
+    const SENT_CASES = [
+      {
+        name: 'an unexpected error',
+        logMsg: 'unexpected error',
+        failure: (): Error => new Error('stream failed after the headers'),
+      },
+      {
+        name: 'a database outage',
+        logMsg: 'database unavailable',
+        failure: (): Error => new DatabaseUnavailableError(),
+      },
+    ] as const;
+
+    it.each(SENT_CASES)(
+      'still cuts off a response already under way when logging $name throws',
+      async ({ logMsg, failure }) => {
+        const logger = new ThrowingLogger();
+        const { server, origin } = await startPartialApp(logger, failure);
+        try {
+          const received = await getRaw(`${origin}/partial`);
+
+          // Exactly the text sent before the failure, never ended: no default error page or stack
+          // was appended, and the client sees the response as truncated.
+          expect(received).toEqual({ status: 200, complete: false, body: PARTIAL_BODY });
+          expect(logger.attempts).toEqual([
+            { msg: logMsg, fields: { method: 'GET', path: '/partial' } },
+          ]);
+          await nextMacrotask();
+          expect(consoleError).not.toHaveBeenCalled();
+        } finally {
+          await stopServer(server);
+        }
+      },
+    );
+  });
+
   describe('the scheduled purge', () => {
     const purgeLog = new CaptureLogger();
     let downPool: Pool;
@@ -650,4 +910,329 @@ describe('failure responses and the purge failure policy', () => {
       expect(purgeLog.byMsg('purge completed')).toHaveLength(1);
     });
   });
+});
+
+describe('server start-up and shutdown', () => {
+  /** The integration database: already migrated, so a start-up against it applies nothing. */
+  const DATABASE_URL = assertTestDatabaseUrl(process.env.DATABASE_URL);
+
+  /** A database role shaped like an email address, as PostgreSQL quotes it in its messages. */
+  const EMAIL_ROLE = 'server-role@example.com';
+
+  /** The same role as a connection string carries it. */
+  const ENCODED_ROLE = encodeURIComponent(EMAIL_ROLE);
+
+  /** No role's password, assembled at run time so that no literal password sits in the source. */
+  const WRONG_PASSWORD = ['wrong', randomBytes(12).toString('hex')].join('-');
+
+  const MARKER = '[redacted]';
+
+  const SIGNALS: readonly NodeJS.Signals[] = ['SIGTERM', 'SIGINT'];
+
+  /** A purge job the server created, with spies on the methods that start and stop its timer. */
+  interface CreatedJob {
+    job: PurgeJob;
+    start: jest.SpiedFunction<PurgeJob['start']>;
+    stop: jest.SpiedFunction<PurgeJob['stop']>;
+  }
+
+  /** Listeners of one signal, as `process.listeners` returns them. */
+  type Listeners = NodeJS.SignalsListener[];
+
+  const originalEnv = process.env;
+  let port: number;
+  /** The `msg` values whose standard-output write throws, standing in for a failing log stream. */
+  let failingMsgs: readonly string[];
+  let chunks: string[];
+  let listenersBefore: Map<NodeJS.Signals, Listeners>;
+  let jobs: CreatedJob[];
+  let stdoutWrite: jest.SpiedFunction<typeof process.stdout.write>;
+  let createPoolSpy: jest.SpiedFunction<typeof poolModule.createPool>;
+  let createPurgeJobSpy: jest.SpiedFunction<typeof purgeJobModule.createPurgeJob>;
+  let createServerSpy: jest.SpiedFunction<typeof http.createServer>;
+  let exitSpy: jest.SpiedFunction<typeof process.exit>;
+  /** Settles at the first `process.exit` call. */
+  let exited: Promise<void>;
+  /** Registered on the host process, so it observes a real unhandled rejection. */
+  let unhandled: jest.Mock<void, [unknown, Promise<unknown>]>;
+
+  /** A port that was free a moment ago: bound to port 0, read back, then released. */
+  function freePort(): Promise<number> {
+    return new Promise<number>((resolve, reject) => {
+      const probe = net.createServer();
+      probe.once('error', reject);
+      probe.listen(0, () => {
+        const address = probe.address();
+        probe.close(() => {
+          if (address === null || typeof address === 'string') {
+            reject(new Error('the port probe has no TCP address'));
+          } else {
+            resolve(address.port);
+          }
+        });
+      });
+    });
+  }
+
+  /** Whether a TCP connection to `port` on the loopback interface is accepted. */
+  function isListening(target: number): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      const socket = net.connect({ port: target, host: '127.0.0.1' });
+      socket.once('connect', () => {
+        socket.destroy();
+        resolve(true);
+      });
+      socket.once('error', () => {
+        socket.destroy();
+        resolve(false);
+      });
+    });
+  }
+
+  /** {@link DATABASE_URL} with its user name and password replaced; the URL encodes both. */
+  function withCredentials(user: string, password: string): string {
+    const url = new URL(DATABASE_URL);
+    url.username = user;
+    url.password = password;
+    return url.toString();
+  }
+
+  /** The lines written to standard output so far, parsed. */
+  function logged(): Record<string, unknown>[] {
+    return chunks
+      .join('')
+      .split('\n')
+      .filter((line) => line !== '')
+      .map((line): Record<string, unknown> => {
+        const parsed: unknown = JSON.parse(line);
+        if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+          throw new Error('server test: a log line is not a JSON object');
+        }
+        return { ...parsed };
+      });
+  }
+
+  /** The `msg` of every line written so far, in order. */
+  function loggedMsgs(): unknown[] {
+    return logged().map((entry) => entry.msg);
+  }
+
+  /** Polls until a line with `msg` has been written; the test timeout bounds the wait. */
+  async function waitForMsg(msg: string): Promise<void> {
+    while (!loggedMsgs().includes(msg)) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    }
+  }
+
+  /** The `SIGTERM` and `SIGINT` listeners added since the case began. */
+  function addedListeners(): Listeners {
+    return SIGNALS.flatMap((signal) => {
+      const before = listenersBefore.get(signal) ?? [];
+      return process.listeners(signal).filter((listener) => !before.includes(listener));
+    });
+  }
+
+  /** The pools the server created. */
+  function createdPools(): Pool[] {
+    return createPoolSpy.mock.results.flatMap((result) =>
+      result.type === 'return' ? [result.value] : [],
+    );
+  }
+
+  /** Resolves after one macrotask, by when Node has reported any unhandled rejection. */
+  function nextMacrotask(): Promise<void> {
+    return new Promise<void>((resolve) => setImmediate(resolve));
+  }
+
+  beforeEach(async () => {
+    port = await freePort();
+    process.env = {
+      ...originalEnv,
+      DATABASE_URL,
+      SESSION_SECRET: randomBytes(32).toString('hex'),
+      PORT: String(port),
+      NODE_ENV: 'test',
+    };
+    process.exitCode = undefined;
+    failingMsgs = [];
+    chunks = [];
+    listenersBefore = new Map(SIGNALS.map((signal) => [signal, process.listeners(signal)]));
+    jobs = [];
+
+    stdoutWrite = jest
+      .spyOn(process.stdout, 'write')
+      .mockImplementation((chunk: string | Uint8Array): boolean => {
+        const text = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8');
+        if (failingMsgs.some((msg) => text.includes(`"msg":${JSON.stringify(msg)}`))) {
+          throw new Error('standard output write failed');
+        }
+        chunks.push(text);
+        return true;
+      });
+    createPoolSpy = jest.spyOn(poolModule, 'createPool');
+    createServerSpy = jest.spyOn(http, 'createServer');
+    const realCreatePurgeJob = purgeJobModule.createPurgeJob;
+    createPurgeJobSpy = jest
+      .spyOn(purgeJobModule, 'createPurgeJob')
+      .mockImplementation((deps): PurgeJob => {
+        const job = realCreatePurgeJob(deps);
+        jobs.push({ job, start: jest.spyOn(job, 'start'), stop: jest.spyOn(job, 'stop') });
+        return job;
+      });
+    let markExited: () => void = () => undefined;
+    exited = new Promise<void>((resolve) => {
+      markExited = resolve;
+    });
+    // The real call would end Jest itself; the shutdown's last step is recorded instead.
+    exitSpy = jest.spyOn(process, 'exit').mockImplementation((): never => {
+      markExited();
+      return undefined as never;
+    });
+    unhandled = jest.fn<void, [unknown, Promise<unknown>]>();
+    hostProcess.on('unhandledRejection', unhandled);
+  });
+
+  afterEach(async () => {
+    hostProcess.off('unhandledRejection', unhandled);
+    // Releases whatever a failed case left behind, so no listener, timer, socket or connection
+    // outlives it.
+    for (const signal of SIGNALS) {
+      const before = listenersBefore.get(signal) ?? [];
+      for (const listener of process.listeners(signal)) {
+        if (!before.includes(listener)) {
+          process.removeListener(signal, listener);
+        }
+      }
+    }
+    for (const { job } of jobs) {
+      job.stop();
+    }
+    for (const result of createServerSpy.mock.results) {
+      if (result.type === 'return' && result.value.listening) {
+        const server = result.value;
+        await new Promise<void>((resolve) => {
+          server.close(() => resolve());
+          server.closeAllConnections();
+        });
+      }
+    }
+    for (const pool of createdPools()) {
+      if (!pool.ended && !pool.ending) {
+        await pool.end();
+      }
+    }
+    exitSpy.mockRestore();
+    createPurgeJobSpy.mockRestore();
+    createServerSpy.mockRestore();
+    createPoolSpy.mockRestore();
+    stdoutWrite.mockRestore();
+    process.env = originalEnv;
+    // Left set, the server's exit code would become Jest's own.
+    process.exitCode = undefined;
+  });
+
+  it('logs a failed sign-in of an email-shaped role once, redacted, and exits 1', async () => {
+    const databaseUrl = withCredentials(EMAIL_ROLE, WRONG_PASSWORD);
+    expect(databaseUrl).toContain(`//${ENCODED_ROLE}:${WRONG_PASSWORD}@`);
+    process.env.DATABASE_URL = databaseUrl;
+
+    await expect(startServer()).resolves.toBeUndefined();
+
+    expect(process.exitCode).toBe(1);
+    const entries = logged();
+    expect(entries.map((entry) => entry.msg)).toEqual(['migration failed']);
+    expect(entries[0]).toMatchObject({
+      level: 'error',
+      err: {
+        code: '28P01',
+        message: `password authentication failed for user "${MARKER}"`,
+        stack: expect.stringContaining(`for user "${MARKER}"`),
+      },
+    });
+    const text = chunks.join('');
+    for (const secret of [EMAIL_ROLE, ENCODED_ROLE, WRONG_PASSWORD]) {
+      expect(text).not.toContain(secret);
+    }
+    expect(await isListening(port)).toBe(false);
+    expect(createdPools().map((pool) => pool.ended)).toEqual([true]);
+    expect(jobs).toEqual([]);
+    expect(addedListeners()).toEqual([]);
+  });
+
+  it.each<[string, readonly string[], 'configured' | 'wrong', readonly string[]]>([
+    ['the "migration failed" line', ['migration failed'], 'wrong', []],
+    [
+      'the "server listening" line',
+      ['server listening'],
+      'configured',
+      ['migrations applied', 'startup failed'],
+    ],
+    [
+      'the "server listening" and "startup failed" lines',
+      ['server listening', 'startup failed'],
+      'configured',
+      ['migrations applied'],
+    ],
+  ])(
+    'exits 1 leaving nothing running when %s cannot be written',
+    async (_label, failing, credentials, expectedMsgs) => {
+      if (credentials === 'wrong') {
+        process.env.DATABASE_URL = withCredentials(EMAIL_ROLE, WRONG_PASSWORD);
+      }
+      failingMsgs = failing;
+
+      await expect(startServer()).resolves.toBeUndefined();
+      await nextMacrotask();
+
+      expect(process.exitCode).toBe(1);
+      expect(loggedMsgs()).toEqual(expectedMsgs);
+      expect(await isListening(port)).toBe(false);
+      for (const { start } of jobs) {
+        expect(start).not.toHaveBeenCalled();
+      }
+      expect(addedListeners()).toEqual([]);
+      expect(createdPools().map((pool) => pool.ended)).toEqual([true]);
+      expect(exitSpy).not.toHaveBeenCalled();
+      expect(unhandled).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each<[string, readonly string[], readonly Record<string, unknown>[]]>([
+    [
+      'every line is written',
+      [],
+      [{ level: 'info', msg: 'shutting down', signal: 'SIGTERM' }],
+    ],
+    ['the "shutting down" line cannot be written', ['shutting down'], []],
+  ])(
+    'shuts down on SIGTERM and exits 0 exactly once when %s',
+    async (_label, failing, expectedLines) => {
+      failingMsgs = failing;
+
+      await expect(startServer()).resolves.toBeUndefined();
+      expect(process.exitCode).toBeUndefined();
+      expect(await isListening(port)).toBe(true);
+      expect(addedListeners()).toHaveLength(SIGNALS.length);
+      // The purge the start-up began is left to finish, so the shutdown drains an idle pool.
+      await waitForMsg('purge completed');
+
+      process.emit('SIGTERM', 'SIGTERM');
+      // The other signal, delivered during the shutdown, reaches the re-entry guard.
+      process.emit('SIGINT', 'SIGINT');
+      await exited;
+      await nextMacrotask();
+
+      expect(exitSpy).toHaveBeenCalledTimes(1);
+      expect(exitSpy).toHaveBeenCalledWith(0);
+      const shutdownLines = logged().filter(
+        (entry) => entry.msg === 'shutting down' || entry.msg === 'shutdown failed',
+      );
+      expect(shutdownLines).toEqual(expectedLines.map((line) => expect.objectContaining(line)));
+      expect(await isListening(port)).toBe(false);
+      expect(jobs.map(({ stop }) => stop.mock.calls.length)).toEqual([1]);
+      expect(createdPools().map((pool) => pool.ended)).toEqual([true]);
+      expect(addedListeners()).toEqual([]);
+      expect(unhandled).not.toHaveBeenCalled();
+    },
+  );
 });

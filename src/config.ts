@@ -4,7 +4,8 @@
  * The process entry points pass their environment in, so this module never reads the global one
  * and every rule can be exercised with a plain object. Error messages are fixed strings and never
  * include the received value, because `DATABASE_URL` carries a password and `SESSION_SECRET` is a
- * secret.
+ * secret. {@link databaseCredentials} lists the credentials of an accepted `DATABASE_URL`, which
+ * the entry points hand to their loggers to redact from driver error text.
  */
 
 /** Validated application configuration, built once at start-up by {@link loadConfig}. */
@@ -154,4 +155,55 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
  */
 export function loadDatabaseUrl(env: NodeJS.ProcessEnv): string {
   return parseDatabaseUrl(env.DATABASE_URL);
+}
+
+/**
+ * Query parameters that the driver's connection-string parser reads as the user name and the
+ * password, taking precedence over the URL's user-info part.
+ */
+const CREDENTIAL_PARAMS: readonly string[] = ['user', 'password'];
+
+/** Returns `value` percent-decoded, or unchanged when it holds a malformed escape. */
+function percentDecode(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+/**
+ * Lists the credentials a connection string carries, for the entry points' loggers to redact:
+ * the user name and password of its user-info part, and every `user` and `password` query
+ * parameter.
+ *
+ * The driver sends the percent-decoded user name, and that is the form PostgreSQL quotes in its
+ * messages, so `alice%40example.com` is reported as `alice@example.com`. The user-info values are
+ * therefore listed both as written and decoded; the query API already returns decoded values.
+ *
+ * @param databaseUrl - A connection string accepted by {@link loadConfig} or
+ *   {@link loadDatabaseUrl}.
+ * @returns The distinct non-empty values, longest first; empty when the URL carries none.
+ * @throws {ConfigError} `DATABASE_URL must be a postgres:// connection string` when
+ *   `databaseUrl` does not parse as a URL; the parser's own error, which quotes the input, is
+ *   discarded.
+ */
+export function databaseCredentials(databaseUrl: string): string[] {
+  let url: URL;
+  try {
+    url = new URL(databaseUrl);
+  } catch {
+    throw new ConfigError(DATABASE_URL_MESSAGE);
+  }
+  const values = [
+    url.username,
+    percentDecode(url.username),
+    url.password,
+    percentDecode(url.password),
+  ];
+  for (const name of CREDENTIAL_PARAMS) {
+    values.push(...url.searchParams.getAll(name));
+  }
+  const distinct = new Set(values.filter((value) => value !== ''));
+  return [...distinct].sort((a, b) => b.length - a.length);
 }
