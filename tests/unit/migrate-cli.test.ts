@@ -2,6 +2,7 @@ import type { Pool } from 'pg';
 
 import { runMigrations } from '../../src/db/migrate';
 import { main } from '../../src/db/migrate-cli';
+import * as poolModule from '../../src/db/pool';
 import type { Logger } from '../../src/shared/logger';
 
 jest.mock('../../src/db/migrate', () => ({ runMigrations: jest.fn() }));
@@ -199,5 +200,82 @@ describe('migrate CLI main', () => {
         msg: 'DATABASE_URL must be a postgres:// connection string',
       },
     ]);
+  });
+
+  describe('command-line arguments', () => {
+    /** A connection string with its password, as a user might mistype it onto the command line. */
+    const URL_ARGUMENT = `postgres://${ENCODED_ROLE}:${PASSWORD}@${DATABASE}`;
+
+    let createPoolSpy: jest.SpiedFunction<typeof poolModule.createPool>;
+
+    beforeEach(() => {
+      createPoolSpy = jest.spyOn(poolModule, 'createPool');
+    });
+
+    afterEach(() => {
+      createPoolSpy.mockRestore();
+    });
+
+    test.each([
+      [['--help'], 'unset', undefined],
+      [['-h'], 'unset', undefined],
+      [['--help'], 'invalid', 'not a url'],
+      [['-h'], 'invalid', 'not a url'],
+      [['--help'], 'valid', URL_ARGUMENT],
+    ])(
+      '%j prints the usage and exits 0 without reading DATABASE_URL (%s) or connecting',
+      async (args: string[], _state: string, databaseUrl: string | undefined): Promise<void> => {
+        if (databaseUrl === undefined) {
+          delete process.env.DATABASE_URL;
+        } else {
+          process.env.DATABASE_URL = databaseUrl;
+        }
+
+        await main(args);
+
+        expect(process.exitCode).toBe(0);
+        const text = capturedText();
+        expect(text).toContain('Usage: node dist/db/migrate-cli.js [--help]');
+        expect(text).toContain('DATABASE_URL');
+        expect(text).toContain('-h, --help');
+        // Usage text only: no configuration error and no migration outcome is logged.
+        expect(text).not.toContain('"level"');
+        for (const line of text.split('\n')) {
+          expect(line.length).toBeLessThanOrEqual(100);
+        }
+        expect(mockedRunMigrations).not.toHaveBeenCalled();
+        expect(createPoolSpy).not.toHaveBeenCalled();
+      },
+    );
+
+    test.each([
+      ['an unknown option', ['--bogus'], '--bogus'],
+      ['a positional connection string', [URL_ARGUMENT], URL_ARGUMENT],
+      ['an unknown option holding a connection string', [`--url=${URL_ARGUMENT}`], '--url'],
+      ['a value given to --help', ['--help=1'], '--help=1'],
+      ['--help with a positional argument', ['--help', 'extra'], 'extra'],
+    ])(
+      'rejects %s with one fixed line and exit code 2, echoing none of it',
+      async (_case: string, args: string[], echoed: string): Promise<void> => {
+        // Valid, so a run that read it would go on to the runner.
+        process.env.DATABASE_URL = URL_ARGUMENT;
+
+        await main(args);
+
+        expect(process.exitCode).toBe(2);
+        expect(capturedEntries()).toEqual([
+          {
+            time: expect.any(String),
+            level: 'error',
+            msg: 'invalid arguments; run with --help for usage',
+          },
+        ]);
+        const text = capturedText();
+        expect(text).not.toContain(echoed);
+        expect(text).not.toContain(PASSWORD);
+        expect(mockedRunMigrations).not.toHaveBeenCalled();
+        expect(createPoolSpy).not.toHaveBeenCalled();
+      },
+    );
   });
 });

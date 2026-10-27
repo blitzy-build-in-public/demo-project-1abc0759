@@ -48,6 +48,19 @@ function parseDatabaseUrl(raw: string | undefined): string {
   if (raw === undefined || raw.trim() === '') {
     throw new ConfigError(DATABASE_URL_MESSAGE);
   }
+  // URL parsing alone is too lenient: it accepts `postgres:` forms without `//` and silently
+  // strips surrounding whitespace and control characters, which the pg driver reads differently,
+  // so the value validated would not name the server and database the driver connects to.
+  // A raw space or a malformed percent-escape likewise makes pg re-encode the whole string
+  // before reading it, which alters valid escapes and IPv6 brackets, or throws on a trailing `%`.
+  if (
+    !/^postgres(?:ql)?:\/\//i.test(raw) ||
+    /\s/.test(raw) ||
+    /%(?![0-9a-f]{2})/i.test(raw) ||
+    /[\u0000-\u001f\u007f]/.test(raw)
+  ) {
+    throw new ConfigError(DATABASE_URL_MESSAGE);
+  }
   let protocol: string;
   try {
     protocol = new URL(raw).protocol;
@@ -100,8 +113,10 @@ function parseNodeEnv(raw: string | undefined): AppConfig['nodeEnv'] {
  * Parses and validates the application's environment variables.
  *
  * Variables are checked in this order, and the first failure throws a {@link ConfigError}:
- * - `DATABASE_URL`: required; a `postgres://` or `postgresql://` URL, returned unchanged.
- *   Otherwise: `DATABASE_URL must be a postgres:// connection string`.
+ * - `DATABASE_URL`: required; a URL beginning with `postgres://` or `postgresql://` (scheme
+ *   case-insensitive), with no whitespace, no control characters, and every `%` starting a
+ *   two-hex-digit escape (encode a space as `%20` and a literal `%` as `%25`), returned
+ *   unchanged. Otherwise: `DATABASE_URL must be a postgres:// connection string`.
  * - `SESSION_SECRET`: required; at least 32 characters, not trimmed.
  *   Otherwise: `SESSION_SECRET is required (at least 32 characters)`.
  * - `PORT`: optional, default `3000` when unset or empty; decimal digits only, 1 to 65535.
@@ -133,7 +148,9 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
  * @param env - The process environment, passed in by the entry point; never read globally.
  * @returns The `postgres://` or `postgresql://` connection string, unchanged.
  * @throws {ConfigError} `DATABASE_URL must be a postgres:// connection string` when the value is
- *   missing, blank, not a URL, or uses another scheme.
+ *   missing, blank, not a URL, does not begin with `postgres://` or `postgresql://` (scheme
+ *   case-insensitive), contains whitespace or a control character, or has a `%` that does not
+ *   start a two-hex-digit escape (encode a space as `%20` and a literal `%` as `%25`).
  */
 export function loadDatabaseUrl(env: NodeJS.ProcessEnv): string {
   return parseDatabaseUrl(env.DATABASE_URL);

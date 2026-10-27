@@ -8,8 +8,10 @@
  * file with the entry points. No other module in `src/db` may import `../config`.
  *
  * Exit status: 0 when every pending migration was applied (or none was pending), 1 when
- * `DATABASE_URL` is invalid or a migration fails. The connection string is never logged, because
- * it carries the database password.
+ * `DATABASE_URL` is invalid or a migration fails, and 2 when the command line holds anything but
+ * `-h`/`--help`. `--help` prints the usage and exits 0; like a rejected command line, it neither
+ * reads `DATABASE_URL` nor connects. The connection string is never logged, because it carries
+ * the database password, and neither is a rejected argument, which can hold one.
  *
  * Every line written once `DATABASE_URL` is accepted, the runner's and the pool's included, has
  * the database user name and password of that URL replaced by `[redacted]` in the error's
@@ -20,6 +22,7 @@
  */
 
 import { Writable } from 'node:stream';
+import { parseArgs } from 'node:util';
 
 import { ConfigError, loadDatabaseUrl } from '../config';
 import { createLogger } from '../shared/logger';
@@ -29,6 +32,51 @@ import { createPool } from './pool';
 
 /** Text that stands in for each occurrence of a connection credential in a log line. */
 const REDACTED = '[redacted]';
+
+/** Usage text that `-h`/`--help` writes to standard output. */
+const USAGE = [
+  'Usage: node dist/db/migrate-cli.js [--help]',
+  '       (also run as `npm run migrate`, or `npm run migrate:local` to read .env)',
+  '',
+  'Applies every pending migration to the database named by DATABASE_URL, then exits.',
+  '',
+  'Environment:',
+  '  DATABASE_URL  Required. A postgres:// or postgresql:// connection string.',
+  '',
+  'Options:',
+  '  -h, --help    Print this usage and exit, without reading DATABASE_URL or connecting.',
+  '',
+  'Exit status:',
+  '  0  every pending migration was applied, or none was pending',
+  '  1  DATABASE_URL is invalid, or a migration failed',
+  '  2  invalid arguments',
+  '',
+].join('\n');
+
+/** The one line logged for a rejected command line. */
+const INVALID_ARGUMENTS = 'invalid arguments; run with --help for usage';
+
+/** What the command line asks for: a migration run, the usage text, or neither. */
+type CliRequest = 'migrate' | 'help' | 'invalid';
+
+/**
+ * Reads the command line. `-h`/`--help` is the only option; an unknown option, a value given to
+ * `--help` or any positional argument makes the request invalid.
+ */
+function parseCliArgs(args: readonly string[]): CliRequest {
+  try {
+    const { values } = parseArgs({
+      args: [...args],
+      options: { help: { type: 'boolean', short: 'h' } },
+      strict: true,
+      allowPositionals: false,
+    });
+    return values.help === true ? 'help' : 'migrate';
+  } catch {
+    // The parser's error is dropped on purpose: its message quotes the offending argument.
+    return 'invalid';
+  }
+}
 
 /**
  * Query parameters that the driver's connection-string parser reads as the user name and the
@@ -176,6 +224,10 @@ function createCliLogger(databaseUrl: string | undefined): Logger {
 /**
  * Applies every pending migration to the database named by `DATABASE_URL`, then closes the pool.
  *
+ * - The command line is read first. `-h`/`--help` writes the usage text to standard output and
+ *   sets exit code 0. Anything else on it, an unknown option, a value given to `--help` or a
+ *   positional argument, logs `invalid arguments; run with --help for usage` alone, without the
+ *   argument text, and sets exit code 2. Neither reads `DATABASE_URL` nor opens a connection.
  * - An invalid `DATABASE_URL` logs the fixed configuration message alone, with no error object,
  *   and sets exit code 1 without opening a connection. `SESSION_SECRET` is not required.
  * - `runMigrations` logs `migrations applied` with `count` and `versions` on success, which sets
@@ -194,11 +246,29 @@ function createCliLogger(databaseUrl: string | undefined): Logger {
  * The result is reported through `process.exitCode` rather than `process.exit()`, so the log
  * lines written to stdout are flushed before the process ends.
  *
+ * @param args The command-line arguments after the script path, `process.argv.slice(2)` for the
+ *   process entry. Defaults to none, which runs the migrations.
  * @returns A promise that resolves once the run has finished and the pool is ended. Every
  *   expected failure is logged and resolved; only an error that is not a {@link ConfigError}
  *   while reading the configuration rejects.
  */
-export async function main(): Promise<void> {
+export async function main(args: readonly string[] = []): Promise<void> {
+  const request = parseCliArgs(args);
+  if (request === 'help') {
+    // Usage is help text, not a log event, so it bypasses the JSON logger.
+    process.stdout.write(USAGE);
+    process.exitCode = 0;
+    return;
+  }
+  if (request === 'invalid') {
+    // The argument is not echoed: a mistyped command line can hold a connection string and its
+    // password, which never reaches a log. Exit code 2 is the conventional command-line usage
+    // error, kept apart from 1, an invalid DATABASE_URL or a failed migration.
+    createLogger().error(INVALID_ARGUMENTS);
+    process.exitCode = 2;
+    return;
+  }
+
   let databaseUrl: string;
   try {
     databaseUrl = loadDatabaseUrl(process.env);
@@ -233,7 +303,7 @@ export async function main(): Promise<void> {
 if (require.main === module) {
   // `main` logs and resolves every failure it expects. The first handler reports anything that
   // escaped it; the second covers a failure of that log write itself, so the chain never rejects.
-  void main()
+  void main(process.argv.slice(2))
     .catch((err: unknown): void => {
       process.exitCode = 1;
       let databaseUrl: string | undefined;

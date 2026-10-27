@@ -114,7 +114,9 @@ export async function runMigrations(
   dir: string = path.join(__dirname, 'migrations'),
 ): Promise<string[]> {
   // Not `pool.connect()`: an unreachable database must surface as `DatabaseUnavailableError`
-  // already at checkout, like every other data-access failure to connect.
+  // already at checkout, like every other data-access failure to connect, and the client needs
+  // `checkOut`'s `error` listener so a server that ends the session mid-run cannot crash the
+  // process.
   const client = await checkOut(pool);
   let locked = false;
   let destroyConnection = false;

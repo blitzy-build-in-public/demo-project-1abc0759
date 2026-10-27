@@ -7,6 +7,11 @@
  * error) is rethrown unchanged, with its `code` and `constraint` intact, so repositories can
  * still map expected outcomes such as a duplicate email. Nothing here logs, and no message built
  * here carries SQL text, bound values or the connection string.
+ *
+ * A client checked out here keeps an `error` listener for as long as it is out, so a connection
+ * the server ends under it cannot crash the process. The first error it emits is kept on the
+ * client and becomes the `cause` when pg then refuses the client's statements as not queryable,
+ * and its connection is destroyed on release rather than returned to the pool.
  */
 
 import type { Pool, PoolClient, QueryResult, QueryResultRow } from 'pg';
@@ -42,6 +47,26 @@ const POOL_CONNECT_TIMEOUT_MESSAGE = 'timeout exceeded when trying to connect';
 const CONNECTION_TERMINATED_PREFIX = 'Connection terminated';
 
 /**
+ * pg's rejections of a statement issued on a client that can no longer reach the server: its
+ * socket already failed (and the client emitted `error`), or the client was ended. They follow
+ * the driver error that broke the connection rather than carry it, so only their exact text
+ * identifies them.
+ */
+const NOT_QUERYABLE_MESSAGES: readonly string[] = [
+  'Client has encountered a connection error and is not queryable',
+  'Client was closed and is not queryable',
+];
+
+/**
+ * Key under which a client from {@link checkOut} carries the first error it emitted while checked
+ * out. The error lives on the client itself, so this module keeps no state of its own.
+ */
+const RECORDED_CONNECTION_ERROR: unique symbol = Symbol('recordedConnectionError');
+
+/** A client from {@link checkOut}, which may carry the connection error it emitted. */
+type TrackedClient = PoolClient & { [RECORDED_CONNECTION_ERROR]?: Error };
+
+/**
  * How many levels of `cause` and `errors` are searched below the thrown value. Node 20 tries
  * IPv6 and IPv4 for `localhost` and reports an `AggregateError` whose entries hold the real
  * codes, and pg-pool wraps its timeout around the socket error, so a short chain must be
@@ -68,11 +93,15 @@ function isConnectionFailureCode(code: string): boolean {
   );
 }
 
-/** True for the pool connect timeout and for a terminated connection. */
+/**
+ * True for the pool connect timeout, a terminated connection, and pg's refusal to run a statement
+ * on a client whose connection is already gone.
+ */
 function isConnectionFailureMessage(message: string): boolean {
   return (
     message.includes(POOL_CONNECT_TIMEOUT_MESSAGE) ||
-    message.startsWith(CONNECTION_TERMINATED_PREFIX)
+    message.startsWith(CONNECTION_TERMINATED_PREFIX) ||
+    NOT_QUERYABLE_MESSAGES.includes(message)
   );
 }
 
@@ -114,7 +143,9 @@ function matchesConnectionFailure(err: unknown, depth: number): boolean {
  * - `code` `ECONNREFUSED`, `ECONNRESET`, `ENOTFOUND`, `ETIMEDOUT` or `EAI_AGAIN`;
  * - `code` a SQLSTATE of class `08`, or `57P01`, `57P02`, `57P03` or `53300`;
  * - a `message` containing "timeout exceeded when trying to connect";
- * - a `message` starting with "Connection terminated".
+ * - a `message` starting with "Connection terminated";
+ * - the `message` "Client has encountered a connection error and is not queryable" or "Client
+ *   was closed and is not queryable", pg's rejection of a statement on a dead client.
  *
  * A {@link DatabaseUnavailableError} is always a connection failure. Statement errors such as
  * `23505` are not.
@@ -130,12 +161,33 @@ export function isConnectionFailure(err: unknown): boolean {
  * Wraps a connection failure in {@link DatabaseUnavailableError}, keeping the driver error as
  * `cause`, and returns every other value unchanged. An error that is already a
  * `DatabaseUnavailableError` is returned as is, so nested helpers never wrap twice.
+ *
+ * When `err` is pg's follow-on "not queryable" rejection and `db` is a client from
+ * {@link checkOut} that emitted an error, that emitted error becomes the `cause` instead: it is
+ * the driver error (`57P01`, "Connection terminated unexpectedly") that the follow-on only
+ * reports second-hand.
  */
-function toDatabaseError(err: unknown): unknown {
+function toDatabaseError(err: unknown, db?: Queryable): unknown {
   if (err instanceof DatabaseUnavailableError || !isConnectionFailure(err)) {
     return err;
   }
-  return new DatabaseUnavailableError('Database unavailable', { cause: err });
+  const recorded = db === undefined ? undefined : recordedConnectionError(db);
+  const cause = recorded !== undefined && isNotQueryableError(err) ? recorded : err;
+  return new DatabaseUnavailableError('Database unavailable', { cause });
+}
+
+/** The first error a client from {@link checkOut} emitted while checked out, if any. */
+function recordedConnectionError(db: Queryable): unknown {
+  return RECORDED_CONNECTION_ERROR in db ? db[RECORDED_CONNECTION_ERROR] : undefined;
+}
+
+/** True for pg's own refusal to run a statement on a client that is no longer queryable. */
+function isNotQueryableError(err: unknown): boolean {
+  if (typeof err !== 'object' || err === null) {
+    return false;
+  }
+  const message = readMessage(err);
+  return message !== undefined && NOT_QUERYABLE_MESSAGES.includes(message);
 }
 
 /**
@@ -166,7 +218,7 @@ export async function query<R>(
   try {
     outcome = await db.query<QueryResultRow>(sql, values);
   } catch (err) {
-    throw toDatabaseError(err);
+    throw toDatabaseError(err, db);
   }
   const rows = Array.isArray(outcome) ? outcome.flatMap((result) => result.rows) : outcome.rows;
   // The one place untyped driver rows take the caller's row type.
@@ -174,7 +226,50 @@ export async function query<R>(
 }
 
 /**
+ * Gives a freshly checked-out client its `error` listener and a `release` that takes the
+ * listener off again. pg-pool assigns the client a new `release` at every checkout, so the
+ * wrapper belongs to this checkout alone.
+ */
+function trackConnectionErrors(client: PoolClient): PoolClient {
+  const tracked: TrackedClient = client;
+  // pg-pool removes its idle-client listener while a client is checked out, and an `error` event
+  // with no listener would end the process. pg can emit more than once for one failure (the
+  // server's error, then the socket's end), so only the first, which names the cause, is kept.
+  // Nothing is rethrown or logged: the next statement on the client reports the failure.
+  const recordError = (err: Error): void => {
+    if (tracked[RECORDED_CONNECTION_ERROR] === undefined) {
+      tracked[RECORDED_CONNECTION_ERROR] = err;
+    }
+  };
+  const poolRelease = client.release;
+  client.on('error', recordError);
+  client.release = (...args: Parameters<PoolClient['release']>): void => {
+    const failed = tracked[RECORDED_CONNECTION_ERROR] !== undefined;
+    client.removeListener('error', recordError);
+    delete tracked[RECORDED_CONNECTION_ERROR];
+    if (failed && !args[0]) {
+      // A connection that failed must not go back to the pool, so it is destroyed.
+      poolRelease.call(client, true);
+    } else {
+      poolRelease.call(client, ...args);
+    }
+  };
+  return client;
+}
+
+/**
  * Checks one client out of `pool`, for statements that must share a database session.
+ *
+ * While the client is out it carries an `error` listener, so a connection the server ends (a
+ * restart, `pg_terminate_backend`) cannot crash the process with an unhandled `error` event. The
+ * listener keeps the first error the client emits and neither rethrows nor logs it. The next
+ * statement on the client through {@link query} raises {@link DatabaseUnavailableError} with that
+ * error as `cause`.
+ *
+ * The caller still releases the client exactly once, and that release removes the listener. A
+ * client that emitted an error is destroyed: a missing or falsy argument becomes `release(true)`.
+ * Any other release passes the caller's arguments to pg-pool unchanged. A second release throws,
+ * as pg-pool's does.
  *
  * @param pool - The pool to check a client out of.
  * @returns The client; the caller releases it exactly once.
@@ -182,11 +277,13 @@ export async function query<R>(
  *   failure to connect unchanged.
  */
 export async function checkOut(pool: Pool): Promise<PoolClient> {
+  let client: PoolClient;
   try {
-    return await pool.connect();
+    client = await pool.connect();
   } catch (err) {
     throw toDatabaseError(err);
   }
+  return trackConnectionErrors(client);
 }
 
 /** Issues `ROLLBACK` and reports whether it succeeded. Its own failure is never rethrown. */
@@ -227,7 +324,7 @@ export async function withTransaction<T>(
     await query(client, 'COMMIT', []);
     return result;
   } catch (err) {
-    const mapped = toDatabaseError(err);
+    const mapped = toDatabaseError(err, client);
     const rolledBack = await rollBack(client);
     destroyConnection = !rolledBack || isConnectionFailure(mapped);
     throw mapped;

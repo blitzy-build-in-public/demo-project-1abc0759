@@ -1,3 +1,4 @@
+import { EventEmitter } from 'node:events';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -5,22 +6,31 @@ import path from 'node:path';
 import type { Pool, PoolClient } from 'pg';
 
 import { runMigrations } from '../../src/db/migrate';
+import { DatabaseUnavailableError } from '../../src/shared/errors';
 import type { Logger, LogFields } from '../../src/shared/logger';
 
 const LOCK_SQL = 'SELECT pg_advisory_lock(7253, 1)';
 const UNLOCK_SQL = 'SELECT pg_advisory_unlock(7253, 1)';
 const MIGRATION_VERSION = '0001_x';
 const MIGRATION_SQL = 'CREATE TABLE widgets (id integer);';
+const NOT_QUERYABLE_MESSAGE = 'Client has encountered a connection error and is not queryable';
 
 /** Which statements the fake client rejects. */
 interface FailurePlan {
   migration: boolean;
   unlock: boolean;
+  /**
+   * When set, the connection is lost while the migration file's SQL runs: the client emits this
+   * error from outside any statement, as pg does from its socket, and then refuses that statement
+   * and every later one with pg's "not queryable" error.
+   */
+  connectionLost?: Error;
 }
 
 /** A fake pool whose one client records its statements and every `release` call. */
 interface FakeDatabase {
   pool: Pool;
+  client: EventEmitter;
   statements: string[];
   releaseCalls: unknown[][];
 }
@@ -28,7 +38,8 @@ interface FakeDatabase {
 /**
  * Builds a pool whose `connect()` resolves one fake client. The client answers every statement
  * with no rows, except that it rejects the migration file's SQL with `migrationError` and the
- * unlock with `unlockError` when `fail` says so.
+ * unlock with `unlockError` when `fail` says so, and behaves as a dead client once
+ * `fail.connectionLost` has been emitted.
  */
 function createFakeDatabase(
   fail: FailurePlan,
@@ -37,9 +48,26 @@ function createFakeDatabase(
 ): FakeDatabase {
   const statements: string[] = [];
   const releaseCalls: unknown[][] = [];
-  const client = {
+  const events = new EventEmitter();
+  let lost = false;
+  const client = Object.assign(events, {
     async query(sql: string): Promise<{ rows: unknown[] }> {
       statements.push(sql);
+      const connectionError = fail.connectionLost;
+      if (connectionError !== undefined && sql === MIGRATION_SQL) {
+        lost = true;
+        // Emitted from a later macrotask, where nothing catches it: with no `error` listener on
+        // the client, it is an uncaught exception, as it would crash the process.
+        await new Promise<void>((resolve) => {
+          setImmediate(() => {
+            resolve();
+            events.emit('error', connectionError);
+          });
+        });
+      }
+      if (lost) {
+        throw new Error(NOT_QUERYABLE_MESSAGE);
+      }
       if (fail.migration && sql === MIGRATION_SQL) {
         throw migrationError;
       }
@@ -51,14 +79,15 @@ function createFakeDatabase(
     release(...args: unknown[]): void {
       releaseCalls.push(args);
     },
-  };
+  });
   const pool = {
     async connect(): Promise<PoolClient> {
-      // Only `query` and `release` are used by the runner, so the fake stands in for the client.
+      // Only `query`, `release` and the `error` event are used by the runner and `checkOut`, so
+      // the fake stands in for the client.
       return client as unknown as PoolClient;
     },
   };
-  return { pool: pool as unknown as Pool, statements, releaseCalls };
+  return { pool: pool as unknown as Pool, client, statements, releaseCalls };
 }
 
 /** One `error` call as the logger received it. */
@@ -176,6 +205,36 @@ describe('runMigrations client release', () => {
       expect(logger.errors).toHaveLength(1);
       expect(logger.errors[0]?.msg).toBe('migration unlock failed');
       expect(logger.errors[0]?.err).toBe(unlockError);
+      expect(logger.infos).toEqual([]);
+    },
+  );
+
+  test(
+    'survives a connection the server ends mid-migration, rejects with the emitted error as ' +
+      'cause and destroys the connection',
+    async () => {
+      await writeMigration();
+      const terminated = Object.assign(
+        new Error('terminating connection due to administrator command'),
+        { code: '57P01' },
+      );
+      const db = createFakeDatabase(
+        { migration: false, unlock: false, connectionLost: terminated },
+        migrationError,
+        unlockError,
+      );
+      const logger = new RecordingLogger(false);
+
+      const failure: unknown = await runMigrations(db.pool, logger, dir).then(
+        () => undefined,
+        (err: unknown) => err,
+      );
+
+      expect(failure).toBeInstanceOf(DatabaseUnavailableError);
+      expect(failure instanceof Error ? failure.cause : undefined).toBe(terminated);
+      expect(db.releaseCalls).toEqual([[true]]);
+      expect(db.client.listenerCount('error')).toBe(0);
+      expect(db.statements.slice(-2)).toEqual(['ROLLBACK', UNLOCK_SQL]);
       expect(logger.infos).toEqual([]);
     },
   );

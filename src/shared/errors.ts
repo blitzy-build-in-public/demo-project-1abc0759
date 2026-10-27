@@ -71,10 +71,13 @@ export class CsrfError extends HttpError {
 /**
  * The database could not be reached: a network failure (`ECONNREFUSED`, `ECONNRESET`, `ENOTFOUND`,
  * `ETIMEDOUT`, `EAI_AGAIN`), SQLSTATE class `08`, `57P01`–`57P03` or `53300`, a pool connection
- * timeout, or a terminated connection.
+ * timeout, a terminated connection, or a statement pg refuses because its client's connection is
+ * already gone ("not queryable").
  *
  * Raised by the data-access layer with the driver error kept as `cause`, so the logger can record
- * the driver's code. The error handler logs it and renders 503 "Service temporarily unavailable".
+ * the driver's code. For a refused statement on a checked-out client, the `cause` is the error
+ * that broke its connection when the client recorded one. The error handler logs it and renders
+ * 503 "Service temporarily unavailable".
  * It deliberately does not extend {@link HttpError}, because HTTP errors are never logged.
  */
 export class DatabaseUnavailableError extends Error {
