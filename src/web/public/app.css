@@ -80,6 +80,23 @@ nav a { font-weight: 600; }
 .signed-in { margin-inline-start: auto; color: var(--color-muted); overflow-wrap: anywhere; }
 header form, .logout-form { display: inline; margin: 0; }
 
+/* Skip link, the first element of every page: moved above the viewport until it receives
+   keyboard focus, so it takes no space and is invisible at rest. */
+.skip-link {
+  position: absolute;
+  inset-block-start: 0;
+  inset-inline-start: 0;
+  z-index: 1;
+  padding-block: 0.5rem;
+  padding-inline: 1rem;
+  background: var(--color-bg);
+  font-weight: 600;
+  translate: 0 -100%;
+}
+
+/* Inset when shown, so no edge of the focus outline falls outside the viewport. */
+.skip-link:focus-visible { inset-block-start: 0.5rem; inset-inline-start: 0.5rem; translate: none; }
+
 /* Forms */
 
 form { margin-block: 0 1.5rem; }
