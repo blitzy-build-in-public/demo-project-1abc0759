@@ -490,7 +490,8 @@ export function renderTaskFormPage(view: TaskFormPageView): string {
  * It shows "Delete this task?" and the task's title, a form posting `confirm=yes` with the CSRF
  * field and the list-filter echoes to `/tasks/:id/delete` through a "Delete task" button, and a
  * Cancel link back to the filtered list. The button carries no `data-confirm-delete`, because it
- * is itself the confirmation, and the page loads no script.
+ * is itself the confirmation, and the page loads no script; it takes the danger style of the
+ * other Delete buttons through its `danger` class instead.
  *
  * @param view - The user, CSRF token, task and active list filters.
  * @returns The complete HTML document.
@@ -502,7 +503,7 @@ export function renderDeleteConfirmPage(view: DeleteConfirmPageView): string {
     <form method="post" action="/tasks/${task.id}/delete">${csrfField(csrfToken)}
       <input type="hidden" name="${DELETE_CONFIRM_FIELD}" value="${DELETE_CONFIRMED}">
       ${filterEchoes(filters)}
-      <button type="submit">Delete task</button>
+      <button type="submit" class="danger">Delete task</button>
       <a href="/tasks${filtersToQuery(filters)}">Cancel</a>
     </form>`;
   return renderLayout({ title: 'Delete task', user, csrfToken, body });

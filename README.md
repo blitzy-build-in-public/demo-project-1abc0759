@@ -92,8 +92,10 @@ npm run start:local       # then open http://localhost:3000
 - The server applies every pending migration before it listens. The runner holds a PostgreSQL
   advisory lock for its whole run, so replicas starting at the same moment apply each migration
   exactly once.
-- The runner's statements share the pool's 5-second query timeout with every other statement. A
-  migration statement that runs longer fails the run as database-unavailable, and a replica that
+- The runner's statements share the pool's 4.5-second server-side statement timeout with every
+  other statement: PostgreSQL cancels a statement that runs, or waits for a lock, any longer. The
+  pool's 5-second client-side query timeout is the backstop for a database that stops answering.
+  A migration statement that runs longer fails the run as database-unavailable, and a replica that
   waits longer than that for another replica's run exits with 1, for its restart policy to retry.
 - `npm run migrate` (or `npm run migrate:local`) applies pending migrations without starting the
   server. It needs only `DATABASE_URL` and exits with 0 when every pending migration was applied

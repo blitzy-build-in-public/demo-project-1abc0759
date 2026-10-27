@@ -1,6 +1,7 @@
 /**
  * SQL execution for the data-access layer: the single place where driver errors that mean the
- * database cannot be reached become {@link DatabaseUnavailableError}, which the error handler
+ * database cannot be reached, or that it cancelled a statement it could not serve within its
+ * statement or lock timeout, become {@link DatabaseUnavailableError}, which the error handler
  * logs and renders as 503 "Service temporarily unavailable".
  *
  * Every other driver error (a constraint violation such as `23505`, a check violation, a syntax
@@ -37,6 +38,14 @@ const CONNECTION_EXCEPTION_SQLSTATE = /^08[0-9A-Z]{3}$/;
 
 /** `admin_shutdown`, `crash_shutdown`, `cannot_connect_now` and `too_many_connections`. */
 const UNAVAILABLE_SQLSTATES: readonly string[] = ['57P01', '57P02', '57P03', '53300'];
+
+/**
+ * `query_canceled`, raised when the pool's `statement_timeout` passes, and `lock_not_available`,
+ * raised when a `lock_timeout` passes. PostgreSQL itself gave up on the statement and rolled it
+ * back, so the server is up but could not serve it in time: the user gets the same 503 as for an
+ * outage, and a retry is safe because nothing was written.
+ */
+const SERVER_TIMEOUT_SQLSTATES: readonly string[] = ['57014', '55P03'];
 
 /** pg-pool's rejection when `connectionTimeoutMillis` passes while waiting for a client. */
 const POOL_CONNECT_TIMEOUT_MESSAGE = 'timeout exceeded when trying to connect';
@@ -95,12 +104,16 @@ function readMessage(source: object): string | undefined {
   return 'message' in source && typeof source.message === 'string' ? source.message : undefined;
 }
 
-/** True for a Node network code or a SQLSTATE that means the server cannot serve the request. */
+/**
+ * True for a Node network code, a SQLSTATE that means the server cannot serve the request, or a
+ * SQLSTATE for a statement the server cancelled on its statement or lock timeout.
+ */
 function isConnectionFailureCode(code: string): boolean {
   return (
     NETWORK_ERROR_CODES.includes(code) ||
     CONNECTION_EXCEPTION_SQLSTATE.test(code) ||
-    UNAVAILABLE_SQLSTATES.includes(code)
+    UNAVAILABLE_SQLSTATES.includes(code) ||
+    SERVER_TIMEOUT_SQLSTATES.includes(code)
   );
 }
 
@@ -148,13 +161,15 @@ function matchesConnectionFailure(err: unknown, depth: number): boolean {
 }
 
 /**
- * Tells whether a thrown value means the database could not be reached or dropped the
- * connection, as opposed to rejecting the statement.
+ * Tells whether a thrown value means the database could not be reached, dropped the connection
+ * or cancelled the statement on a timeout, as opposed to rejecting the statement.
  *
  * True when the value, or an entry of its `errors` array or its `cause` (followed a few levels
  * deep), has one of these:
  * - `code` `ECONNREFUSED`, `ECONNRESET`, `ENOTFOUND`, `ETIMEDOUT` or `EAI_AGAIN`;
  * - `code` a SQLSTATE of class `08`, or `57P01`, `57P02`, `57P03` or `53300`;
+ * - `code` `57014` or `55P03`, a statement the server cancelled, and rolled back, once the pool's
+ *   statement timeout or a lock timeout passed;
  * - a `message` containing "timeout exceeded when trying to connect";
  * - a `message` starting with "Connection terminated";
  * - the `message` "Query read timeout", pg's rejection of a statement the server did not answer
@@ -361,7 +376,9 @@ export async function withTransaction<T>(
   } catch (err) {
     const mapped = toDatabaseError(err, client);
     // After a connection failure `ROLLBACK` could only fail on a dead socket or, queued behind a
-    // statement the server left unanswered, wait out a second query timeout before the 503.
+    // statement the server left unanswered, wait out a second query timeout before the 503. After
+    // a server-side statement or lock timeout it is not needed: the server has already aborted
+    // the transaction, and destroying the connection ends it.
     destroyConnection = isConnectionFailure(mapped) || !(await rollBack(client));
     throw mapped;
   } finally {

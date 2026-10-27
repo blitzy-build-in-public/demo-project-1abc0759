@@ -155,8 +155,10 @@ td button {
   font-size: 0.875rem;
 }
 
-/* Delete buttons; the label already says Delete, so colour is not the only cue. */
-[data-confirm-delete] {
+/* Delete buttons; the label already says Delete, so colour is not the only cue. The confirmation
+   page's "Delete task" takes .danger, since data-confirm-delete would ask a second time. */
+[data-confirm-delete],
+.danger {
   border-color: var(--color-error);
   background: var(--color-bg);
   color: var(--color-error);
@@ -164,24 +166,37 @@ td button {
 
 @media (hover: hover) {
   a:hover { color: var(--color-accent-strong); text-decoration-thickness: 2px; }
+  /* The line only, so the title keeps a:hover's 2px thickness. */
+  .site-title:hover { text-decoration-line: underline; }
   input:hover, select:hover, textarea:hover { border-color: var(--color-text); }
   button:hover { border-color: var(--color-accent-strong); background: var(--color-accent-strong); }
-  header button:enabled:hover, td button:enabled:hover { background: var(--color-info-bg); }
-  [data-confirm-delete]:enabled:hover {
+  /* Secondary and Delete buttons fill solid too; a pale tint barely differs from white. The
+     secondary rule sets no border, so button:enabled:active still darkens it. */
+  header button:enabled:hover,
+  td button:enabled:hover { background: var(--color-accent-strong); color: var(--color-on-accent); }
+  [data-confirm-delete]:enabled:hover,
+  .danger:enabled:hover {
     border-color: var(--color-error);
-    background: var(--color-error-bg);
+    background: var(--color-error);
+    color: var(--color-on-accent);
   }
 }
 
-/* After the hover rules, so :active and :disabled override them; invalid fields stay red. */
-a:active { background: var(--color-info-bg); color: var(--color-accent-strong); }
+/* After the hover rules, so :active and :disabled override them; invalid fields stay red.
+   Pressed links invert, since a pale tint would match the header and page backgrounds. */
+a:active { background: var(--color-accent-strong); color: var(--color-on-accent); }
+.error-summary a:active { background: var(--color-error); color: var(--color-on-accent); }
 button:enabled:active,
-[data-confirm-delete]:enabled:active { border-color: var(--color-text); translate: 0 1px; }
+[data-confirm-delete]:enabled:active,
+.danger:enabled:active { border-color: var(--color-text); translate: 0 1px; }
+/* Before :disabled, which matches with the same weight and must win. */
+input:active, select:active, textarea:active { border-color: var(--color-accent); }
 button:disabled, input:disabled, select:disabled,
 textarea:disabled { border-color: var(--color-border); cursor: not-allowed; opacity: 1; }
 button:disabled, input:disabled, select:disabled,
 textarea:disabled { background: var(--color-surface); color: var(--color-muted); }
-[aria-invalid="true"]:hover, [aria-invalid="true"]:disabled { border-color: var(--color-error); }
+[aria-invalid="true"]:hover, [aria-invalid="true"]:active,
+[aria-invalid="true"]:disabled { border-color: var(--color-error); }
 /* POST forms without wrappers: space the submit button and the Cancel link that follows it. */
 main form[method="post"] > button { margin-block-start: 1rem; }
 main form[method="post"] > button + a { margin-inline-start: 1rem; }
@@ -208,27 +223,30 @@ form[method="get"] label:not(:first-child) { margin-inline-start: 0.75rem; }
 
 /* Messages */
 
+/* Every message band takes one shape: field width, rounded corners, a bar at the start. */
 [role="alert"],
 .form-error,
 .field-error {
+  max-width: var(--field-width);
   padding-block: 0.5rem;
   padding-inline: 0.75rem;
   border-inline-start: 4px solid var(--color-error);
+  border-radius: var(--radius);
   background: var(--color-error-bg);
   color: var(--color-error);
   font-weight: 600;
 }
 
-.field-error { max-width: var(--field-width); margin-block: 0.25rem 0; padding-block: 0.25rem; }
+.field-error { margin-block: 0.25rem 0; padding-block: 0.25rem; }
 
 /* The error summary opening a re-rendered task form. It is not an alert (its field messages are),
-   so it takes the error look by class; its links keep the error colour in every state. */
+   so it takes the bands' error shape by class; its links keep the error colour in every state. */
 .error-summary {
   max-width: var(--field-width);
   margin-block: 0 1rem;
   padding-block: 0.75rem;
   padding-inline: 1rem;
-  border: 2px solid var(--color-error);
+  border-inline-start: 4px solid var(--color-error);
   border-radius: var(--radius);
   background: var(--color-error-bg);
 }
@@ -239,9 +257,11 @@ form[method="get"] label:not(:first-child) { margin-inline-start: 0.75rem; }
 
 [role="status"],
 .notice {
+  max-width: var(--field-width);
   padding-block: 0.5rem;
   padding-inline: 0.75rem;
   border-inline-start: 4px solid var(--color-accent);
+  border-radius: var(--radius);
   background: var(--color-info-bg);
 }
 

@@ -2,18 +2,23 @@
  * Failure responses: the 404 handler for unknown routes and the error handler that turns every
  * error into a fixed-message page.
  *
- * Every body comes from `renderErrorPage(status, message)` with one of the fixed messages below
- * or an {@link HttpError}'s `publicMessage`. No error property, stack trace, SQL text or request
- * data is ever rendered, so two failures with the same status and message are byte-identical
- * whoever is signed in. Both handlers are installed in every `NODE_ENV`, so Express's default
- * handler, which prints stack traces, is never reached.
+ * Every body comes from `renderErrorPage` with one of the fixed messages below or an
+ * {@link HttpError}'s `publicMessage`. No error property, stack trace, SQL text, query string or
+ * form field is ever rendered. The only request state a page reads is `req.user` and the
+ * response's CSRF token, for the layout header: a request that reached the failure signed in gets
+ * the navigation, "Signed in as <email>" and the Log out form, and any other gets the anonymous
+ * header. Two failures with the same status and message are therefore byte-identical for the same
+ * user and token. Both handlers are installed in every `NODE_ENV`, so Express's default handler,
+ * which prints stack traces, is never reached.
  */
 
 import type { ErrorRequestHandler, NextFunction, Request, RequestHandler, Response } from 'express';
 
 import { DatabaseUnavailableError, HttpError } from '../../shared/errors';
 import type { Logger } from '../../shared/logger';
-import { renderErrorPage } from '../templates/error-pages';
+import { csrfTokenOf } from '../csrf';
+import '../request-user';
+import { renderErrorPage, type ErrorPageViewer } from '../templates/error-pages';
 
 /** Message of the 404 page for an unknown route or a missing static asset. */
 export const PAGE_NOT_FOUND_MESSAGE = 'Page not found.';
@@ -35,15 +40,40 @@ interface ErrorOutcome {
 }
 
 /**
- * Sends the error page as `text/html; charset=utf-8`.
+ * The signed-in viewer of an error page, read only from state already in memory: `req.user`, set
+ * by `loadSession`, and the CSRF token `csrf.prepare` set on `res.locals`. Neither read touches
+ * the database, so the 503 page renders while it is down.
+ *
+ * Both must be present. A `/static` 404 and a body-parser 400 or 413 arrive before session
+ * loading, and a 503 raised by `loadSession` itself leaves `req.user` unset; a request that failed
+ * before `csrf.prepare` ran has no token, and a Log out form without one could only be refused.
+ * `noStore` runs right after `csrf.prepare` and before any route, so every failure that reaches
+ * this point with a user and a token is already marked `Cache-Control: no-store`, and a page
+ * showing the email is never cached.
+ *
+ * @returns The user and token, or `undefined` for the anonymous page.
+ */
+function signedInViewer(req: Request, res: Response): ErrorPageViewer | undefined {
+  const user = req.user;
+  if (user === undefined) {
+    return undefined;
+  }
+  const csrfToken = csrfTokenOf(res);
+  return csrfToken === '' ? undefined : { user, csrfToken };
+}
+
+/**
+ * Sends the error page as `text/html; charset=utf-8`, with the signed-in header when
+ * {@link signedInViewer} finds a user and a CSRF token for this request, and the anonymous header
+ * otherwise.
  *
  * `Content-Disposition` is removed so that an error raised after the export route set its headers
  * never makes the page download as a CSV file. Every other header already set is kept, notably
  * `Cache-Control: no-store` on a signed-in request and any cookie a middleware set or cleared.
  */
-function sendErrorPage(res: Response, status: number, message: string): void {
+function sendErrorPage(req: Request, res: Response, status: number, message: string): void {
   res.removeHeader('Content-Disposition');
-  res.status(status).type('html').send(renderErrorPage(status, message));
+  res.status(status).type('html').send(renderErrorPage(status, message, signedInViewer(req, res)));
 }
 
 /**
@@ -96,12 +126,13 @@ function classify(err: unknown): ErrorOutcome {
  * Answers 404 "Page not found." for an unknown route or method, and for a missing `/static`
  * asset. Nothing is logged.
  *
- * It reads no request state (no `req.user`, `res.locals`, cookies or session), so it can be
- * mounted at `/static` right after `express.static`, before the cookie and session middleware,
- * as well as after the routers.
+ * The only request state it reads is `req.user` and `res.locals.csrfToken`, for the page header,
+ * and it reads no cookie and queries nothing. Both are absent at `/static`, where it is mounted
+ * right after `express.static` and before the cookie and session middleware, so that 404 renders
+ * the anonymous page. After the routers, a signed-in request gets the signed-in header.
  */
-export const notFoundHandler: RequestHandler = (_req, res): void => {
-  sendErrorPage(res, 404, PAGE_NOT_FOUND_MESSAGE);
+export const notFoundHandler: RequestHandler = (req, res): void => {
+  sendErrorPage(req, res, 404, PAGE_NOT_FOUND_MESSAGE);
 };
 
 /**
@@ -153,6 +184,6 @@ export function createErrorHandler(logger: Logger): ErrorRequestHandler {
       res.destroy();
       return;
     }
-    sendErrorPage(res, outcome.status, outcome.message);
+    sendErrorPage(req, res, outcome.status, outcome.message);
   };
 }

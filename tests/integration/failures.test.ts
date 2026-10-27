@@ -4,11 +4,18 @@
  *
  * - 503 "Service temporarily unavailable" while the database is unreachable, logged once as
  *   `database unavailable` with the method and the path but never the query string, after which
- *   both processes keep serving.
+ *   both processes keep serving. A write blocked on another session's lock, whether an autocommit
+ *   task insert, task delete or sign-up or a transactional status change, gets the same 503 from
+ *   PostgreSQL's own cancellation at the pool's 4.5-second statement timeout, before the 5-second
+ *   client-side query timeout, and leaves the data unchanged once the lock is released.
  * - 404 "Page not found.", 400 and 413 "Bad request." and 500 "Something went wrong.", none of
  *   them carrying a stack frame, SQL text or driver detail, and no malformed request changing data.
  *   A logger that throws changes no response: the 500 and 503 pages are still sent, a response
  *   whose headers were already sent is still cut off, and nothing is printed to the console.
+ * - The failure page's header: a signed-in 400, 403, 404 (page or task) and 500 show the
+ *   navigation, "Signed in as <email>" and a Log out form whose token ends the session, while an
+ *   anonymous 404, a signed-in `/static` 404 and a 503 raised by session loading show the
+ *   anonymous header.
  * - The purge job: a failed run resolves and logs `purge failed`, the same job's next run against
  *   a reachable database purges and logs its counts, and a run never overlaps another.
  * - The server's start-up and shutdown, running `main()` from `src/server.ts` in this process:
@@ -41,6 +48,7 @@ import type { AuthService, PurgeResult } from '../../src/auth/auth-service';
 import { createDataAccess } from '../../src/db/data-access';
 import { createPool } from '../../src/db/pool';
 import * as poolModule from '../../src/db/pool';
+import { checkOut } from '../../src/db/query';
 import { createSessionsRepo } from '../../src/db/sessions-repo';
 import { createPurgeJob } from '../../src/purge-job';
 import type { PurgeJob } from '../../src/purge-job';
@@ -293,6 +301,160 @@ describe('failure responses and the purge failure policy', () => {
       const user = await signUpAndLogIn(healthy, 'still-served@example.com');
       expect((await user.get('/tasks')).status).toBe(200);
     });
+
+    /**
+     * The pool's client-side query timeout. A 503 that takes this long came from pg abandoning
+     * the statement, which the server may still go on to commit.
+     */
+    const QUERY_TIMEOUT_MS = 5_000;
+
+    /**
+     * Allowance for the cost-12 bcrypt hash a sign-up computes before its insert, about a quarter
+     * of a second on an idle host, so that a busy host cannot push that case past its bound.
+     */
+    const PASSWORD_HASH_ALLOWANCE_MS = 1_000;
+
+    /** How long other sessions on the test database may take to finish their statements. */
+    const SETTLE_DEADLINE_MS = 5_000;
+
+    /** Locks the seeded task's row until the holding transaction ends. */
+    const TASK_ROW_LOCK_SQL = 'SELECT id FROM tasks WHERE id = $1 FOR UPDATE';
+
+    /** A write that another session's lock blocks, sent with values the route would accept. */
+    interface LockedWriteCase {
+      /** The write and its route, for the test name. */
+      name: string;
+      /** The statement the lock holder runs after `BEGIN`, and its parameters. */
+      lock: (taskId: number) => readonly [text: string, params: readonly unknown[]];
+      /** The path the request is sent to and logged under. */
+      path: (taskId: number) => string;
+      /** Whether the signed-in client sends it; otherwise an anonymous client does. */
+      signedIn: boolean;
+      /** The form fields; the client adds the CSRF token. */
+      fields: Readonly<Record<string, string>>;
+      /** Time the route may spend on its own work before the blocked statement starts. */
+      leadMs: number;
+    }
+
+    const LOCKED_WRITE_CASES: readonly LockedWriteCase[] = [
+      {
+        name: 'an autocommit task insert (POST /tasks/new)',
+        lock: () => ['LOCK TABLE tasks IN ACCESS EXCLUSIVE MODE', []],
+        path: () => '/tasks/new',
+        signedIn: true,
+        fields: { ...VALID_TASK_FIELDS, title: 'Blocked create' },
+        leadMs: 0,
+      },
+      {
+        name: 'an autocommit task delete (POST /tasks/:id/delete)',
+        lock: (taskId) => [TASK_ROW_LOCK_SQL, [taskId]],
+        path: (taskId) => `/tasks/${taskId}/delete`,
+        signedIn: true,
+        fields: { confirm: 'yes' },
+        leadMs: 0,
+      },
+      {
+        name: 'an autocommit sign-up insert (POST /signup)',
+        lock: () => ['LOCK TABLE users IN ACCESS EXCLUSIVE MODE', []],
+        path: () => '/signup',
+        signedIn: false,
+        fields: { email: 'blocked-sign-up@example.com', password: PASSWORD },
+        leadMs: PASSWORD_HASH_ALLOWANCE_MS,
+      },
+      {
+        // Control: a transaction always rolled back when its connection was dropped.
+        name: 'a transactional status change (POST /tasks/:id/status)',
+        lock: (taskId) => [TASK_ROW_LOCK_SQL, [taskId]],
+        path: (taskId) => `/tasks/${taskId}/status`,
+        signedIn: true,
+        fields: { status: 'Done' },
+        leadMs: 0,
+      },
+    ];
+
+    /** Every user and task row: what a write answered with 503 must leave exactly as it was. */
+    async function storedData(): Promise<Record<string, unknown[]>> {
+      return {
+        users: await sql<Record<string, unknown>>(pool, 'SELECT * FROM users ORDER BY id'),
+        tasks: await sql<Record<string, unknown>>(pool, 'SELECT * FROM tasks ORDER BY id'),
+      };
+    }
+
+    /**
+     * Waits until no other client session on the test database is running a statement, so that
+     * a write the server kept running after the response has committed before the data is read.
+     */
+    async function untilOtherSessionsIdle(): Promise<void> {
+      const deadline = Date.now() + SETTLE_DEADLINE_MS;
+      for (;;) {
+        const [row] = await sql<{ active: number }>(
+          pool,
+          'SELECT count(*)::int AS active FROM pg_stat_activity ' +
+            "WHERE datname = current_database() AND backend_type = 'client backend' " +
+            "AND state = 'active' AND pid <> pg_backend_pid()",
+        );
+        if (row?.active === 0) {
+          return;
+        }
+        if (Date.now() >= deadline) {
+          throw new Error(`other sessions still active after ${SETTLE_DEADLINE_MS} ms`);
+        }
+        await new Promise<void>((resolve) => setTimeout(resolve, 20));
+      }
+    }
+
+    it.each(LOCKED_WRITE_CASES)(
+      'answers $name blocked on a lock with 503 and leaves the data unchanged',
+      async ({ lock, path, signedIn, fields, leadMs }) => {
+        const email = 'lock-wait@example.com';
+        const user = await signUpAndLogIn(healthy, email);
+        const ownerId = await userIdByEmail(pool, email);
+        if (ownerId === null) {
+          throw new Error('the signed-up user was not stored');
+        }
+        const task = await insertTask(pool, ownerId, { title: 'Locked task' });
+        const csrf = await taskFormToken(user);
+        const anonymous = healthy.client();
+        expect((await anonymous.get('/signup')).status).toBe(200);
+        const before = await storedData();
+        const [lockText, lockParams] = lock(task.id);
+
+        const holder = await checkOut(pool);
+        let res: HttpResult;
+        let elapsedMs: number;
+        try {
+          await sql(holder, 'BEGIN');
+          await sql(holder, lockText, lockParams);
+          const started = performance.now();
+          res = signedIn
+            ? await user.post(path(task.id), fields, { csrf })
+            : await anonymous.post(path(task.id), fields);
+          elapsedMs = performance.now() - started;
+        } finally {
+          try {
+            await sql(holder, 'COMMIT');
+          } finally {
+            holder.release();
+          }
+        }
+        await untilOtherSessionsIdle();
+
+        expectFailurePage(res, 503, 'Service temporarily unavailable');
+        // A write abandoned only by the client would have committed once the lock was released.
+        expect(await storedData()).toEqual(before);
+        const logged = healthyLog.byMsg('database unavailable');
+        expect(logged).toHaveLength(1);
+        // `57014` is the server's own cancellation; pg's client-side timeout carries no code.
+        expect(logged[0]).toMatchObject({
+          level: 'error',
+          method: 'POST',
+          path: path(task.id),
+          err: { name: 'DatabaseUnavailableError', code: '57014' },
+        });
+        // The answer comes within the blocked statement's own bound, with no second wait after it.
+        expect(elapsedMs).toBeLessThan(QUERY_TIMEOUT_MS + leadMs);
+      },
+    );
   });
 
   describe('unknown routes (404)', () => {
@@ -547,6 +709,165 @@ describe('failure responses and the purge failure policy', () => {
         await broken.close();
       }
     });
+  });
+
+  describe('the header of a failure page', () => {
+    /** Markup that only the signed-in header renders. */
+    const MAIN_NAV = '<nav aria-label="Main">';
+    const LOGOUT_FORM = '<form method="post" action="/logout" class="logout-form">';
+
+    // The instance behind the 500 case: every report call throws.
+    let failingReportsApp: TestApp;
+
+    beforeAll(async () => {
+      const fail = (): never => {
+        throw new Error('report service failed');
+      };
+      const failingReports: ReportService = {
+        today: () => '2026-10-21',
+        summary: async () => fail(),
+        completions: async () => fail(),
+        exportCsv: async () => fail(),
+      };
+      failingReportsApp = await startTestApp({
+        clock,
+        logger: new CaptureLogger(),
+        overrides: { reports: failingReports },
+      });
+      cleanups.push(() => failingReportsApp.close());
+    });
+
+    /** A failure a signed-in client provokes, and the page it must get. */
+    interface SignedInFailure {
+      name: string;
+      status: number;
+      message: string;
+      /** The instance the client signs in to; only the 500 needs the failing report service. */
+      instance: 'healthy' | 'failing reports';
+      send(client: HttpClient): Promise<HttpResult>;
+    }
+
+    const SIGNED_IN_FAILURES: readonly SignedInFailure[] = [
+      {
+        name: 'a 400 for GET /tasks?status=Bogus',
+        status: 400,
+        message: 'Bad request.',
+        instance: 'healthy',
+        send: (client) => client.get('/tasks?status=Bogus'),
+      },
+      {
+        name: 'a 403 for POST /logout with a wrong token',
+        status: 403,
+        message: 'The form has expired. Reload the page and try again.',
+        instance: 'healthy',
+        send: (client) => client.post('/logout', {}, { csrf: 'wrong' }),
+      },
+      {
+        name: 'a 404 for GET /no-such-page',
+        status: 404,
+        message: 'Page not found.',
+        instance: 'healthy',
+        send: (client) => client.get('/no-such-page'),
+      },
+      {
+        name: 'a 404 for a missing task',
+        status: 404,
+        message: 'Task not found.',
+        instance: 'healthy',
+        send: (client) => client.get('/tasks/999999/edit'),
+      },
+      {
+        name: 'a 500 from a failing report service',
+        status: 500,
+        message: 'Something went wrong.',
+        instance: 'failing reports',
+        send: (client) => client.get('/reports'),
+      },
+    ];
+
+    it.each(SIGNED_IN_FAILURES)(
+      'renders $name with the signed-in header, whose token logs out',
+      async ({ status, message, instance, send }) => {
+        const email = 'signed-in-failure@example.com';
+        const client = await signUpAndLogIn(
+          instance === 'healthy' ? healthy : failingReportsApp,
+          email,
+        );
+
+        const res = await send(client);
+
+        expectFailurePage(res, status, message);
+        expect(res.body).toContain(MAIN_NAV);
+        expect(res.body).toContain(`<span class="signed-in">Signed in as ${email}</span>`);
+        expect(res.body).toContain(LOGOUT_FORM);
+        expect(res.headers.get('cache-control')).toBe('no-store');
+
+        // While the session is active a wrong token is refused with 403, so the 303 and the
+        // deleted session row show that the page's Log out form carries the session's token.
+        const token = client.csrfToken();
+        if (token === null) {
+          throw new Error('the failure page carries no CSRF token');
+        }
+        expect(await countRows(pool, 'sessions')).toBe(1);
+        const logOut = await client.post('/logout', {}, { csrf: token });
+        expect(logOut.status).toBe(303);
+        expect(logOut.location).toBe('/login');
+        expect(await countRows(pool, 'sessions')).toBe(0);
+      },
+    );
+
+    /** A failure answered with the anonymous header, and the page it must get. */
+    interface AnonymousFailure {
+      name: string;
+      status: number;
+      message: string;
+      send(): Promise<HttpResult>;
+    }
+
+    const ANONYMOUS_FAILURES: readonly AnonymousFailure[] = [
+      {
+        name: 'an anonymous GET /no-such-page',
+        status: 404,
+        message: 'Page not found.',
+        send: () => healthy.client().get('/no-such-page'),
+      },
+      {
+        // The /static 404 answers before the cookie and session middleware run.
+        name: 'a signed-in GET /static/missing.js',
+        status: 404,
+        message: 'Page not found.',
+        send: async () => {
+          const client = await signUpAndLogIn(healthy, 'static-asset@example.com');
+          return client.get('/static/missing.js');
+        },
+      },
+      {
+        // Session loading itself fails, so the request never gets a user.
+        name: 'a signed-in GET /tasks while the database is unreachable',
+        status: 503,
+        message: 'Service temporarily unavailable',
+        send: async () => {
+          const signedIn = await signUpAndLogIn(healthy, 'outage-header@example.com');
+          const client = down.client();
+          client.setCookie('sid', sessionCookie(signedIn));
+          return client.get('/tasks');
+        },
+      },
+    ];
+
+    it.each(ANONYMOUS_FAILURES)(
+      'renders $name with the anonymous header',
+      async ({ status, message, send }) => {
+        const res = await send();
+
+        expectFailurePage(res, status, message);
+        expect(res.body).toContain('<a href="/tasks" class="site-title">Task Tracker</a>');
+        expect(res.body).not.toContain('<nav');
+        expect(res.body).not.toContain('Signed in as');
+        expect(res.body).not.toContain('action="/logout"');
+        expect(res.body).not.toContain('name="_csrf"');
+      },
+    );
   });
 
   describe('a failing logger', () => {

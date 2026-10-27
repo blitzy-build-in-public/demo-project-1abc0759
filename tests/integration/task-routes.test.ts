@@ -1447,6 +1447,10 @@ describe('status change and delete keep the list filters', () => {
     expect(res.body).toContain('Keep me');
     expect(res.body).toMatch(/<input[^>]*name="confirm"[^>]*value="yes"/);
     expect(res.body).toMatch(/<input[^>]*name="filterStatus"[^>]*value="In progress"/);
+    // The button is the confirmation: danger-styled by class, never a second script prompt.
+    expect(res.body).toContain('<button type="submit" class="danger">Delete task</button>');
+    expect(res.body).not.toContain('data-confirm-delete');
+    expect(res.body).not.toContain('<script');
     expect(await tasksForOwner(pool, userA.userId)).toEqual([task]);
   });
 
