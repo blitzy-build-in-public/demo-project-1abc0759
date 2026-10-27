@@ -43,13 +43,15 @@ const TASK_ID_PATTERN = /^[1-9][0-9]{0,14}$/;
  * Reads one field from a parsed request body or query.
  *
  * Returns the value unchanged (no trimming), or `undefined` when the field is absent or `source`
- * is not an object. A repeated parameter arrives as an array, which is a malformed request, so it
- * and any other non-string value throw.
+ * is not an object. A field is absent when `source` has no own property of that name (inherited
+ * keys are ignored) or its own property holds `undefined`. A repeated parameter arrives as an
+ * array, which is a malformed request, so it and any other non-string value (`null`, a number,
+ * an object) throw.
  *
  * @param source - `req.body` or `req.query`, typed as `unknown`.
  * @param name - The field name.
  * @returns The submitted string, or `undefined` when the field is absent.
- * @throws {@link BadRequestError} when the value is not a single string.
+ * @throws {@link BadRequestError} when the value is present but not a single string.
  */
 export function readField(source: unknown, name: string): string | undefined {
   if (typeof source !== 'object' || source === null) {
@@ -61,6 +63,11 @@ export function readField(source: unknown, name: string): string | undefined {
     return undefined;
   }
   const value: unknown = (source as Readonly<Record<string, unknown>>)[name];
+  // An own key holding `undefined`, as `{ status: body.filterStatus }` builds when the echo was
+  // not posted, is an absent field: per the list-filter rule an absent value sets no filter.
+  if (value === undefined) {
+    return undefined;
+  }
   if (typeof value !== 'string') {
     throw new BadRequestError();
   }
@@ -109,7 +116,9 @@ export function parseTaskId(raw: string): TaskId {
  * An absent or empty value sets no filter, and its key is omitted. An exact label sets that
  * filter. The two filters combine with AND, which `TasksRepo.list` applies. Other keys are
  * ignored. Routes also pass `{ status: body.filterStatus, priority: body.filterPriority }` to
- * validate the filter echoes posted with a status change or delete.
+ * validate the filter echoes posted with a status change or delete. An echo that was not posted
+ * leaves its key holding `undefined`, which {@link readField} treats as absent, so it sets no
+ * filter.
  *
  * @param query - `req.query`, or an object holding the posted filter echoes.
  * @returns The filters to apply.
