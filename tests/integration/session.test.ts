@@ -531,7 +531,7 @@ async function sentCookies(client: HttpClient, path: string): Promise<string> {
 }
 
 describe('HttpClient, the cookie-jar client every session case relies on', () => {
-  /** Every request the foreign server has received. */
+  /** Every request the foreign server has received since the current origin-binding case began. */
   const foreignHits: ForeignHit[] = [];
 
   /** The application stand-in, which {@link handleApp} answers for. */
@@ -673,6 +673,12 @@ describe('HttpClient, the cookie-jar client every session case relies on', () =>
   describe('HttpClient origin binding', () => {
     /** Sends one request that leaves the client's origin. */
     type Send = (client: HttpClient) => Promise<HttpResult>;
+
+    beforeEach(() => {
+      // Each case judges only its own traffic. The previous case awaited its request, and the
+      // foreign server records a request on arrival, so no earlier hit can land after this reset.
+      foreignHits.length = 0;
+    });
 
     it.each<[string, Send]>([
       ['get with an absolute foreign URL', (c) => c.get(`${foreignBase}/collect`)],
