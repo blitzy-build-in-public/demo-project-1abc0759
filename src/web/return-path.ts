@@ -51,8 +51,10 @@ function startsWithSingleSlash(value: string): boolean {
 /**
  * Whether a resolved pathname names one of {@link EXCLUDED_PATHS}, ignoring case and one trailing
  * slash. Routing matches paths exactly, so `/LOGIN` or `/login/` reaches only the 404 page; the
- * comparison rejects such variants as well, so a login never ends on a 404 page and the user lands
- * on {@link DEFAULT_RETURN_PATH} instead.
+ * comparison rejects these auth-page variants as well, and the user lands on
+ * {@link DEFAULT_RETURN_PATH} instead. No other path is checked against the routes: another
+ * same-origin path that no route serves, such as `/TASKS` or `/missing`, is still accepted, and a
+ * login there ends on the 404 page.
  */
 function isExcludedTarget(pathname: string): boolean {
   const lower = pathname.toLowerCase();

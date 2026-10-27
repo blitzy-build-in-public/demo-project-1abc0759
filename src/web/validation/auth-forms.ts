@@ -27,6 +27,19 @@ export const DUPLICATE_EMAIL_MESSAGE = 'An account with this email already exist
 export const LOCKOUT_MESSAGE = 'Too many failed attempts. Try again later.';
 
 /**
+ * Wire names of the sign-up and login forms: the body keys of `POST /signup` and `POST /login`.
+ * `next` is also the return-path query parameter of `GET /signup` and `GET /login`.
+ *
+ * The parsers in this module read exactly these keys, and the pages' `name` attributes and links
+ * and the routes' query reads and redirects use them, so each wire name has one spelling.
+ */
+export const AUTH_FIELDS = Object.freeze({
+  email: 'email',
+  password: 'password',
+  next: 'next',
+} as const);
+
+/**
  * Largest login lockout key, in UTF-8 bytes. It is far above the 254-character longest address
  * sign-up accepts, so every attempt on an address an account can hold is still checked and
  * counted, and far below PostgreSQL's 2,704-byte B-tree entry limit, so the failure row for
@@ -96,8 +109,8 @@ export type SignUpFormResult =
  */
 export function readAuthFormValues(body: unknown): AuthFormValues {
   return {
-    email: (readField(body, 'email') ?? '').trim(),
-    next: sanitizeReturnPath(readField(body, 'next')),
+    email: (readField(body, AUTH_FIELDS.email) ?? '').trim(),
+    next: sanitizeReturnPath(readField(body, AUTH_FIELDS.next)),
   };
 }
 
@@ -118,7 +131,7 @@ export function readAuthFormValues(body: unknown): AuthFormValues {
  */
 export function parseSignUpForm(body: unknown): SignUpFormResult {
   const values = readAuthFormValues(body);
-  const password = readField(body, 'password') ?? '';
+  const password = readField(body, AUTH_FIELDS.password) ?? '';
 
   const errors: SignUpFormErrors = {};
   const emailError = validateEmail(values.email);
@@ -155,7 +168,7 @@ export function parseSignUpForm(body: unknown): SignUpFormResult {
  */
 export function parseLogInForm(body: unknown): FormResult<AuthCredentials, AuthFormValues> {
   const values = readAuthFormValues(body);
-  const password = readField(body, 'password') ?? '';
+  const password = readField(body, AUTH_FIELDS.password) ?? '';
 
   // The auth service locks on, and records failures under, normalizeEmail(email), so the parser
   // checks that same key. A key holding U+0000, which PostgreSQL text cannot store, or one too

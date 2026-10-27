@@ -12,9 +12,12 @@
  * the route does not pass, which keeps account existence hidden.
  */
 
-import type { AuthFormValues } from '../validation/auth-forms';
+import { AUTH_FIELDS, type AuthFormValues } from '../validation/auth-forms';
 import { html } from './html';
 import { csrfField, describedBy, fieldError, renderLayout } from './layout';
+
+/** The forms' wire names, taken from the parser that reads them so the markup cannot drift. */
+const { email: EMAIL_FIELD, password: PASSWORD_FIELD, next: NEXT_FIELD } = AUTH_FIELDS;
 
 /** View model of the sign-up page (`GET /signup`, and `POST /signup` on 409 or 422). */
 export interface SignUpPageView {
@@ -53,7 +56,7 @@ export interface LogInPageView {
  * the `&` and quotes it may contain for the attribute.
  */
 function withNext(path: '/login' | '/signup', next: string): string {
-  return next === '/tasks' ? path : `${path}?next=${encodeURIComponent(next)}`;
+  return next === '/tasks' ? path : `${path}?${NEXT_FIELD}=${encodeURIComponent(next)}`;
 }
 
 /**
@@ -84,15 +87,15 @@ export function renderSignUpPage(view: SignUpPageView): string {
   <h1>Sign up</h1>${notice}
   <form method="post" action="/signup">
     <label for="email">Email</label>
-    <input type="email" id="email" name="email" autocomplete="email" required
+    <input type="email" id="email" name="${EMAIL_FIELD}" autocomplete="email" required
       value="${values.email}"${describedBy(emailError && 'email-error')}${emailInvalid}>
     ${fieldError('email-error', emailError)}
     <label for="password">Password</label>
-    <input type="password" id="password" name="password" autocomplete="new-password"
+    <input type="password" id="password" name="${PASSWORD_FIELD}" autocomplete="new-password"
       required${describedBy('password-hint', passwordError && 'password-error')}${passwordInvalid}>
     <p class="hint" id="password-hint">At least 10 characters, including a letter and a digit.</p>
     ${fieldError('password-error', passwordError)}
-    <input type="hidden" name="next" value="${values.next}">
+    <input type="hidden" name="${NEXT_FIELD}" value="${values.next}">
     ${csrfField(view.csrfToken)}
     <button type="submit">Create account</button>
   </form>
@@ -129,12 +132,12 @@ export function renderLogInPage(view: LogInPageView): string {
   <h1>Log in</h1>${created}${messageArea}
   <form method="post" action="/login">
     <label for="email">Email</label>
-    <input type="email" id="email" name="email" autocomplete="email" required
+    <input type="email" id="email" name="${EMAIL_FIELD}" autocomplete="email" required
       value="${values.email}"${described}>
     <label for="password">Password</label>
-    <input type="password" id="password" name="password" autocomplete="current-password"
+    <input type="password" id="password" name="${PASSWORD_FIELD}" autocomplete="current-password"
       required${described}>
-    <input type="hidden" name="next" value="${values.next}">
+    <input type="hidden" name="${NEXT_FIELD}" value="${values.next}">
     ${csrfField(view.csrfToken)}
     <button type="submit">Log in</button>
   </form>

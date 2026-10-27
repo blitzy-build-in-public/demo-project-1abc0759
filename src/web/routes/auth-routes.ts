@@ -20,6 +20,7 @@ import '../request-user';
 import { sanitizeReturnPath } from '../return-path';
 import { renderLogInPage, renderSignUpPage } from '../templates/auth-pages';
 import {
+  AUTH_FIELDS,
   DUPLICATE_EMAIL_MESSAGE,
   INVALID_CREDENTIALS_MESSAGE,
   LOCKOUT_MESSAGE,
@@ -67,7 +68,7 @@ function readSessionToken(req: Request): string | null {
  */
 function signUpCreatedLocation(next: string): string {
   const created = '/login?created=1';
-  return next === '/tasks' ? created : `${created}&next=${encodeURIComponent(next)}`;
+  return next === '/tasks' ? created : `${created}&${AUTH_FIELDS.next}=${encodeURIComponent(next)}`;
 }
 
 /**
@@ -163,7 +164,8 @@ export function createAuthRouter(deps: {
   }
 
   router.get('/signup', requireAnonymous, (req: Request, res: Response): void => {
-    renderSignUp(res, 200, { email: '', next: sanitizeReturnPath(req.query.next) }, {});
+    const values = { email: '', next: sanitizeReturnPath(req.query[AUTH_FIELDS.next]) };
+    renderSignUp(res, 200, values, {});
   });
 
   router.post(
@@ -195,7 +197,7 @@ export function createAuthRouter(deps: {
   );
 
   router.get('/login', requireAnonymous, (req: Request, res: Response): void => {
-    const values = { email: '', next: sanitizeReturnPath(req.query.next) };
+    const values = { email: '', next: sanitizeReturnPath(req.query[AUTH_FIELDS.next]) };
     renderLogIn(res, 200, values, req.query.created === '1');
   });
 

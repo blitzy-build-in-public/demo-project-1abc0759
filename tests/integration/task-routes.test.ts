@@ -288,7 +288,8 @@ describe('create, edit, change status and delete (SC4)', () => {
     expect(editedRow).toContain('<td>2026-11-05</td>');
     expect(page.body).not.toContain('>Write report</a>');
     await expectListShowsStored(page.body, userA.userId);
-    expect(await storedTask(userA.userId, report.id)).toMatchObject({
+    const beforeMove = await storedTask(userA.userId, report.id);
+    expect(beforeMove).toMatchObject({
       title: 'Write final report',
       description: 'Include the appendix',
       status: 'To do',
@@ -296,6 +297,9 @@ describe('create, edit, change status and delete (SC4)', () => {
       dueDate: '2026-11-05',
     });
 
+    // A later instant than the edit, so the status change's own update time is distinguishable.
+    clock.advance(STEP_MS);
+    const movedAt = clock.now();
     const moved = await postAs(userA, `/tasks/${report.id}/status`, {
       status: 'In progress',
       filterStatus: '',
@@ -310,7 +314,13 @@ describe('create, edit, change status and delete (SC4)', () => {
     expect(movedRow).toContain('>Mark Done</button>');
     expect(movedRow).not.toContain('Mark In progress');
     await expectListShowsStored(page.body, userA.userId);
-    expect((await storedTask(userA.userId, report.id)).status).toBe('In progress');
+    // Only the status and the update time change: the edited fields, the creation time and the
+    // absent completion time are kept as they were stored before the move.
+    expect(await storedTask(userA.userId, report.id)).toEqual({
+      ...beforeMove,
+      status: 'In progress',
+      updatedAt: movedAt,
+    });
 
     const deleted = await postAs(userA, `/tasks/${report.id}/delete`, {
       confirm: 'yes',
@@ -328,26 +338,49 @@ describe('create, edit, change status and delete (SC4)', () => {
 });
 
 describe('completion time (SC5)', () => {
-  test('moving into Done records the time and moving out of Done clears it', async () => {
-    const task = await insertTask(pool, userA.userId, { title: 'Ship it', status: 'To do' });
+  test.each<{ reopenTo: TaskRow['status'] }>([
+    { reopenTo: 'In progress' },
+    { reopenTo: 'To do' },
+  ])(
+    'moving into Done records the time, moving to $reopenTo clears it, and nothing else changes',
+    async ({ reopenTo }) => {
+      // Every field but the status differs from the insert defaults, and the row was created and
+      // last updated before the clock's start, so a status change that rewrote any field other
+      // than the status and the two transition times would show in the full-row comparisons.
+      const fixture: TaskFixture = {
+        title: 'Ship it',
+        description: 'Tag the release\nand publish the notes',
+        status: 'To do',
+        priority: 'High',
+        dueDate: '2026-11-20',
+        createdAt: new Date('2026-10-19T08:15:30.250Z'),
+      };
+      const seeded = await insertTask(pool, userA.userId, fixture);
+      const before = await storedTask(userA.userId, seeded.id);
+      expect(before).toMatchObject({ ...fixture, updatedAt: fixture.createdAt, completedAt: null });
+      const statusPath = `/tasks/${before.id}/status`;
 
-    clock.advance(STEP_MS);
-    const c1 = clock.now();
-    expect((await postAs(userA, `/tasks/${task.id}/status`, { status: 'Done' })).status).toBe(303);
-    const done = await storedTask(userA.userId, task.id);
-    expect(done.status).toBe('Done');
-    expect(done.completedAt?.getTime()).toBe(c1.getTime());
+      clock.advance(STEP_MS);
+      const c1 = clock.now();
+      expect((await postAs(userA, statusPath, { status: 'Done' })).status).toBe(303);
+      expect(await storedTask(userA.userId, before.id)).toEqual({
+        ...before,
+        status: 'Done',
+        completedAt: c1,
+        updatedAt: c1,
+      });
 
-    clock.advance(STEP_MS);
-    const c2 = clock.now();
-    expect(
-      (await postAs(userA, `/tasks/${task.id}/status`, { status: 'In progress' })).status,
-    ).toBe(303);
-    const reopened = await storedTask(userA.userId, task.id);
-    expect(reopened.status).toBe('In progress');
-    expect(reopened.completedAt).toBeNull();
-    expect(reopened.updatedAt.getTime()).toBe(c2.getTime());
-  });
+      clock.advance(STEP_MS);
+      const c2 = clock.now();
+      expect((await postAs(userA, statusPath, { status: reopenTo })).status).toBe(303);
+      expect(await storedTask(userA.userId, before.id)).toEqual({
+        ...before,
+        status: reopenTo,
+        completedAt: null,
+        updatedAt: c2,
+      });
+    },
+  );
 
   test('editing a Done task keeps its completion time and moves the update time', async () => {
     const task = await insertTask(pool, userA.userId, { title: 'Close sprint', status: 'To do' });
@@ -672,6 +705,224 @@ describe('failed form: error summary and focus', () => {
       expectAutofocusOn(res.body, c.field);
     },
   );
+});
+
+/** The entities the `html` tag writes, each with the character it stands for. */
+const HTML_ENTITIES: Readonly<Record<string, string>> = {
+  '&amp;': '&',
+  '&lt;': '<',
+  '&gt;': '>',
+  '&quot;': '"',
+  '&#39;': "'",
+  '&#96;': '`',
+};
+
+/** Any one of {@link HTML_ENTITIES}. */
+const HTML_ENTITY = /&(?:amp|lt|gt|quot|#39|#96);/g;
+
+/** An `<option>` as `selectOptions` renders it: its value, an optional `selected`, its label. */
+const OPTION = /<option value="([^"]*)"( selected)?>([^<]*)<\/option>/g;
+
+/** The task form's status and priority values in display order, each its own label. */
+const FORM_OPTIONS = {
+  status: ['To do', 'In progress', 'Done'],
+  priority: ['Low', 'Medium', 'High'],
+} as const;
+
+/** One option of a rendered select, its value and label decoded. */
+interface RenderedOption {
+  value: string;
+  label: string;
+  selected: boolean;
+}
+
+/** Decodes the entities the `html` tag writes, in one pass, so `&amp;lt;` becomes `&lt;`. */
+function decodeHtml(text: string): string {
+  return text.replace(HTML_ENTITY, (entity) => HTML_ENTITIES[entity] ?? entity);
+}
+
+/** The edit form of task `id`, from its start tag to its end tag, without the Delete form. */
+function editFormOf(body: string, id: number): string {
+  const start = body.indexOf(`<form method="post" action="/tasks/${id}/edit">`);
+  const end = start < 0 ? -1 : body.indexOf('</form>', start);
+  if (end < 0) {
+    throw new Error(`editFormOf: the page has no edit form for task ${id}`);
+  }
+  return body.slice(start, end + '</form>'.length);
+}
+
+/** The decoded value of attribute `name` on the start tag `tag`, or `null` when it has none. */
+function attributeOf(tag: string, name: string): string | null {
+  const match = new RegExp(`\\s${name}="([^"]*)"`).exec(tag);
+  return match === null ? null : decodeHtml(match[1] ?? '');
+}
+
+/** The options of the select whose id is `id` in `form`, in page order. */
+function optionsOf(form: string, id: string): RenderedOption[] {
+  const select = new RegExp(`<select\\b[^>]*\\sid="${id}"[^>]*>([\\s\\S]*?)</select>`).exec(form);
+  if (select === null) {
+    throw new Error(`optionsOf: the form has no select with id "${id}"`);
+  }
+  return [...(select[1] ?? '').matchAll(OPTION)].map((m) => ({
+    value: decodeHtml(m[1] ?? ''),
+    label: decodeHtml(m[3] ?? ''),
+    selected: m[2] !== undefined,
+  }));
+}
+
+/**
+ * The value that the control whose id is `id` holds in `form`, decoded: an input's `value`, a
+ * textarea's text after the one leading line feed the HTML parser drops, or the value of a
+ * select's only selected option. A textarea's line breaks come back as the markup holds them; a
+ * browser submits each one as CRLF, so the two agree when every line break is a CRLF.
+ */
+function controlValue(form: string, id: string): string {
+  const tag = controlTag(form, id);
+  if (tag.startsWith('<input')) {
+    return attributeOf(tag, 'value') ?? '';
+  }
+  if (tag.startsWith('<textarea')) {
+    const start = form.indexOf(tag) + tag.length;
+    const end = form.indexOf('</textarea>', start);
+    if (end < 0) {
+      throw new Error(`controlValue: the textarea with id "${id}" is not closed`);
+    }
+    const text = form.slice(start, end);
+    return decodeHtml(text.startsWith('\n') ? text.slice(1) : text);
+  }
+  const [selected, ...others] = optionsOf(form, id).filter((o) => o.selected);
+  if (selected === undefined || others.length > 0) {
+    throw new Error(`controlValue: the select with id "${id}" has no single selected option`);
+  }
+  return selected.value;
+}
+
+/**
+ * The fields the rendered edit form of task `id` holds, read from its controls as
+ * {@link controlValue} does: what an edit made through the page posts, unlike
+ * {@link formFieldsOf}, which builds them from the stored row.
+ */
+function editFormFields(body: string, id: number): Record<string, string> {
+  const form = editFormOf(body, id);
+  return {
+    title: controlValue(form, 'title'),
+    description: controlValue(form, 'description'),
+    status: controlValue(form, 'status'),
+    priority: controlValue(form, 'priority'),
+    dueDate: controlValue(form, 'dueDate'),
+  };
+}
+
+/** The options a task-form select must render: each value its own label, only `selected` marked. */
+function expectedOptions(values: readonly string[], selected: string): RenderedOption[] {
+  return values.map((value) => ({ value, label: value, selected: value === selected }));
+}
+
+/**
+ * Stored tasks with nondefault values, the new-task defaults being To do, Medium, an empty
+ * description and no due date. Their titles and descriptions hold every character the `html` tag
+ * escapes and line breaks, one description starts with a line break, and one task is undated.
+ */
+const PREFILL_CASES: readonly { name: string; task: TaskFixture }[] = [
+  {
+    name: 'an In progress, High task with a multi-line description',
+    task: {
+      title: 'Review <draft> & "notes" `v1`',
+      description: "First line & <b>bold</b>\nSecond line's end\n",
+      status: 'In progress',
+      priority: 'High',
+      dueDate: '2026-11-15',
+    },
+  },
+  {
+    name: 'a Done, Low task whose description starts with a line break',
+    task: {
+      title: "Ship the team's release",
+      description: '\nShipped "v2" & tagged it `v2.0`',
+      status: 'Done',
+      priority: 'Low',
+      dueDate: '2026-09-30',
+    },
+  },
+  {
+    name: 'an undated To do, High task',
+    task: {
+      title: 'Undated work',
+      description: 'No deadline yet',
+      status: 'To do',
+      priority: 'High',
+      dueDate: null,
+    },
+  },
+];
+
+describe('the edit form shows the stored task', () => {
+  test.each(PREFILL_CASES)('GET /tasks/:id/edit prefills every control from $name', async (c) => {
+    const { id } = await insertTask(pool, userA.userId, c.task);
+    const stored = await storedTask(userA.userId, id);
+    expect(stored).toMatchObject(c.task);
+
+    const res = await userA.client.get(`/tasks/${id}/edit`);
+    expect(res.status).toBe(200);
+    const form = editFormOf(res.body, id);
+    expect(controlTag(form, 'title')).toMatch(/^<input type="text"\s/);
+    expect(controlValue(form, 'title')).toBe(stored.title);
+    expect(controlTag(form, 'description')).toMatch(/^<textarea\s/);
+    expect(controlValue(form, 'description')).toBe(stored.description);
+    expect(optionsOf(form, 'status')).toEqual(expectedOptions(FORM_OPTIONS.status, stored.status));
+    expect(optionsOf(form, 'priority')).toEqual(
+      expectedOptions(FORM_OPTIONS.priority, stored.priority),
+    );
+    expect(form).not.toContain('(invalid)');
+    const dueDate = controlTag(form, 'dueDate');
+    expect(dueDate).toMatch(/^<input type="date"\s/);
+    expect(attributeOf(dueDate, 'value')).toBe(stored.dueDate ?? '');
+  });
+
+  test.each<{ name: string; task: TaskFixture; title: string }>([
+    {
+      name: 'a task with a single-line title',
+      task: {
+        title: 'Draft the Q4 plan',
+        description: 'Budget & <headcount>\r\nTimeline',
+        status: 'Done',
+        priority: 'Low',
+        dueDate: '2026-11-15',
+      },
+      title: 'Draft the final Q4 plan',
+    },
+    {
+      name: 'a task with a multi-line title',
+      task: {
+        title: 'Plan\r\nreview',
+        description: "Agenda: \"scope\" & 'risks'",
+        status: 'In progress',
+        priority: 'High',
+        dueDate: '2026-12-01',
+      },
+      title: 'Plan\r\nfinal review',
+    },
+  ])('a title edit posted from the form of $name changes only title and update time', async (c) => {
+    const { id } = await insertTask(pool, userA.userId, c.task);
+    const before = await storedTask(userA.userId, id);
+    const page = await userA.client.get(`/tasks/${id}/edit`);
+    expect(page.status).toBe(200);
+    // The fixtures' line breaks are CRLF, so these are exactly the fields a browser would post.
+    const fields = editFormFields(page.body, id);
+    expect(fields).toEqual(formFieldsOf(before));
+
+    clock.advance(STEP_MS);
+    const at = clock.now();
+    expect(at.getTime()).toBeGreaterThan(before.updatedAt.getTime());
+    const edited = await postAs(userA, `/tasks/${id}/edit`, { ...fields, title: c.title });
+    expect(edited.status).toBe(303);
+    expect(edited.location).toBe('/tasks');
+    expect(await storedTask(userA.userId, id)).toEqual({
+      ...before,
+      title: c.title,
+      updatedAt: at,
+    });
+  });
 });
 
 /** The title textarea's start tag as the task form renders it, before its extra attributes. */
