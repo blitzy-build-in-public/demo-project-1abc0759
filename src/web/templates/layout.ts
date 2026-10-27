@@ -175,6 +175,11 @@ export interface DateInputOptions {
   describedBy?: readonly (string | false | null | undefined)[];
   /** Adds `aria-invalid="true"` when the field failed validation. */
   invalid?: boolean;
+  /**
+   * Adds `autofocus`, for the first invalid field of a re-rendered form, so the browser scrolls
+   * it into view and announces its linked message. At most one field per page may set it.
+   */
+  autofocus?: boolean;
 }
 
 /**
@@ -185,14 +190,15 @@ export interface DateInputOptions {
  * submitted string, because a browser sanitises an invalid value in a `type=date` control to
  * empty. No `required`, `min` or `max` is set: the server is the only validator.
  *
- * @param opts - The field's id, name, value, described-by ids and invalid flag.
+ * @param opts - The field's id, name, value, described-by ids, invalid flag and autofocus flag.
  * @returns The `<input>` element.
  */
 export function dateInput(opts: DateInputOptions): SafeHtml {
   const { id, name, value } = opts;
   const described = describedBy(...(opts.describedBy ?? []));
   const invalid = opts.invalid === true && html` aria-invalid="true"`;
-  const attrs = html`id="${id}" name="${name}" value="${value}"${described}${invalid}`;
+  const autofocus = opts.autofocus === true && html` autofocus`;
+  const attrs = html`id="${id}" name="${name}" value="${value}"${described}${invalid}${autofocus}`;
   if (value !== '' && parseIsoDate(value) === null) {
     return html`<input type="text" inputmode="numeric" placeholder="YYYY-MM-DD" ${attrs}>`;
   }
