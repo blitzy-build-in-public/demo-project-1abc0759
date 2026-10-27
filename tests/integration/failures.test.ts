@@ -16,7 +16,12 @@
  *   the role and password redacted and exits 1 without listening; a log write that throws at
  *   start-up still releases the port, the purge job, the signal handlers and the pool and exits
  *   1, and one that throws during a shutdown still closes everything and exits 0 exactly once,
- *   neither leaving an unhandled rejection.
+ *   neither leaving an unhandled rejection. A `SIGTERM` while a connection has sent no byte,
+ *   partial headers or a partial body destroys it and exits 0 at once; a request received in
+ *   full before the signal is still answered in full; a response already ended but still queued
+ *   behind a reader that has paused is delivered in full before its connection closes; and a
+ *   repeat of the same signal during a drain that cannot finish exits 1 at once, while the other
+ *   signal is ignored.
  *
  * The unreachable instance points at port 1 on the loopback interface, which refuses at once
  * (`ECONNREFUSED`), so no case waits on the pool's 5-second connection timeout.
@@ -48,7 +53,8 @@ import { createErrorHandler } from '../../src/web/middleware/error-handler';
 import { CaptureLogger } from '../helpers/capture-logger';
 import type { CapturedEntry } from '../helpers/capture-logger';
 import { FAKE_CLOCK_START, FakeClock } from '../helpers/fake-clock';
-import type { HttpClient, HttpResult } from '../helpers/http-client';
+import { HttpClient } from '../helpers/http-client';
+import type { HttpResult } from '../helpers/http-client';
 import { startTestApp } from '../helpers/test-app';
 import type { TestApp } from '../helpers/test-app';
 import {
@@ -60,6 +66,7 @@ import {
   insertUser,
   loginAttemptRows,
   sessionsForUser,
+  sql,
   truncateAll,
   userIdByEmail,
 } from '../helpers/test-db';
@@ -929,6 +936,25 @@ describe('server start-up and shutdown', () => {
 
   const SIGNALS: readonly NodeJS.Signals[] = ['SIGTERM', 'SIGINT'];
 
+  /**
+   * How long {@link waitForMsg} waits for a line before it rejects. It is well inside the
+   * integration project's 30-second test timeout, so a line that never comes fails the case with
+   * the line's name while the case is still running.
+   */
+  const MSG_WAIT_TIMEOUT_MS = 10_000;
+
+  /** How often {@link waitForMsg} re-reads the lines written so far. */
+  const MSG_POLL_INTERVAL_MS = 10;
+
+  /** A {@link waitForMsg} call that has not settled yet. */
+  interface PendingWait {
+    /** Stops the wait's timers and rejects it, naming the line it was waiting for. */
+    cancel(): void;
+  }
+
+  /** Every unsettled {@link waitForMsg}, so the teardown can stop the ones a case left behind. */
+  const pendingWaits = new Set<PendingWait>();
+
   /** A purge job the server created, with spies on the methods that start and stop its timer. */
   interface CreatedJob {
     job: PurgeJob;
@@ -1017,11 +1043,60 @@ describe('server start-up and shutdown', () => {
     return logged().map((entry) => entry.msg);
   }
 
-  /** Polls until a line with `msg` has been written; the test timeout bounds the wait. */
-  async function waitForMsg(msg: string): Promise<void> {
-    while (!loggedMsgs().includes(msg)) {
-      await new Promise<void>((resolve) => setTimeout(resolve, 10));
-    }
+  /**
+   * Polls until a line with `msg` has been written. It rejects, naming `msg`, when no such line
+   * arrives within {@link MSG_WAIT_TIMEOUT_MS}, when the lines cannot be read, or when the
+   * teardown cancels it. Jest's test timeout fails a case without stopping its body, so the wait
+   * carries its own deadline and registers in {@link pendingWaits}; no timer of it outlives the
+   * case.
+   */
+  function waitForMsg(msg: string): Promise<void> {
+    let pollTimer: NodeJS.Timeout | undefined;
+    let deadlineTimer: NodeJS.Timeout | undefined;
+    let settle: (failure: { reason: unknown } | null) => void = () => undefined;
+    const arrival = new Promise<void>((resolve, reject) => {
+      settle = (failure): void => {
+        clearTimeout(pollTimer);
+        clearTimeout(deadlineTimer);
+        pendingWaits.delete(wait);
+        if (failure === null) {
+          resolve();
+        } else {
+          reject(failure.reason);
+        }
+      };
+    });
+    const wait: PendingWait = {
+      cancel: (): void => {
+        // A case may end without awaiting its wait, and the cancellation must not then become an
+        // unhandled rejection. The no-op handler sits on a derived promise: a test that awaits
+        // the wait still receives the rejection.
+        arrival.catch(() => undefined);
+        settle({ reason: new Error(`server test: the wait for a "${msg}" line was cancelled`) });
+      },
+    };
+    const poll = (): void => {
+      let arrived: boolean;
+      try {
+        arrived = loggedMsgs().includes(msg);
+      } catch (err: unknown) {
+        settle({ reason: err });
+        return;
+      }
+      if (arrived) {
+        settle(null);
+      } else {
+        pollTimer = setTimeout(poll, MSG_POLL_INTERVAL_MS);
+      }
+    };
+    deadlineTimer = setTimeout(() => {
+      settle({
+        reason: new Error(`server test: no "${msg}" line within ${MSG_WAIT_TIMEOUT_MS} ms`),
+      });
+    }, MSG_WAIT_TIMEOUT_MS);
+    pendingWaits.add(wait);
+    poll();
+    return arrival;
   }
 
   /** The `SIGTERM` and `SIGINT` listeners added since the case began. */
@@ -1093,42 +1168,93 @@ describe('server start-up and shutdown', () => {
   });
 
   afterEach(async () => {
-    hostProcess.off('unhandledRejection', unhandled);
-    // Releases whatever a failed case left behind, so no listener, timer, socket or connection
-    // outlives it.
-    for (const signal of SIGNALS) {
-      const before = listenersBefore.get(signal) ?? [];
-      for (const listener of process.listeners(signal)) {
-        if (!before.includes(listener)) {
-          process.removeListener(signal, listener);
-        }
+    // Every step is attempted on its own and its failure collected, so a stop that throws or a
+    // close that rejects can neither leave the remaining resources open nor skip the restores.
+    const errors: unknown[] = [];
+    const attempt = async (step: () => void | Promise<void>): Promise<void> => {
+      try {
+        await step();
+      } catch (err: unknown) {
+        errors.push(err);
       }
-    }
-    for (const { job } of jobs) {
-      job.stop();
-    }
-    for (const result of createServerSpy.mock.results) {
-      if (result.type === 'return' && result.value.listening) {
-        const server = result.value;
-        await new Promise<void>((resolve) => {
-          server.close(() => resolve());
-          server.closeAllConnections();
+    };
+    try {
+      // A wait the case left polling is stopped first, so it reads no later case's lines.
+      for (const wait of [...pendingWaits]) {
+        await attempt(() => {
+          wait.cancel();
         });
       }
-    }
-    for (const pool of createdPools()) {
-      if (!pool.ended && !pool.ending) {
-        await pool.end();
+      // Releases whatever a failed case left behind, so no listener, timer, socket or connection
+      // outlives it. Each list is read inside an attempt as well: a set-up that failed part-way
+      // can leave it unassigned.
+      for (const signal of SIGNALS) {
+        await attempt(() => {
+          const before = listenersBefore.get(signal) ?? [];
+          for (const listener of process.listeners(signal)) {
+            if (!before.includes(listener)) {
+              process.removeListener(signal, listener);
+            }
+          }
+        });
       }
+      await attempt(async () => {
+        for (const { job } of jobs) {
+          await attempt(() => {
+            job.stop();
+          });
+        }
+      });
+      await attempt(async () => {
+        for (const result of createServerSpy.mock.results) {
+          if (result.type === 'return' && result.value.listening) {
+            const server = result.value;
+            await attempt(
+              () =>
+                new Promise<void>((resolve, reject) => {
+                  server.close((err) => (err === undefined ? resolve() : reject(err)));
+                  server.closeAllConnections();
+                }),
+            );
+          }
+        }
+      });
+      await attempt(async () => {
+        for (const pool of createdPools()) {
+          if (!pool.ended && !pool.ending) {
+            await attempt(() => pool.end());
+          }
+        }
+      });
+    } finally {
+      // Restores the spies, the environment and the exit code whatever the cleanup did, so no
+      // later case runs against this case's mocks or state.
+      await attempt(() => {
+        hostProcess.off('unhandledRejection', unhandled);
+      });
+      await attempt(() => {
+        exitSpy.mockRestore();
+      });
+      await attempt(() => {
+        createPurgeJobSpy.mockRestore();
+      });
+      await attempt(() => {
+        createServerSpy.mockRestore();
+      });
+      await attempt(() => {
+        createPoolSpy.mockRestore();
+      });
+      await attempt(() => {
+        stdoutWrite.mockRestore();
+      });
+      process.env = originalEnv;
+      // Left set, the server's exit code would become Jest's own.
+      process.exitCode = undefined;
     }
-    exitSpy.mockRestore();
-    createPurgeJobSpy.mockRestore();
-    createServerSpy.mockRestore();
-    createPoolSpy.mockRestore();
-    stdoutWrite.mockRestore();
-    process.env = originalEnv;
-    // Left set, the server's exit code would become Jest's own.
-    process.exitCode = undefined;
+    if (errors.length > 0) {
+      // Reported only now, after every cleanup and restore has been attempted.
+      throw new AggregateError(errors, 'server test teardown failed');
+    }
   });
 
   it('logs a failed sign-in of an email-shaped role once, redacted, and exits 1', async () => {
@@ -1235,4 +1361,328 @@ describe('server start-up and shutdown', () => {
       expect(unhandled).not.toHaveBeenCalled();
     },
   );
+
+  /**
+   * How long a shutdown case waits for any one step. It is far inside the 30-second test timeout,
+   * so a shutdown that hangs fails the case, naming the step, while the case is still running.
+   */
+  const SHUTDOWN_STEP_MS = 5_000;
+
+  /** The one HTTP server the start-up created. */
+  function createdServer(): http.Server {
+    const servers = createServerSpy.mock.results.flatMap((result) =>
+      result.type === 'return' ? [result.value] : [],
+    );
+    const [server] = servers;
+    if (servers.length !== 1 || server === undefined) {
+      throw new Error(`server test: the start-up created ${servers.length} servers, not one`);
+    }
+    return server;
+  }
+
+  /** Settles as `promise` does, or rejects naming `what` after {@link SHUTDOWN_STEP_MS}. */
+  async function within<T>(promise: Promise<T>, what: string): Promise<T> {
+    let timer: NodeJS.Timeout | undefined;
+    const deadline = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        reject(new Error(`server test: ${what} did not happen within ${SHUTDOWN_STEP_MS} ms`));
+      }, SHUTDOWN_STEP_MS);
+    });
+    try {
+      return await Promise.race([promise, deadline]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /** Polls until `done()` holds, rejecting naming `what` after {@link SHUTDOWN_STEP_MS}. */
+  async function until(done: () => boolean, what: string): Promise<void> {
+    const deadline = Date.now() + SHUTDOWN_STEP_MS;
+    while (!done()) {
+      if (Date.now() >= deadline) {
+        throw new Error(`server test: ${what} did not happen within ${SHUTDOWN_STEP_MS} ms`);
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    }
+  }
+
+  it.each<[string, string]>([
+    ['no byte', ''],
+    ['headers without the final CRLF', 'GET /login HTTP/1.1\r\nHost: 127.0.0.1\r\n'],
+    [
+      'a POST with Content-Length 100 and 7 body bytes',
+      'POST /login HTTP/1.1\r\nHost: 127.0.0.1\r\n' +
+        'Content-Type: application/x-www-form-urlencoded\r\nContent-Length: 100\r\n\r\nemail=a',
+    ],
+  ])('exits 0 at once on SIGTERM while a connection has sent %s', async (_label, payload) => {
+    await expect(startServer()).resolves.toBeUndefined();
+    await waitForMsg('purge completed');
+    const server = createdServer();
+    const accepted = new Promise<net.Socket>((resolve) => {
+      server.once('connection', resolve);
+    });
+    const client = net.connect({ port, host: '127.0.0.1' });
+    let signalled = false;
+    try {
+      // A reset closes the client as well; which of the two ends it is not what the case checks.
+      client.on('error', () => undefined);
+      const clientClosed = new Promise<void>((resolve) => {
+        client.once('close', () => resolve());
+      });
+      if (payload !== '') {
+        client.write(payload);
+      }
+      const socket = await within(accepted, 'the connection');
+      // Once the server has read every byte sent, the signal finds the state under test.
+      const length = Buffer.byteLength(payload);
+      await until(() => socket.bytesRead === length, `the receipt of ${length} bytes`);
+
+      signalled = true;
+      process.emit('SIGTERM', 'SIGTERM');
+      await within(exited, 'the exit');
+      await within(clientClosed, 'the close of the client socket');
+      await nextMacrotask();
+
+      expect(exitSpy).toHaveBeenCalledTimes(1);
+      expect(exitSpy).toHaveBeenCalledWith(0);
+      expect(await isListening(port)).toBe(false);
+      expect(createdPools().map((pool) => pool.ended)).toEqual([true]);
+      // The body cut short becomes body-parser's 400 `request.aborted`, which is never logged.
+      expect(logged().filter((entry) => entry.level === 'error')).toEqual([]);
+      expect(unhandled).not.toHaveBeenCalled();
+    } finally {
+      client.destroy();
+      if (signalled) {
+        // A drain that this socket held open ends once it closes. Awaiting that shutdown keeps
+        // its `process.exit` call out of the next case, whose spy would otherwise record it.
+        await within(exited, 'the exit after the client closed').catch(() => undefined);
+      }
+    }
+  });
+
+  it('answers a request received before SIGTERM in full, then exits 0', async () => {
+    await expect(startServer()).resolves.toBeUndefined();
+    await waitForMsg('purge completed');
+    const server = createdServer();
+    const client = new HttpClient(`http://127.0.0.1:${port}`);
+    expect((await client.get('/login')).status).toBe(200);
+    /** For each signal sent, whether the response had still to be sent when it arrived. */
+    const unsentAtSignal: boolean[] = [];
+    server.on('request', (req: http.IncomingMessage, res: http.ServerResponse): void => {
+      // `end` fires once body-parser has read the whole form: the request is received in full,
+      // and the login handler is still checking the credentials against the database.
+      req.once('end', (): void => {
+        unsentAtSignal.push(!res.headersSent);
+        process.emit('SIGTERM', 'SIGTERM');
+      });
+    });
+
+    const email = `in-flight-${randomUUID()}@example.com`;
+    const result = await within(client.post('/login', { email, password: PASSWORD }), 'the login');
+    await within(exited, 'the exit');
+    await nextMacrotask();
+
+    expect(unsentAtSignal).toEqual([true]);
+    expect(result.status).toBe(422);
+    expect(result.body).toContain('Email or password is incorrect.');
+    expect(result.body).toMatch(/<\/html>\s*$/);
+    expect(exitSpy).toHaveBeenCalledTimes(1);
+    expect(exitSpy).toHaveBeenCalledWith(0);
+    expect(await isListening(port)).toBe(false);
+    expect(createdPools().map((pool) => pool.ended)).toEqual([true]);
+    expect(unhandled).not.toHaveBeenCalled();
+  });
+
+  it.each<[NodeJS.Signals, NodeJS.Signals]>([
+    ['SIGTERM', 'SIGINT'],
+    ['SIGINT', 'SIGTERM'],
+  ])('exits 1 at once on a repeated %s while the drain cannot finish', async (signal, other) => {
+    await expect(startServer()).resolves.toBeUndefined();
+    await waitForMsg('purge completed');
+    const [pool] = createdPools();
+    if (pool === undefined) {
+      throw new Error('server test: the start-up created no pool');
+    }
+    // The shutdown's last step is held, so its drain cannot finish until the case releases it.
+    let release: () => void = () => undefined;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let markReached: () => void = () => undefined;
+    const reached = new Promise<void>((resolve) => {
+      markReached = resolve;
+    });
+    const endPool = pool.end.bind(pool);
+    let ending: Promise<void> = Promise.resolve();
+    const endSpy = jest.spyOn(pool, 'end').mockImplementation((): Promise<void> => {
+      markReached();
+      ending = held.then(() => endPool());
+      return ending;
+    });
+    try {
+      process.emit(signal, signal);
+      await within(reached, 'the call that ends the pool');
+      process.emit(other, other);
+      expect(exitSpy).not.toHaveBeenCalled();
+
+      process.emit(signal, signal);
+
+      expect(exitSpy.mock.calls).toEqual([[1]]);
+      expect(logged().filter((entry) => entry.level === 'error')).toEqual([
+        expect.objectContaining({
+          msg: 'shutdown failed',
+          err: expect.objectContaining({ message: `${signal} received again during the shutdown` }),
+        }),
+      ]);
+    } finally {
+      // The real exit would have ended the process. With it mocked, the held step is released and
+      // the drain runs to its own end, so the case leaves no server, pool or listener behind.
+      release();
+      await ending;
+      await nextMacrotask();
+      endSpy.mockRestore();
+    }
+    expect(exitSpy.mock.calls).toEqual([[1], [0]]);
+    expect(createdPools().map((created) => created.ended)).toEqual([true]);
+    expect(addedListeners()).toEqual([]);
+    expect(unhandled).not.toHaveBeenCalled();
+  });
+
+  /** Tasks seeded for the buffered-export case. */
+  const EXPORT_TASK_COUNT = 5_000;
+
+  /** The description length of each of them: the 5,000-character maximum the schema allows. */
+  const EXPORT_DESCRIPTION_CHARS = 5_000;
+
+  /**
+   * The smallest export body the buffered-export case accepts. Loopback socket buffers hold a few
+   * megabytes, so most of a body this large is still queued in the process when its response ends.
+   */
+  const MIN_EXPORT_BYTES = 20_000_000;
+
+  /** The UTC day every seeded task was created on, and the export's one-day range. */
+  const EXPORT_DAY = '2026-10-21';
+
+  /** A response's write state one macrotask after its `end` call returned. */
+  interface ResponseAtSignal {
+    writableEnded: boolean;
+    writableFinished: boolean;
+    writableLength: number;
+  }
+
+  it('delivers a response ended but still buffered at SIGTERM in full, then exits 0', async () => {
+    await expect(startServer()).resolves.toBeUndefined();
+    await waitForMsg('purge completed');
+    const server = createdServer();
+    const [pool] = createdPools();
+    if (pool === undefined) {
+      throw new Error('server test: the start-up created no pool');
+    }
+    const email = `slow-reader-${randomUUID()}@example.com`;
+    const session = new HttpClient(`http://127.0.0.1:${port}`);
+    expect((await session.get('/signup')).status).toBe(200);
+    expect((await session.post('/signup', { email, password: PASSWORD })).status).toBe(303);
+    expect((await session.get('/login')).status).toBe(200);
+    expect((await session.post('/login', { email, password: PASSWORD })).status).toBe(303);
+    const ownerId = await userIdByEmail(pool, email);
+    if (ownerId === null) {
+      throw new Error('server test: the signed-up user has no row');
+    }
+    await sql(
+      pool,
+      'INSERT INTO tasks (owner_id, title, description, created_at, updated_at) ' +
+        "SELECT $1::bigint, 'Export task ' || n, repeat('x', $2::int), $3::timestamptz, " +
+        '$3::timestamptz FROM generate_series(1, $4::int) AS n',
+      [ownerId, EXPORT_DESCRIPTION_CHARS, `${EXPORT_DAY}T12:00:00.000Z`, EXPORT_TASK_COUNT],
+    );
+
+    let signalled = false;
+    const atSignal = new Promise<ResponseAtSignal>((resolve) => {
+      server.on('request', (req: http.IncomingMessage, res: http.ServerResponse): void => {
+        if (req.url?.startsWith('/reports/export?') !== true) {
+          return;
+        }
+        // The proxy keeps every overload of `end`. One macrotask after the call returns, the
+        // response has ended, but most of the body still waits behind the paused reader.
+        res.end = new Proxy(res.end, {
+          apply: (end, thisArg: unknown, args: unknown[]): unknown => {
+            const result: unknown = Reflect.apply(end, thisArg, args);
+            setImmediate((): void => {
+              resolve({
+                writableEnded: res.writableEnded,
+                writableFinished: res.writableFinished,
+                writableLength: res.writableLength,
+              });
+              signalled = true;
+              process.emit('SIGTERM', 'SIGTERM');
+            });
+            return result;
+          },
+        });
+      });
+    });
+
+    const client = net.connect({ port, host: '127.0.0.1' });
+    // Paused before any byte arrives, so the client reads nothing until the case resumes it: the
+    // loopback buffers fill, and the rest of the body stays queued in the server process.
+    client.pause();
+    const received: Buffer[] = [];
+    client.on('data', (chunk: Buffer): void => {
+      received.push(chunk);
+    });
+    let clientError: Error | null = null;
+    client.on('error', (err: Error): void => {
+      clientError = err;
+    });
+    const clientClosed = new Promise<void>((resolve) => {
+      client.once('close', () => resolve());
+    });
+    try {
+      // A keep-alive request, so it is the shutdown that closes the connection once it is done.
+      client.write(
+        `GET /reports/export?from=${EXPORT_DAY}&to=${EXPORT_DAY}&status= HTTP/1.1\r\n` +
+          `Host: 127.0.0.1\r\nCookie: sid=${sessionCookie(session)}\r\n\r\n`,
+      );
+      const state = await within(atSignal, 'the end of the export response');
+      expect(state).toEqual({
+        writableEnded: true,
+        writableFinished: false,
+        writableLength: expect.any(Number),
+      });
+      expect(state.writableLength).toBeGreaterThan(0);
+
+      client.resume();
+      await within(clientClosed, 'the close of the client socket');
+      await within(exited, 'the exit');
+      await nextMacrotask();
+
+      const response = Buffer.concat(received);
+      const headEnd = response.indexOf('\r\n\r\n');
+      expect(headEnd).toBeGreaterThan(0);
+      const head = response.subarray(0, headEnd).toString('latin1');
+      const body = response.subarray(headEnd + 4);
+      expect(head).toMatch(/^HTTP\/1\.1 200 OK\r\n/);
+      const advertised = /\r\ncontent-length: *(\d+)\r\n/i.exec(`${head}\r\n`)?.[1];
+      expect(advertised).toBeDefined();
+      const contentLength = Number(advertised);
+      expect(contentLength).toBeGreaterThanOrEqual(MIN_EXPORT_BYTES);
+      // Every advertised byte arrived and nothing followed: the connection carried no more.
+      expect(body.length).toBe(contentLength);
+      // The header row and one record per task, each terminated by CRLF.
+      expect(body.toString('utf8').split('\r\n').length - 1).toBe(EXPORT_TASK_COUNT + 1);
+      expect(clientError).toBeNull();
+      expect(exitSpy).toHaveBeenCalledTimes(1);
+      expect(exitSpy).toHaveBeenCalledWith(0);
+      expect(await isListening(port)).toBe(false);
+      expect(createdPools().map((created) => created.ended)).toEqual([true]);
+      expect(logged().filter((entry) => entry.level === 'error')).toEqual([]);
+      expect(unhandled).not.toHaveBeenCalled();
+    } finally {
+      client.destroy();
+      if (signalled) {
+        // Awaiting the shutdown keeps its `process.exit` call out of the next case's spy.
+        await within(exited, 'the exit after the client closed').catch(() => undefined);
+      }
+    }
+  });
 });

@@ -31,6 +31,10 @@ services:
 
   app:
     build: .
+    # An init process runs as PID 1 and forwards SIGTERM and SIGINT to node. A signal that arrives
+    # during start-up, before the server registers its handlers, then gets its default action
+    # instead of being ignored, as the kernel ignores such signals sent to PID 1.
+    init: true
     ports:
       - "3000:3000"
     # Set with `environment:` only, never `env_file: .env`: the host-run DATABASE_URL (localhost)

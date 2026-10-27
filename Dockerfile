@@ -30,7 +30,9 @@ COPY --from=build --chown=node:node /app/node_modules ./node_modules
 COPY --from=build --chown=node:node /app/dist ./dist
 USER node
 EXPOSE 3000
-# Exec form makes node PID 1, so it receives SIGTERM and SIGINT and shuts down gracefully.
+# Exec form runs node with no shell in between, so SIGTERM and SIGINT reach it and it shuts down
+# gracefully. Run it under an init process (compose sets `init: true`; `docker run --init`), or
+# node is PID 1 and ignores a signal that arrives during start-up, before its handlers exist.
 # The server applies pending migrations before it listens. To apply them without serving, run
 # the migration CLI instead: docker run --rm -e DATABASE_URL=... <image> node dist/db/migrate-cli.js
 CMD ["node", "dist/server.js"]

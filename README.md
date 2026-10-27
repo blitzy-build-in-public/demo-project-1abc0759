@@ -124,7 +124,7 @@ For a standalone image, with `DATABASE_URL` naming a database host the container
 
 ```bash
 docker build -t task-tracker .
-docker run -e DATABASE_URL='postgres://tasktracker:<password>@<db-host>:5432/tasktracker' \
+docker run --init -e DATABASE_URL='postgres://tasktracker:<password>@<db-host>:5432/tasktracker' \
   -e SESSION_SECRET='<at least 32 characters>' -p 3000:3000 task-tracker
 ```
 
@@ -138,9 +138,13 @@ To apply migrations without serving, run the migration CLI in the image instead:
 - **Start-up failures.** Invalid configuration or a failed migration, including an unreachable
   database, is logged and exits with code 1 before the server listens. The orchestrator's restart
   policy retries (`restart: unless-stopped` under compose). `SIGTERM` and `SIGINT` sent to the
-  `node` process shut it down gracefully: it logs `shutting down` and exits with code 0. In the
-  container `node` is PID 1 (the exec-form `CMD`), so `docker stop` and `docker compose stop`
-  reach it. Locally, signal `node` itself or its process group, not npm (see Local development).
+  `node` process shut it down gracefully: it logs `shutting down` and exits with code 0.
+  Connections without a complete request are closed at once, and requests already received
+  finish first. A repeat of the same signal forces exit code 1. The exec-form `CMD` runs `node`
+  with no shell in between, so `docker stop` and `docker compose stop` reach it. The init process
+  (`init: true` under compose, `docker run --init`) keeps a signal sent during start-up from
+  being ignored, as it would be by `node` running as PID 1. Locally, signal `node` itself or its
+  process group, not npm (see Local development).
 
 ## Testing
 
