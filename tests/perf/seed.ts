@@ -218,8 +218,11 @@ export async function seedPerfUser(baseUrl: string, databaseUrl: string): Promis
 
 /**
  * Best-effort cleanup after a failed seed: deletes the user by email (a no-op when the sign-up
- * never created it) and ends the pool. Cleanup failures are logged, never thrown, so the caller
- * rethrows the error that caused the seed to fail.
+ * never created it), then ends the pool.
+ *
+ * It never rejects. It always resolves after attempting both the delete and one `pool.end()`,
+ * whatever either step or the logging of its failure does, so the caller rethrows the error that
+ * caused the seed to fail, unchanged.
  */
 async function discardFailedSeed(
   pool: Pool,
@@ -227,14 +230,27 @@ async function discardFailedSeed(
   logger: Logger,
 ): Promise<void> {
   try {
-    await query(pool, DELETE_USER_BY_EMAIL_SQL, [email]);
-  } catch (cleanupErr) {
-    logger.error('perf seed cleanup: user delete failed', cleanupErr);
+    try {
+      await query(pool, DELETE_USER_BY_EMAIL_SQL, [email]);
+    } catch (cleanupErr) {
+      logCleanupFailure(logger, 'perf seed cleanup: user delete failed', cleanupErr);
+    }
+  } finally {
+    try {
+      await pool.end();
+    } catch (cleanupErr) {
+      logCleanupFailure(logger, 'perf seed cleanup: pool end failed', cleanupErr);
+    }
   }
+}
+
+/** Logs one cleanup failure through `logger`, never throwing whatever the logger does. */
+function logCleanupFailure(logger: Logger, msg: string, err: unknown): void {
   try {
-    await pool.end();
-  } catch (cleanupErr) {
-    logger.error('perf seed cleanup: pool end failed', cleanupErr);
+    logger.error(msg, err);
+  } catch {
+    // The logger is the only channel left to report on; a failure to write is dropped so that
+    // the cleanup still ends the pool and the original seed error is the one rethrown.
   }
 }
 

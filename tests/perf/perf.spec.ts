@@ -64,37 +64,70 @@ interface Target {
   run(page: Page): Promise<number>;
 }
 
-/** A target's measured runs and their statistics, as printed and written to `perf.json`. */
-interface TargetResult {
+/**
+ * A target's measured runs as taken, collected run by run. These raw durations are what the
+ * threshold is applied to; only {@link TargetResult} holds the display form.
+ */
+interface MeasuredTarget {
   name: string;
   url: string;
-  /** Each measured run in milliseconds, rounded to 0.1 ms, in run order. */
+  /** Each measured run's duration in milliseconds, unrounded, in run order. */
   runs: number[];
-  min: number | null;
-  median: number | null;
-  max: number | null;
-}
-
-/** Rounds a duration to 0.1 ms for the output. */
-function roundMs(ms: number): number {
-  return Math.round(ms * 10) / 10;
 }
 
 /**
- * Returns `result` with `min`, `median` and `max` computed from its runs, each `null` when there
- * are none. The median is the middle sorted value, or the mean of the two middle values.
+ * A target's measured runs and their statistics, as printed and written to `perf.json`. Every
+ * duration is in display form ({@link displayMs}).
  */
-function withStats(result: TargetResult): TargetResult {
-  const sorted = [...result.runs].sort((a, b) => a - b);
+interface TargetResult {
+  name: string;
+  url: string;
+  /** Each measured run in milliseconds, in display form, in run order. */
+  runs: number[];
+  /** The fastest run, or `null` when no run was measured. */
+  min: number | null;
+  /** The median of the raw runs, put in display form afterwards; `null` when none was measured. */
+  median: number | null;
+  /** The slowest run, or `null` when no run was measured. */
+  max: number | null;
+}
+
+/**
+ * Puts a duration in display form for the output: truncated (rounded down) to 0.1 ms. The verdict
+ * compares the raw duration with {@link THRESHOLD_MS}; truncation keeps the shown value consistent
+ * with it, so a shown value is at or above 2000.0 exactly when the run failed. Rounding to the
+ * nearest 0.1 ms would show 2000.0 for a passing 1999.96 ms run.
+ */
+function displayMs(ms: number): number {
+  return Math.floor(ms * 10) / 10;
+}
+
+/**
+ * Returns the output form of `measured`: its runs and their `min`, `median` and `max`, each
+ * statistic `null` when there are no runs. The statistics are computed from the raw runs and put
+ * in display form last. The median is the middle sorted value, or the mean of the two middle
+ * values.
+ */
+function withStats(measured: MeasuredTarget): TargetResult {
+  const { name, url } = measured;
+  const runs = measured.runs.map(displayMs);
+  const sorted = [...measured.runs].sort((a, b) => a - b);
   const count = sorted.length;
   const first = sorted[0];
   const last = sorted[count - 1];
   if (first === undefined || last === undefined) {
-    return { ...result, min: null, median: null, max: null };
+    return { name, url, runs, min: null, median: null, max: null };
   }
   const upper = sorted[Math.floor(count / 2)] ?? last;
   const lower = sorted[Math.floor((count - 1) / 2)] ?? first;
-  return { ...result, min: first, median: roundMs((lower + upper) / 2), max: last };
+  return {
+    name,
+    url,
+    runs,
+    min: displayMs(first),
+    median: displayMs((lower + upper) / 2),
+    max: displayMs(last),
+  };
 }
 
 /**
@@ -345,26 +378,19 @@ test.describe('SC12 performance with 10,000 tasks', () => {
       },
     ];
 
-    const results: TargetResult[] = [];
+    const results: MeasuredTarget[] = [];
     try {
       for (const target of targets) {
         // Recorded before measuring, and filled run by run, so a readiness failure keeps the
         // runs measured so far in the output.
-        const result: TargetResult = {
-          name: target.name,
-          url: target.url,
-          runs: [],
-          min: null,
-          median: null,
-          max: null,
-        };
+        const result: MeasuredTarget = { name: target.name, url: target.url, runs: [] };
         results.push(result);
         await test.step(target.name, async () => {
           for (let i = 0; i < WARMUP_RUNS; i += 1) {
             await target.run(activePage);
           }
           for (let i = 0; i < MEASURED_RUNS; i += 1) {
-            result.runs.push(roundMs(await target.run(activePage)));
+            result.runs.push(await target.run(activePage));
           }
         });
       }
@@ -374,8 +400,12 @@ test.describe('SC12 performance with 10,000 tasks', () => {
       printSummary(finished);
     }
 
+    // The verdict compares raw durations, so rounding cannot move a run across the threshold;
+    // only the message shows them in display form.
     const offenders = results.flatMap((r) =>
-      r.runs.flatMap((ms, k) => (ms >= THRESHOLD_MS ? [`${r.name} run ${k + 1}: ${ms} ms`] : [])),
+      r.runs.flatMap((ms, k) =>
+        ms >= THRESHOLD_MS ? [`${r.name} run ${k + 1}: ${displayMs(ms)} ms`] : [],
+      ),
     );
     expect(offenders, `Runs at or above ${THRESHOLD_MS} ms:\n${offenders.join('\n')}`).toEqual([]);
   });

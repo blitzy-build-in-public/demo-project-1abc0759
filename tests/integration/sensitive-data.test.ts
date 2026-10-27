@@ -173,16 +173,21 @@ describe('sensitive data', () => {
   let pool: Pool;
   let app: TestApp;
   let down: TestApp;
+  // Registered as each resource opens, so a setup that fails part-way still closes what it opened.
+  const cleanups: (() => Promise<void>)[] = [];
 
   beforeAll(async () => {
     pool = createTestPool();
+    cleanups.push(() => pool.end());
     app = await startTestApp({ clock, logger: log, sessionSecret });
+    cleanups.push(() => app.close());
     down = await startTestApp({
       clock,
       logger: log,
       sessionSecret,
       databaseUrl: UNREACHABLE_DATABASE_URL,
     });
+    cleanups.push(() => down.close());
   });
 
   beforeEach(async () => {
@@ -192,172 +197,199 @@ describe('sensitive data', () => {
   });
 
   afterAll(async () => {
-    await Promise.all([app.close(), down.close()]);
-    await pool.end();
+    // Every registered cleanup is attempted before any failure is reported, so one that rejects
+    // cannot leave the other instance or this suite's pool open. The async wrapper turns a
+    // synchronous throw into a rejection, which allSettled collects like the rest.
+    const results = await Promise.allSettled(
+      cleanups.map(async (cleanup): Promise<void> => cleanup()),
+    );
+    const reasons = results
+      .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
+      .map((result): unknown => result.reason);
+    if (reasons.length === 1) {
+      throw reasons[0];
+    }
+    if (reasons.length > 1) {
+      throw new AggregateError(
+        reasons,
+        `sensitive-data teardown: ${reasons.length} cleanups failed`,
+      );
+    }
   });
 
-  it('keeps passwords, hashes and session tokens out of logs, pages, redirects and CSV', async () => {
-    const seen: Seen[] = [];
-    const track = (label: string, result: HttpResult): HttpResult => {
-      seen.push({ label, result });
-      return result;
-    };
-    const password = `Sekrit${randomBytes(16).toString('hex')}7`;
-    const email = `Sensitive.${randomBytes(4).toString('hex')}@Example.com`;
-    const user = app.client();
+  it(
+    'keeps passwords, hashes and session tokens out of logs, pages, redirects and CSV',
+    async () => {
+      const seen: Seen[] = [];
+      const track = (label: string, result: HttpResult): HttpResult => {
+        seen.push({ label, result });
+        return result;
+      };
+      const password = `Sekrit${randomBytes(16).toString('hex')}7`;
+      const email = `Sensitive.${randomBytes(4).toString('hex')}@Example.com`;
+      const user = app.client();
 
-    // 1. Sign up and log in.
-    expect(track('GET /signup', await user.get('/signup')).status).toBe(200);
-    const signUp = track('POST /signup', await user.post('/signup', { email, password }));
-    expect(signUp.status).toBe(303);
-    expect(signUp.location).toBe('/login?created=1');
-    expect(track('GET /login?created=1', await user.get('/login?created=1')).status).toBe(200);
-    const logIn = track('POST /login', await user.post('/login', { email, password }));
-    expect(logIn.status).toBe(303);
-    expect(logIn.location).toBe('/tasks');
-    const sid = defined(user.cookie(SESSION_COOKIE), 'a session cookie after login');
-    const token = rawSessionToken(sid);
+      // 1. Sign up and log in.
+      expect(track('GET /signup', await user.get('/signup')).status).toBe(200);
+      const signUp = track('POST /signup', await user.post('/signup', { email, password }));
+      expect(signUp.status).toBe(303);
+      expect(signUp.location).toBe('/login?created=1');
+      expect(track('GET /login?created=1', await user.get('/login?created=1')).status).toBe(200);
+      const logIn = track('POST /login', await user.post('/login', { email, password }));
+      expect(logIn.status).toBe(303);
+      expect(logIn.location).toBe('/tasks');
+      const sid = defined(user.cookie(SESSION_COOKIE), 'a session cookie after login');
+      const token = rawSessionToken(sid);
 
-    // The database truth for the hash and the session id is read while the session exists.
-    const userId = defined(await userIdByEmail(pool, email), 'the new user');
-    const hashRows = await sql<PasswordHashRow>(
-      pool,
-      'SELECT password_hash AS "passwordHash" FROM users WHERE lower(email) = lower($1)',
-      [email],
-    );
-    const hash = defined(hashRows[0], 'a password hash').passwordHash;
-    const sessionRows = await sql<SessionHexRow>(
-      pool,
-      "SELECT encode(id, 'hex') AS hex FROM sessions WHERE user_id = $1",
-      [userId],
-    );
-    expect(sessionRows).toHaveLength(1);
-    const sessionIdHex = defined(sessionRows[0], 'a session row').hex;
-    expect(hash).toMatch(BCRYPT_COST_12_HASH);
-    expect(token).toMatch(SESSION_TOKEN_FORMAT);
-    expect(sessionIdHex).toBe(createHash('sha256').update(token).digest('hex'));
+      // The database truth for the hash and the session id is read while the session exists.
+      const userId = defined(await userIdByEmail(pool, email), 'the new user');
+      const hashRows = await sql<PasswordHashRow>(
+        pool,
+        'SELECT password_hash AS "passwordHash" FROM users WHERE lower(email) = lower($1)',
+        [email],
+      );
+      const hash = defined(hashRows[0], 'a password hash').passwordHash;
+      const sessionRows = await sql<SessionHexRow>(
+        pool,
+        "SELECT encode(id, 'hex') AS hex FROM sessions WHERE user_id = $1",
+        [userId],
+      );
+      expect(sessionRows).toHaveLength(1);
+      const sessionIdHex = defined(sessionRows[0], 'a session row').hex;
+      expect(hash).toMatch(BCRYPT_COST_12_HASH);
+      expect(token).toMatch(SESSION_TOKEN_FORMAT);
+      expect(sessionIdHex).toBe(createHash('sha256').update(token).digest('hex'));
 
-    // 2. Re-rendered forms that received the password. Signed-in requests to these routes are
-    // redirected away, so a separate anonymous client submits them.
-    const anon = app.client();
-    expect(track('GET /signup (anonymous)', await anon.get('/signup')).status).toBe(200);
-    const badSignUp = track(
-      'POST /signup with an invalid email',
-      await anon.post('/signup', { email: INVALID_EMAIL, password }),
-    );
-    expect(badSignUp.status).toBe(422);
-    expect(track('GET /login (anonymous)', await anon.get('/login')).status).toBe(200);
-    const badLogIn = track(
-      'POST /login with a wrong password',
-      await anon.post('/login', { email, password: `${password}x` }),
-    );
-    expect(badLogIn.status).toBe(422);
+      // 2. Re-rendered forms that received the password. Signed-in requests to these routes are
+      // redirected away, so a separate anonymous client submits them.
+      const anon = app.client();
+      expect(track('GET /signup (anonymous)', await anon.get('/signup')).status).toBe(200);
+      const badSignUp = track(
+        'POST /signup with an invalid email',
+        await anon.post('/signup', { email: INVALID_EMAIL, password }),
+      );
+      expect(badSignUp.status).toBe(422);
+      expect(track('GET /login (anonymous)', await anon.get('/login')).status).toBe(200);
+      const badLogIn = track(
+        'POST /login with a wrong password',
+        await anon.post('/login', { email, password: `${password}x` }),
+      );
+      expect(badLogIn.status).toBe(422);
 
-    // 3. Every task page and the reports page. The list is fetched first because the login
-    // redirect carries no page, and only a page supplies the session-bound CSRF token.
-    expect(track('GET /tasks (empty)', await user.get('/tasks')).status).toBe(200);
-    for (const [index, form] of TASK_FORMS.entries()) {
-      const label = `POST /tasks/new (task ${index + 1})`;
-      const created = track(label, await user.post('/tasks/new', form));
-      expect(created.status).toBe(303);
-    }
-    const taskRows = await sql<TaskIdRow>(
-      pool,
-      'SELECT id FROM tasks WHERE owner_id = $1 ORDER BY id',
-      [userId],
-    );
-    expect(taskRows).toHaveLength(TASK_FORMS.length);
-    const firstTaskId = defined(taskRows[0], 'a task row').id;
-    const list = track('GET /tasks', await user.get('/tasks'));
-    expect(list.status).toBe(200);
-    expect(list.body).toContain('Write release notes');
-    expect(track('GET /tasks/new', await user.get('/tasks/new')).status).toBe(200);
-    const editPath = `/tasks/${firstTaskId}/edit`;
-    expect(track(`GET ${editPath}`, await user.get(editPath)).status).toBe(200);
-    const deletePath = `/tasks/${firstTaskId}/delete`;
-    const confirmPage = track(`POST ${deletePath} (unconfirmed)`, await user.post(deletePath, {}));
-    expect(confirmPage.status).toBe(200);
-    expect(confirmPage.body).toContain('Delete this task?');
-    expect(track('GET /reports', await user.get('/reports')).status).toBe(200);
+      // 3. Every task page and the reports page. The list is fetched first because the login
+      // redirect carries no page, and only a page supplies the session-bound CSRF token.
+      expect(track('GET /tasks (empty)', await user.get('/tasks')).status).toBe(200);
+      for (const [index, form] of TASK_FORMS.entries()) {
+        const label = `POST /tasks/new (task ${index + 1})`;
+        const created = track(label, await user.post('/tasks/new', form));
+        expect(created.status).toBe(303);
+      }
+      const taskRows = await sql<TaskIdRow>(
+        pool,
+        'SELECT id FROM tasks WHERE owner_id = $1 ORDER BY id',
+        [userId],
+      );
+      expect(taskRows).toHaveLength(TASK_FORMS.length);
+      const firstTaskId = defined(taskRows[0], 'a task row').id;
+      const list = track('GET /tasks', await user.get('/tasks'));
+      expect(list.status).toBe(200);
+      expect(list.body).toContain('Write release notes');
+      expect(track('GET /tasks/new', await user.get('/tasks/new')).status).toBe(200);
+      const editPath = `/tasks/${firstTaskId}/edit`;
+      expect(track(`GET ${editPath}`, await user.get(editPath)).status).toBe(200);
+      const deletePath = `/tasks/${firstTaskId}/delete`;
+      const confirmPage = track(
+        `POST ${deletePath} (unconfirmed)`,
+        await user.post(deletePath, {}),
+      );
+      expect(confirmPage.status).toBe(200);
+      expect(confirmPage.body).toContain('Delete this task?');
+      expect(track('GET /reports', await user.get('/reports')).status).toBe(200);
 
-    // 4. The export.
-    const exported = track('GET /reports/export', await user.get(EXPORT_PATH));
-    expect(exported.status).toBe(200);
-    expect(exported.headers.get('content-type')).toBe('text/csv; charset=utf-8; header=present');
-    const csvText = exported.bytes.toString('utf8');
+      // 4. The export.
+      const exported = track('GET /reports/export', await user.get(EXPORT_PATH));
+      expect(exported.status).toBe(200);
+      expect(exported.headers.get('content-type')).toBe('text/csv; charset=utf-8; header=present');
+      const csvText = exported.bytes.toString('utf8');
 
-    // 5. Failures logged with the password in the request body and the session in its cookie.
-    const downAnon = down.client();
-    expect(track('GET /login (database down)', await downAnon.get('/login')).status).toBe(200);
-    const downLogIn = track(
-      'POST /login (database down)',
-      await downAnon.post('/login', { email, password }),
-    );
-    expect(downLogIn.status).toBe(503);
-    expect(downLogIn.body).toContain('Service temporarily unavailable');
-    const downUser = down.client();
-    downUser.setCookie(SESSION_COOKIE, sid);
-    const downTasks = track('GET /tasks (database down)', await downUser.get('/tasks'));
-    expect(downTasks.status).toBe(503);
-    expect(downTasks.body).toContain('Service temporarily unavailable');
+      // 5. Failures logged with the password in the request body and the session in its cookie.
+      const downAnon = down.client();
+      expect(track('GET /login (database down)', await downAnon.get('/login')).status).toBe(200);
+      const downLogIn = track(
+        'POST /login (database down)',
+        await downAnon.post('/login', { email, password }),
+      );
+      expect(downLogIn.status).toBe(503);
+      expect(downLogIn.body).toContain('Service temporarily unavailable');
+      const downUser = down.client();
+      downUser.setCookie(SESSION_COOKIE, sid);
+      const downTasks = track('GET /tasks (database down)', await downUser.get('/tasks'));
+      expect(downTasks.status).toBe(503);
+      expect(downTasks.body).toContain('Service temporarily unavailable');
 
-    // 6. Logout. The last page the client received, the reports page, holds the session token.
-    const logOut = track('POST /logout', await user.post('/logout', {}));
-    expect(logOut.status).toBe(303);
-    expect(logOut.location).toBe('/login');
-    expect(user.cookie(SESSION_COOKIE)).toBeUndefined();
-    const afterLogOut = track('GET /tasks after logout', await user.get('/tasks'));
-    expect(afterLogOut.status).toBe(302);
-    expect(afterLogOut.location).toBe('/login?next=%2Ftasks');
+      // 6. Logout. The last page the client received, the reports page, holds the session-bound
+      // CSRF token.
+      const logOut = track('POST /logout', await user.post('/logout', {}));
+      expect(logOut.status).toBe(303);
+      expect(logOut.location).toBe('/login');
+      expect(user.cookie(SESSION_COOKIE)).toBeUndefined();
+      const afterLogOut = track('GET /tasks after logout', await user.get('/tasks'));
+      expect(afterLogOut.status).toBe(302);
+      expect(afterLogOut.location).toBe('/login?next=%2Ftasks');
 
-    // The scan must read real failure logs: one entry per 503, each naming only method and path.
-    const logText = log.text();
-    expect(logText).not.toBe('');
-    expect(logText).toContain('database unavailable');
-    const unavailable = log
-      .byMsg('database unavailable')
-      .map((entry) => `${String(entry.method)} ${String(entry.path)}`);
-    expect(unavailable).toEqual(['POST /login', 'GET /tasks']);
+      // The scan must read real failure logs: one entry per 503, each naming only method and path.
+      const logText = log.text();
+      expect(logText).not.toBe('');
+      expect(logText).toContain('database unavailable');
+      const unavailable = log
+        .byMsg('database unavailable')
+        .map((entry) => `${String(entry.method)} ${String(entry.path)}`);
+      expect(unavailable).toEqual(['POST /login', 'GET /tasks']);
 
-    // The token's one permitted channel did carry it, so the allowance hides nothing else.
-    const carriesToken = (line: string): boolean =>
-      line.startsWith(`${SESSION_COOKIE}=`) && line.includes(token);
-    expect(logIn.setCookies.some(carriesToken)).toBe(true);
+      // The token's one permitted channel did carry it, so the allowance hides nothing else.
+      const carriesToken = (line: string): boolean =>
+        line.startsWith(`${SESSION_COOKIE}=`) && line.includes(token);
+      expect(logIn.setCookies.some(carriesToken)).toBe(true);
 
-    const secrets: readonly Secret[] = [
-      { name: 'password', value: password },
-      { name: 'password hash', value: hash },
-      { name: 'session token', value: token },
-      { name: 'URL-encoded session token', value: encodeURIComponent(token) },
-      { name: 'session id hash', value: sessionIdHex },
-    ];
-    const surfaces: readonly Surface[] = [
-      { where: 'the captured log', text: logText },
-      ...responseSurfaces(seen),
-      { where: 'the CSV export', text: csvText },
-    ];
-    expect(findLeaks(secrets, surfaces)).toEqual([]);
+      const secrets: readonly Secret[] = [
+        { name: 'password', value: password },
+        { name: 'password hash', value: hash },
+        { name: 'session token', value: token },
+        { name: 'URL-encoded session token', value: encodeURIComponent(token) },
+        { name: 'session id hash', value: sessionIdHex },
+      ];
+      const surfaces: readonly Surface[] = [
+        { where: 'the captured log', text: logText },
+        ...responseSurfaces(seen),
+        { where: 'the CSV export', text: csvText },
+      ];
+      expect(findLeaks(secrets, surfaces)).toEqual([]);
 
-    // The export holds the eight task columns and nothing about the user.
-    expect(csvText.toLowerCase()).not.toContain(email.toLowerCase());
-    const csv = parseCsv(exported.bytes);
-    expect(csv.bom).toBe(true);
-    expect(CSV_HEADER).toHaveLength(EXPORT_COLUMN_COUNT);
-    expect(csv.records[0]).toEqual([...CSV_HEADER]);
-    const dataRecords = csv.records.slice(1);
-    expect(dataRecords).toHaveLength(TASK_FORMS.length);
-    for (const record of dataRecords) {
-      expect(record).toHaveLength(EXPORT_COLUMN_COUNT);
-    }
-    expect(dataRecords.map((record) => record.slice(0, 3))).toEqual(
-      TASK_FORMS.map((form, index) => [String(taskRows[index]?.id), form.title, form.description]),
-    );
+      // The export holds the eight task columns and nothing about the user.
+      expect(csvText.toLowerCase()).not.toContain(email.toLowerCase());
+      const csv = parseCsv(exported.bytes);
+      expect(csv.bom).toBe(true);
+      expect(CSV_HEADER).toHaveLength(EXPORT_COLUMN_COUNT);
+      expect(csv.records[0]).toEqual([...CSV_HEADER]);
+      const dataRecords = csv.records.slice(1);
+      expect(dataRecords).toHaveLength(TASK_FORMS.length);
+      for (const record of dataRecords) {
+        expect(record).toHaveLength(EXPORT_COLUMN_COUNT);
+      }
+      expect(dataRecords.map((record) => record.slice(0, 3))).toEqual(
+        TASK_FORMS.map((form, index) => [
+          String(taskRows[index]?.id),
+          form.title,
+          form.description,
+        ]),
+      );
 
-    // Each re-render kept the entered email, so it really rendered the submission, but never
-    // echoed the password.
-    expect(badSignUp.body).toContain(`value="${INVALID_EMAIL}"`);
-    expect(badSignUp.body).not.toContain(password);
-    expect(badLogIn.body).toContain(`value="${email}"`);
-    expect(badLogIn.body).not.toContain(password);
-  });
+      // Each re-render kept the entered email, so it really rendered the submission, but never
+      // echoed the password.
+      expect(badSignUp.body).toContain(`value="${INVALID_EMAIL}"`);
+      expect(badSignUp.body).not.toContain(password);
+      expect(badLogIn.body).toContain(`value="${email}"`);
+      expect(badLogIn.body).not.toContain(password);
+    },
+  );
 });
