@@ -3,10 +3,11 @@
  * `npm run start:local` and the Playwright end-to-end web server.
  *
  * This is composition-root code. It reads the environment (with `src/db/migrate-cli.ts`, the only
- * file that does, passing it straight to `src/config.ts`), builds the pool, applies the pending
+ * file that does): it first fixes libuv's thread-pool size by setting `UV_THREADPOOL_SIZE`, then
+ * passes the environment straight to `src/config.ts`. It builds the pool, applies the pending
  * migrations, constructs the services and the application, listens, starts the scheduled purge,
- * and is the only file that handles signals. Importing it starts nothing: {@link main} runs only
- * when this file is the process entry.
+ * and is the only file that handles signals. Importing it starts nothing: the thread-pool size is
+ * set, and {@link main} runs, only when this file is the process entry.
  *
  * The configuration is never logged, whole or in part: `DATABASE_URL` carries the database
  * password and `SESSION_SECRET` is a secret. Once it is read, every component logs through one
@@ -21,7 +22,7 @@ import { ConfigError, databaseCredentials, loadConfig } from './config';
 import type { AppConfig } from './config';
 import { createDataAccess } from './db/data-access';
 import { runMigrations } from './db/migrate';
-import { createPool } from './db/pool';
+import { createPool, POOL_MAX_CLIENTS } from './db/pool';
 import { createPurgeJob } from './purge-job';
 import type { PurgeJob } from './purge-job';
 import { createReportService } from './reports/report-service';
@@ -35,6 +36,13 @@ const PURGE_INTERVAL_MS = 15 * 60 * 1000;
 
 /** Signals that start a graceful shutdown. */
 const SHUTDOWN_SIGNALS: readonly NodeJS.Signals[] = ['SIGTERM', 'SIGINT'];
+
+/**
+ * libuv's own default thread-pool size, kept on top of one thread per pooled connection for the
+ * thread pool's other work: `express.static` file reads, `dns.lookup` of a database host name and
+ * the rest of Node's asynchronous file-system calls.
+ */
+const LIBUV_DEFAULT_THREADS = 4;
 
 /** The process's pool, typed through its factory so that only the data-access layer imports pg. */
 type Pool = ReturnType<typeof createPool>;
@@ -223,6 +231,23 @@ function handleShutdownSignals(running: RunningServer): void {
 }
 
 /**
+ * Fixes libuv's thread-pool size at {@link POOL_MAX_CLIENTS} plus {@link LIBUV_DEFAULT_THREADS}
+ * threads, 14, by setting `UV_THREADPOOL_SIZE`. The size is fixed, never read: a value inherited
+ * from the environment is replaced, because the application reads no variables beyond its four
+ * configuration variables. libuv reads the setting once, when its thread pool is first used, so
+ * this runs before {@link main}; loading this file's modules does not use the thread pool.
+ *
+ * @param env The process environment, which libuv reads the setting from.
+ */
+function fixThreadPoolSize(env: NodeJS.ProcessEnv): void {
+  // One thread per pooled connection: each login holds its connection for the length of the
+  // bcrypt comparison it runs, and that comparison runs on libuv's thread pool, so logins for
+  // different emails run in parallel up to the pool size. libuv's default 4 threads remain for
+  // file reads and DNS lookups.
+  env.UV_THREADPOOL_SIZE = String(POOL_MAX_CLIENTS + LIBUV_DEFAULT_THREADS);
+}
+
+/**
  * Starts the application. The steps run in this order, and each runs only when the one before
  * it succeeded:
  *
@@ -329,6 +354,7 @@ export async function main(): Promise<void> {
 }
 
 if (require.main === module) {
+  fixThreadPoolSize(process.env);
   // `main` logs, cleans up and resolves every start-up failure itself and never rejects; this
   // handler is the last resort that would still report exit code 1 should it ever do so.
   void main().catch((): void => {

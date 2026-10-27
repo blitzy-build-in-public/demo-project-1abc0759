@@ -12,7 +12,11 @@ RUN npm ci
 COPY tsconfig*.json ./
 COPY scripts/ ./scripts/
 COPY src/ ./src/
-RUN npm run build && npm prune --omit=dev
+# npm prune deletes the dev packages but leaves their scope directories (@types, @jest, ...)
+# behind empty. Only an empty @scope directory directly inside a node_modules, at any depth, is
+# removed; other empty directories stay. The ./ prefix lets the regex match the top level too.
+RUN npm run build && npm prune --omit=dev \
+  && find ./node_modules -type d -empty -regex '.*/node_modules/@[^/]*' -delete
 
 # Runtime stage: the compiled server and its runtime dependencies only, run as the unprivileged
 # node user. The same base image as the build stage keeps bcrypt's native binary ABI-compatible.

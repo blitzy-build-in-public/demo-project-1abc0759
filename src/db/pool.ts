@@ -25,8 +25,12 @@ pg.types.setTypeParser(pg.types.builtins.INT8, (value: string): number => Number
 // keep the default parser, which already yields a `Date` for the absolute instant.
 pg.defaults.parseInputDatesAsUTC = true;
 
-/** Upper bound on open connections per process. */
-const POOL_MAX_CLIENTS = 10;
+/**
+ * Upper bound on open connections per process. `src/server.ts` sizes libuv's thread pool from it,
+ * one thread per connection, because every login holds a connection for the length of a bcrypt
+ * comparison that runs on that thread pool.
+ */
+export const POOL_MAX_CLIENTS = 10;
 
 /** How long a checkout waits for a connection before failing as database-unavailable. */
 const CONNECTION_TIMEOUT_MS = 5_000;

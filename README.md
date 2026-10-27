@@ -47,6 +47,11 @@ listening.
   placeholders only, and no secret lives in the source tree.
 - The application reads no other variables. All dates and times are stored and reported in UTC,
   whatever the host's time zone.
+- The server sets Node's `UV_THREADPOOL_SIZE`, the size of libuv's thread pool, to 14 itself
+  before it starts, replacing any value in the environment. Each login holds one of the 10 pooled
+  database connections for the length of a bcrypt comparison, which runs on that thread pool, so
+  10 threads let logins for different emails run in parallel up to the pool size, and libuv's
+  default 4 remain for file reads and DNS lookups.
 
 ## Local development
 
@@ -65,6 +70,16 @@ npm run start:local       # then open http://localhost:3000
   before running them.
 - `npm run build` compiles `src/` to `dist/` and copies the SQL migrations and the static assets
   into it. Rebuild after every source change.
+- npm runs each script (`start`, `start:local`, `migrate`, `migrate:local`) through `sh -c`, which
+  passes no signal on to `node`. A signal sent to the npm process alone never reaches the server
+  or the migration: `SIGTERM` ends npm with exit code 143 and leaves `node` running; after `SIGINT`,
+  `node` keeps running as well, whether or not npm exits. To stop the server, signal the `node`
+  process, for example the owner of its port (`kill "$(lsof -ti :3000)"`), or the whole process
+  group (`kill -TERM -- -<pgid>`), as Ctrl+C in a terminal does. A process manager can instead run
+  `node` directly: `node --env-file=.env dist/server.js` or `node dist/server.js`.
+- npm prints a four-line banner, the script name and its command between blank lines, before the
+  server's JSON-lines output. To capture JSON lines only, run `npm run --silent start:local` or
+  `npm start --silent`, or run `node` directly.
 
 ## Migrations
 
@@ -122,8 +137,10 @@ To apply migrations without serving, run the migration CLI in the image instead:
   over HTTPS.
 - **Start-up failures.** Invalid configuration or a failed migration, including an unreachable
   database, is logged and exits with code 1 before the server listens. The orchestrator's restart
-  policy retries (`restart: unless-stopped` under compose). `SIGTERM` and `SIGINT` shut down
-  gracefully with code 0.
+  policy retries (`restart: unless-stopped` under compose). `SIGTERM` and `SIGINT` sent to the
+  `node` process shut it down gracefully: it logs `shutting down` and exits with code 0. In the
+  container `node` is PID 1 (the exec-form `CMD`), so `docker stop` and `docker compose stop`
+  reach it. Locally, signal `node` itself or its process group, not npm (see Local development).
 
 ## Testing
 

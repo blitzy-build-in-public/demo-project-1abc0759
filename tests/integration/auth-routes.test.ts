@@ -7,8 +7,10 @@
  * lockout timeline under the fake clock, the lockout key across email spellings (ASCII case
  * variants share the account's key, and U+0130 variants never reach the account), login
  * serialisation within one instance and across two (two instances with separate pools are how
- * replicas are emulated, plan 0.9.2), CSRF on every form, the return path, logout, and signed-in
- * users kept away from the anonymous pages.
+ * replicas are emulated, plan 0.9.2), the login lock's cost (same-email calls queued in process
+ * hold no pooled client, and a connection failure fails the calls queued behind it at once),
+ * CSRF on every form, the return path, logout, and signed-in users kept away from the anonymous
+ * pages.
  *
  * Every sign-up is a real cost-12 bcrypt hash and every login a compare, so each test signs up
  * at most two users. Messages are asserted verbatim against local constants, not the
@@ -16,9 +18,13 @@
  */
 
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { runInThisContext } from 'node:vm';
 
 import type { Pool } from 'pg';
 
+import { createDataAccess } from '../../src/db/data-access';
+import type { TxRepos } from '../../src/db/data-access';
+import { DatabaseUnavailableError } from '../../src/shared/errors';
 import { FAKE_CLOCK_START, FakeClock } from '../helpers/fake-clock';
 import { parseSetCookie, rawSessionToken } from '../helpers/http-client';
 import type { HttpClient, HttpResult, ParsedSetCookie } from '../helpers/http-client';
@@ -66,6 +72,13 @@ const BAD_TOKENS: readonly BadToken[] = [
   { label: 'missing', csrf: false },
   { label: 'wrong', csrf: 'wrong' },
 ];
+
+/**
+ * The host process. Jest gives each test file its own copy of `process`, and listeners added to
+ * that copy never receive the real process's events, so an `unhandledRejection` spy on it could
+ * never fire. `runInThisContext` evaluates in Node's main context, whose `process` is the real one.
+ */
+const hostProcess = runInThisContext('process') as NodeJS.Process;
 
 /** A fresh address, so no two tests or cases can collide on the unique email index. */
 function uniqueEmail(): string {
@@ -712,6 +725,190 @@ describe('login serialisation (plan 0.9.2)', () => {
       );
     }
   });
+});
+
+describe('login lock cost (plan 0.3.4)', () => {
+  /** The pool's `max`: the test pool uses the application's `createPool` settings. */
+  const POOL_MAX = 10;
+
+  /** A promise that settles only when `open` is called. */
+  interface Gate {
+    readonly opened: Promise<void>;
+    open(): void;
+  }
+
+  function createGate(): Gate {
+    let markOpened: () => void = () => undefined;
+    const opened = new Promise<void>((resolve) => {
+      markOpened = resolve;
+    });
+    return { opened, open: () => markOpened() };
+  }
+
+  /** Clients checked out of `db` right now, whether in use or still connecting. */
+  function checkedOut(db: Pool): number {
+    return db.totalCount - db.idleCount;
+  }
+
+  /** A driver error for an unreachable server, the root cause a queued call must carry. */
+  const CONNECTION_REFUSED = Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:9'), {
+    code: 'ECONNREFUSED',
+  });
+
+  interface HolderFailure {
+    label: string;
+    error: Error;
+    queuedRun: boolean;
+  }
+
+  const HOLDER_FAILURES: readonly HolderFailure[] = [
+    {
+      label: 'a connection failure',
+      error: new DatabaseUnavailableError('Database unavailable', { cause: CONNECTION_REFUSED }),
+      queuedRun: false,
+    },
+    { label: 'any other error', error: new Error('not a connection failure'), queuedRun: true },
+  ];
+
+  test('same-email calls queued behind a holder hold no client and run in order', async () => {
+    expect(pool.options.max).toBe(POOL_MAX);
+    const dal = createDataAccess(pool);
+    const key = lockoutKey(uniqueEmail());
+    const holderStarted = createGate();
+    const releaseHolder = createGate();
+    const order: number[] = [];
+    let running = 0;
+    let mostRunning = 0;
+
+    /** Call `index`'s work: one statement on its transaction's client, as a login issues. */
+    async function work(tx: TxRepos, index: number): Promise<number> {
+      running += 1;
+      mostRunning = Math.max(mostRunning, running);
+      order.push(index);
+      try {
+        await tx.loginAttempts.latestFailures(key, 5);
+        if (index === 0) {
+          holderStarted.open();
+          await releaseHolder.opened;
+        }
+        return index;
+      } finally {
+        running -= 1;
+      }
+    }
+
+    const calls = [dal.withLoginLock(key, (tx) => work(tx, 0))];
+    // More waiters than the pool has clients: each would exhaust it if it checked one out.
+    const indexes = Array.from({ length: POOL_MAX + 2 }, (_, at) => at + 1);
+    try {
+      await holderStarted.opened;
+      calls.push(...indexes.map((index) => dal.withLoginLock(key, (tx) => work(tx, index))));
+      // One macrotask lets any waiter that was going to request a client do so.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      expect(pool.waitingCount).toBe(0);
+      expect(checkedOut(pool)).toBe(1);
+      // Other users' statements, and logins for other emails, still find a client at once.
+      await expect(sql<{ one: number }>(pool, 'SELECT 1 AS one')).resolves.toEqual([{ one: 1 }]);
+      const otherKey = lockoutKey(uniqueEmail());
+      await expect(dal.withLoginLock(otherKey, async () => 'other')).resolves.toBe('other');
+      expect(checkedOut(pool)).toBe(1);
+      expect(order).toEqual([0]);
+
+      releaseHolder.open();
+      await expect(Promise.all(calls)).resolves.toEqual([0, ...indexes]);
+      expect(order).toEqual([0, ...indexes]);
+      expect(mostRunning).toBe(1);
+      expect(checkedOut(pool)).toBe(0);
+    } finally {
+      // A failed expectation must not leave the holder's lock and client held for later tests.
+      releaseHolder.open();
+      await Promise.allSettled(calls);
+    }
+  });
+
+  test.each(HOLDER_FAILURES)(
+    'a holder failing with $label: the calls queued behind it, then a fresh call',
+    async ({ error, queuedRun }) => {
+      const dal = createDataAccess(pool);
+      const key = lockoutKey(uniqueEmail());
+      const holderStarted = createGate();
+      const releaseHolder = createGate();
+      const ran: number[] = [];
+      // Registered on the host process, not on Jest's copy of `process`, so it would observe a
+      // real unhandled rejection.
+      const unhandled = jest.fn<void, [unknown, Promise<unknown>]>();
+      hostProcess.on('unhandledRejection', unhandled);
+      const holder = dal.withLoginLock(key, async (): Promise<number> => {
+        ran.push(0);
+        holderStarted.open();
+        await releaseHolder.opened;
+        throw error;
+      });
+      const indexes = [1, 2, 3];
+      const queued: Promise<number>[] = [];
+      // Counts the clients checked out of the pool once the holder has its own.
+      let acquires = 0;
+      const countAcquire = (): void => {
+        acquires += 1;
+      };
+      try {
+        await holderStarted.opened;
+        pool.on('acquire', countAcquire);
+        queued.push(
+          ...indexes.map((index) =>
+            dal.withLoginLock(key, async (): Promise<number> => {
+              ran.push(index);
+              return index;
+            }),
+          ),
+        );
+
+        releaseHolder.open();
+        await expect(holder).rejects.toBe(error);
+        const outcomes = await Promise.allSettled(queued);
+        pool.off('acquire', countAcquire);
+
+        if (queuedRun) {
+          expect(outcomes).toEqual(indexes.map((value) => ({ status: 'fulfilled', value })));
+          expect(ran).toEqual([0, ...indexes]);
+          expect(acquires).toBe(indexes.length);
+        } else {
+          expect(acquires).toBe(0);
+          // Each queued call fails at once with its own error around the root driver error,
+          // without checking a client out or running its work.
+          for (const outcome of outcomes) {
+            const reason: unknown = outcome.status === 'rejected' ? outcome.reason : outcome;
+            expect(reason).toBeInstanceOf(DatabaseUnavailableError);
+            expect(reason).not.toBe(error);
+            const cause = reason instanceof DatabaseUnavailableError ? reason.cause : reason;
+            expect(cause).toBe(CONNECTION_REFUSED);
+          }
+          expect(ran).toEqual([0]);
+        }
+
+        // The queue is not left stuck: a later call for the email runs normally.
+        await expect(
+          dal.withLoginLock(key, async (): Promise<string> => {
+            ran.push(4);
+            return 'fresh';
+          }),
+        ).resolves.toBe('fresh');
+        expect(ran.at(-1)).toBe(4);
+        expect(checkedOut(pool)).toBe(0);
+        // Node reports unhandled rejections once the microtask queue drains; one macrotask later
+        // any would have reached the spy.
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(unhandled).not.toHaveBeenCalled();
+      } finally {
+        // A failed expectation must not leave the holder's lock and client held for later tests.
+        releaseHolder.open();
+        await Promise.allSettled([holder, ...queued]);
+        pool.off('acquire', countAcquire);
+        hostProcess.off('unhandledRejection', unhandled);
+      }
+    },
+  );
 });
 
 describe('CSRF protection (plan 0.3.4)', () => {
