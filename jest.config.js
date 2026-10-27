@@ -25,6 +25,12 @@ const tsJestTransform = {
 module.exports = {
   collectCoverageFrom: ['<rootDir>/src/**/*.ts'],
   coverageDirectory: '<rootDir>/coverage',
+  // The integration project's 30-second limit, set here because jest-circus 30 reads
+  // `testTimeout` from the top-level configuration only and ignores it inside a project entry,
+  // where it would leave the 5-second default in force. Every integration sign-up and login
+  // performs a real cost-12 bcrypt operation. Unit tests finish in milliseconds, so the shared
+  // limit changes nothing for them.
+  testTimeout: 30000,
   projects: [
     {
       displayName: 'unit',
@@ -44,8 +50,6 @@ module.exports = {
       // Guards the `_test` database name and applies the migrations once before any suite. Jest
       // runs it only when integration tests are selected, so unit runs need no database.
       globalSetup: '<rootDir>/tests/integration/global-setup.ts',
-      // Every sign-up and login performs a real cost-12 bcrypt operation.
-      testTimeout: 30000,
     },
   ],
 };
