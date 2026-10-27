@@ -2,9 +2,9 @@
  * Playwright configuration: the `e2e` browser flows and the `perf` check (SC12), Chromium only.
  *
  * - `npm run test:e2e` builds, then runs `playwright test --project=e2e`. Playwright starts
- *   `node dist/server.js` on port 3100 against the caller's `DATABASE_URL`, which must name a
- *   `_test` database: the global setup refuses any other, applies migrations and truncates the
- *   application tables once.
+ *   `node dist/server.js` on port 3100 (or `E2E_PORT`) against the caller's `DATABASE_URL`,
+ *   which must name a `_test` database: the global setup refuses any other, applies migrations
+ *   and truncates the application tables once.
  * - `npm run test:perf` runs `playwright test --project=perf` with `PERF_BASE_URL` pointing at the
  *   production-mode compose container. That run starts no server and skips the e2e global setup,
  *   because it targets the application database, which is not a `_test` database.
@@ -20,9 +20,32 @@ const perfBaseUrl = process.env.PERF_BASE_URL;
 /** A non-empty `PERF_BASE_URL` marks the performance run against an already running app. */
 const isPerfRun = perfBaseUrl !== undefined && perfBaseUrl !== '';
 
-/** Port and origin of the server Playwright starts for the `e2e` project. */
-const E2E_PORT = 3100;
+/**
+ * Port of the server Playwright starts for the `e2e` project: 3100 unless `E2E_PORT` names
+ * another, so that several checkouts on one host can run the end-to-end tests at the same time.
+ */
+const E2E_PORT = resolveE2ePort(process.env.E2E_PORT);
+/** Origin of the server Playwright starts for the `e2e` project. */
 const E2E_BASE_URL = `http://127.0.0.1:${E2E_PORT}`;
+
+/**
+ * Returns the e2e server port: 3100 when `raw` is unset or empty, otherwise `raw` as an integer
+ * from 1 to 65535.
+ *
+ * @param raw - The `E2E_PORT` environment value.
+ * @returns The port number.
+ * @throws Error when `raw` is set but is not an integer from 1 to 65535.
+ */
+function resolveE2ePort(raw: string | undefined): number {
+  if (raw === undefined || raw === '') {
+    return 3100;
+  }
+  const port = Number(raw);
+  if (!/^[0-9]+$/.test(raw) || port < 1 || port > 65535) {
+    throw new Error('E2E_PORT must be an integer between 1 and 65535');
+  }
+  return port;
+}
 
 /**
  * The resolved configuration. Playwright loads its config through a default export only, so this
