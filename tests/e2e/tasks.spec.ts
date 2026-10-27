@@ -1,7 +1,8 @@
 /**
  * Task flows in Chromium: create, edit, one-action status change and delete (SC4); filters and
  * the due-date sort (SC6); both empty list states and inline errors that keep the entered values
- * (SC11); the code-point length limits; and the entered-value fallbacks of a re-rendered form.
+ * (SC11); the code-point length limits; the entered-value fallbacks of a re-rendered form; and
+ * Control+End reaching the last row of a long list.
  *
  * The shared flows run twice, with JavaScript enabled and disabled, because every task page must
  * work without scripts. Only Delete differs between the two runs: with scripts
@@ -17,8 +18,10 @@ import {
   type Locator,
   type Page,
   type Response,
+  type ViewportSize,
 } from '@playwright/test';
 
+import { FIXTURE_TIME, createTestPool, sql, userIdByEmail } from '../helpers/test-db';
 import { createTask, signUpAndLogIn, taskRow, userTasks } from './support';
 
 /** A task as stored, read through {@link userTasks}. */
@@ -52,6 +55,32 @@ interface SeenDialog {
   message: string;
 }
 
+/** The page's scroll offset and where the last task-list row sits, all in CSS pixels. */
+interface ListScrollState {
+  /** Whether the scroll offset held still over two animation frames, so no scroll is moving. */
+  settled: boolean;
+  /** The vertical scroll offset. */
+  scrollY: number;
+  /** The last row's top edge, from the top of the viewport. */
+  lastRowTop: number;
+  /** The last row's bottom edge, from the top of the viewport. */
+  lastRowBottom: number;
+  /** The viewport's height. */
+  viewportHeight: number;
+}
+
+/** Where the long list is shown for Control+End, each press checked on its own. */
+interface EndKeyCase {
+  name: string;
+  /** The viewport the list loads in, where Control+End is pressed first. */
+  load: ViewportSize;
+  /**
+   * When given, the list then goes back to its top, is resized to this viewport and gets a second
+   * press, so the groups at its end were last laid out at another width.
+   */
+  resizeTo?: ViewportSize;
+}
+
 /** The due-date `<input>` start tag of the task form, whatever the order of its attributes. */
 const DUE_DATE_INPUT = /<input\b[^>]*\bname="dueDate"[^>]*>/;
 
@@ -74,6 +103,35 @@ const LINE_BREAK_TITLES: readonly { name: string; title: string; shown: string }
     name: 'an LF line break at 200 code points',
     title: `${'a'.repeat(100)}\n${'b'.repeat(99)}`,
     shown: `${'a'.repeat(100)}\n${'b'.repeat(99)}`,
+  },
+];
+
+/**
+ * Tasks in the long list: five of the task table's 50-row groups. The first screen renders the
+ * first and the last two always render, so Control+End passes two groups that render only during
+ * the scroll before it lands in the last.
+ */
+const LONG_LIST_TASKS = 250;
+
+/**
+ * How long a key-driven scroll may take to come to rest on a busy host. A press scrolls smoothly
+ * over several frames, so the checks retry until the page is still.
+ */
+const SCROLL_SETTLE_TIMEOUT_MS = 10_000;
+
+/**
+ * Viewports for Control+End: a phone, just above the small-screen breakpoint (40rem, 640px), a
+ * small laptop, and a desktop, whose list is then resized to a phone after its end was laid out
+ * at desktop width.
+ */
+const END_KEY_CASES: readonly EndKeyCase[] = [
+  { name: 'a list loaded at 375x812', load: { width: 375, height: 812 } },
+  { name: 'a list loaded at 641x812', load: { width: 641, height: 812 } },
+  { name: 'a list loaded at 1024x768', load: { width: 1024, height: 768 } },
+  {
+    name: 'a list loaded at 1280x800, then resized to 375x812',
+    load: { width: 1280, height: 800 },
+    resizeTo: { width: 375, height: 812 },
   },
 ];
 
@@ -131,6 +189,122 @@ async function storedTask(email: string, title: string): Promise<StoredTask> {
 /** The titles of the user's stored tasks, in creation order. */
 async function storedTitles(email: string): Promise<string[]> {
   return (await userTasks(email)).map((t) => t.title);
+}
+
+/**
+ * Inserts `count` undated tasks for the user with `email` in one statement, straight into the
+ * test database. Task `n` is titled `n` as five digits, then a space and repeated "lorem ipsum
+ * dolor sit amet" words cut at 200 code points, the longest title the form accepts, so every row
+ * wraps to several lines. The list orders undated tasks by id, so task `count` is the last row.
+ */
+async function insertLongTitledTasks(email: string, count: number): Promise<void> {
+  const pool = createTestPool();
+  try {
+    const ownerId = await userIdByEmail(pool, email);
+    if (ownerId === null) {
+      throw new Error(`insertLongTitledTasks: no user has the email ${email}`);
+    }
+    await sql(
+      pool,
+      'INSERT INTO tasks (owner_id, title, created_at, updated_at) ' +
+        "SELECT $1, left(lpad(g.i::text, 5, '0') || repeat($4, 8), 200), $2, $2 " +
+        'FROM generate_series(1, $3::int) AS g(i)',
+      [ownerId, FIXTURE_TIME, count, ' lorem ipsum dolor sit amet'],
+    );
+  } finally {
+    await pool.end();
+  }
+}
+
+/**
+ * Reads the page's {@link ListScrollState}. The read waits two animation frames, so the layout
+ * of a resize or a scroll step has run, and reports `settled` only when the scroll offset did not
+ * move meanwhile.
+ */
+async function listScrollState(page: Page): Promise<ListScrollState> {
+  return page.evaluate(async () => {
+    const nextFrame = (): Promise<void> =>
+      new Promise((resolve) => requestAnimationFrame(() => resolve()));
+    const before = window.scrollY;
+    await nextFrame();
+    await nextFrame();
+    const rows = document.querySelectorAll('table tbody tr');
+    const last = rows[rows.length - 1];
+    if (last === undefined) {
+      throw new Error('the task table has no rows');
+    }
+    const box = last.getBoundingClientRect();
+    return {
+      settled: window.scrollY === before,
+      scrollY: window.scrollY,
+      lastRowTop: box.top,
+      lastRowBottom: box.bottom,
+      viewportHeight: window.innerHeight,
+    };
+  });
+}
+
+/**
+ * Presses `key` once and waits for the smooth scroll it starts to fire `scrollend`. The scroll can
+ * look still for a few frames before it ends, and a key pressed then is dropped, so the next
+ * press waits for the event. The listener is in place before the press, so the event cannot be
+ * missed; a press that starts no scroll fails after {@link SCROLL_SETTLE_TIMEOUT_MS}.
+ */
+async function pressScrollKey(page: Page, key: string): Promise<void> {
+  const watcher = await page.evaluateHandle(
+    ({ timeoutMs, pressed }) => ({
+      ended: new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          reject(new Error(`${pressed} started no scroll that ended within ${timeoutMs} ms`));
+        }, timeoutMs);
+        addEventListener(
+          'scrollend',
+          () => {
+            clearTimeout(timer);
+            resolve();
+          },
+          { once: true },
+        );
+      }),
+    }),
+    { timeoutMs: SCROLL_SETTLE_TIMEOUT_MS, pressed: key },
+  );
+  try {
+    await page.keyboard.press(key);
+    await watcher.evaluate((w) => w.ended);
+  } finally {
+    await watcher.dispose();
+  }
+}
+
+/**
+ * Presses Control+End once and waits for the scroll to come to rest with the last task-list row
+ * wholly inside the viewport.
+ */
+async function expectOneEndPressToShowLastRow(page: Page): Promise<void> {
+  await pressScrollKey(page, 'Control+End');
+  await expectScrollToSettle(page, (s) => {
+    expect(s.lastRowTop, 'the last row starts above the viewport').toBeGreaterThanOrEqual(0);
+    expect(s.lastRowBottom, 'the last row ends below the viewport').toBeLessThanOrEqual(
+      s.viewportHeight,
+    );
+  });
+}
+
+/**
+ * Waits until the page has stopped scrolling and `check` passes on its {@link ListScrollState},
+ * retrying both until {@link SCROLL_SETTLE_TIMEOUT_MS}. It presses nothing, so a scroll that
+ * comes to rest in the wrong place fails rather than being given a second press.
+ */
+async function expectScrollToSettle(
+  page: Page,
+  check: (state: ListScrollState) => void,
+): Promise<void> {
+  await expect(async () => {
+    const state = await listScrollState(page);
+    expect(state.settled, 'the page is still scrolling').toBe(true);
+    check(state);
+  }).toPass({ timeout: SCROLL_SETTLE_TIMEOUT_MS });
 }
 
 /** Asserts the task titled `title` is listed exactly once, showing these cells. */
@@ -600,6 +774,35 @@ test.describe('tasks with JavaScript', () => {
     await expectUnfilteredList(page);
     await expect(taskRow(page, kept)).toHaveCount(1);
     expect(await storedTitles(email)).toEqual([kept]);
+  });
+
+  // Control+End is the browser's own scrolling and needs no script, so this one run covers both.
+  test('one Control+End press brings the last of 250 long-titled tasks fully into view', async ({
+    page,
+  }) => {
+    // Four page loads and six smooth scrolls follow the two bcrypt-bound form posts.
+    test.setTimeout(60_000);
+    const { email } = await signUpAndLogIn(page);
+    await insertLongTitledTasks(email, LONG_LIST_TASKS);
+    for (const c of END_KEY_CASES) {
+      await test.step(c.name, async () => {
+        await page.setViewportSize(c.load);
+        await page.goto('/tasks');
+        await expect(page.locator('table tbody tr')).toHaveCount(LONG_LIST_TASKS);
+        await expectOneEndPressToShowLastRow(page);
+        const { resizeTo } = c;
+        if (resizeTo !== undefined) {
+          await pressScrollKey(page, 'Control+Home');
+          await expectScrollToSettle(page, (s) => expect(s.scrollY).toBe(0));
+          await page.setViewportSize(resizeTo);
+          await expectScrollToSettle(page, (s) => {
+            expect(s.viewportHeight).toBe(resizeTo.height);
+            expect(s.scrollY).toBe(0);
+          });
+          await expectOneEndPressToShowLastRow(page);
+        }
+      });
+    }
   });
 });
 

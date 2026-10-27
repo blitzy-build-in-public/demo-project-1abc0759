@@ -118,6 +118,12 @@ const OTHER_STATUSES: Readonly<Record<Status, readonly Status[]>> = {
 /** Shown in the due-date column of an undated task. */
 const NO_DUE_DATE = '\u2014';
 
+/**
+ * Task rows per `<tbody>` group of the task table. app.css lets an off-screen group skip rendering
+ * and sizes a skipped group as this many rows, so the two values change together.
+ */
+const TASK_ROW_GROUP_SIZE = 50;
+
 /** Whether a field carries an inline message, using the same rule as {@link fieldError}. */
 function hasError(message: string | undefined): message is string {
   return message !== undefined && message !== '';
@@ -224,6 +230,13 @@ function renderTaskListContent(view: TaskListPageView): SafeHtml {
   }
   // Rendered in the order given: the repository already sorts by due date, undated last, then id.
   const rows = tasks.map(renderTaskRow);
+  // Rows sit in <tbody> groups so the browser skips rendering whole off-screen groups: a resize
+  // restyles and lays out only the groups in view, and while scrolling it checks each group, not
+  // each of up to 10,000 rows, for visibility, which per-row skipping costs on every frame.
+  const groups: SafeHtml[] = [];
+  for (let i = 0; i < rows.length; i += TASK_ROW_GROUP_SIZE) {
+    groups.push(html`<tbody>${rows.slice(i, i + TASK_ROW_GROUP_SIZE)}</tbody>`);
+  }
   // The row buttons belong to this one form by ancestry, not through a `form="task-actions"`
   // attribute on each: Chromium associates form-attribute controls at a cost that grows with the
   // square of their number, which measured about 29 s for 10,000 rows (30,000 buttons) against
@@ -238,7 +251,7 @@ function renderTaskListContent(view: TaskListPageView): SafeHtml {
         <tr><th scope="col">Title</th><th scope="col">Status</th><th scope="col">Priority</th><th
           scope="col">Due date</th><th scope="col">Actions</th></tr>
       </thead>
-      <tbody>${rows}</tbody>
+      ${groups}
     </table>
   </form>`;
 }

@@ -267,12 +267,20 @@ td {
 
 thead th { border-block-end: 2px solid var(--color-control); font-weight: 600; }
 tbody th { font-weight: 400; }
-/* Fixed layout takes column widths from the header row, so only the five header cells match. */
-.task-table thead th:nth-child(1) { width: 30%; }
-.task-table thead th:nth-child(2) { width: 13%; }
-.task-table thead th:nth-child(3) { width: 11%; }
-.task-table thead th:nth-child(4) { width: 14%; }
-.task-table thead th:nth-child(5) { width: 32%; }
+/* Task-table rows are grids on fixed column tracks, so widths never depend on content (as with
+   fixed table layout), and each tbody group of 50 rows (task-pages.ts) skips rendering while off
+   screen: a resize or the breakpoint restyles and lays out only the groups in view. The markup
+   keeps its table semantics. A never-rendered group is sized as 50 rows of 20rem, above the row a
+   200-character title makes at 641px (under 19rem), so a group a scroll renders shrinks rather
+   than pushing the last row past where End stops. A remembered height is exact only at its own
+   width, so the last two groups (the whole list, or at least 51 rows) always render and End
+   lands on real heights. That selector matches groups, never rows. Groups clip their contents,
+   and the margin keeps focus rings whole. */
+.task-table, .task-table thead, .task-table tbody { display: block; }
+.task-table tr { display: grid; grid-template-columns: 30% 13% 11% 14% 32%; }
+.task-table tbody { content-visibility: auto; contain-intrinsic-size: auto 1000rem; }
+.task-table tbody { overflow-clip-margin: 0.5rem; }
+.task-table tbody:nth-last-child(-n + 2) { content-visibility: visible; }
 /* Wraps the hidden inputs and the task table; it must add no space around the table. */
 #task-actions { margin: 0; }
 
@@ -319,15 +327,13 @@ dd { margin: 0; font-weight: 600; }
   .filters label:not(:first-child),
   form[method="get"] label:not(:first-child) { margin-block: 0.5rem 0; margin-inline: 0; }
   /* Tighter cells and rebalanced columns keep "In progress", "Medium" and dates from breaking
-     mid-word at phone widths. */
+     mid-word at phone widths. Rows wrap taller here, so the group-height estimate grows: 50 rows
+     of 40rem, above the row a 200-character title makes at 320px (under 38rem). */
   table { font-size: 0.8125rem; }
   th, td { padding-inline: 0.25rem; }
   td button { padding-inline: 0.375rem; font-size: inherit; }
-  .task-table thead th:nth-child(1) { width: 20%; }
-  .task-table thead th:nth-child(2) { width: 19%; }
-  .task-table thead th:nth-child(3),
-  .task-table thead th:nth-child(4) { width: 18%; }
-  .task-table thead th:nth-child(5) { width: 25%; }
+  .task-table tr { grid-template-columns: 20% 19% 18% 18% 25%; }
+  .task-table tbody { contain-intrinsic-size: auto 2000rem; }
   /* The chart renders at about half size here. 17 user units is the largest label size whose
      hinted glyphs still leave a blank pixel row below the axis at 1x pixel density. */
   .chart-label { font-size: 17px; }
