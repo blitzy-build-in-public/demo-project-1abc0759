@@ -318,6 +318,15 @@ const TITLE_200_LF = 'a'.repeat(100) + '\n' + 'b'.repeat(99);
 const TITLE_200_LF_SUBMITTED = 'a'.repeat(100) + '\r\n' + 'b'.repeat(99);
 
 /**
+ * A description of exactly 5,000 code points holding 50 LF line breaks, the longest accepted,
+ * as a client other than a browser can store it.
+ */
+const DESCRIPTION_5000_LF = (ASTRAL.repeat(99) + '\n').repeat(50);
+
+/** {@link DESCRIPTION_5000_LF} as a browser submits it, each LF written as CRLF: 5,050. */
+const DESCRIPTION_5000_LF_SUBMITTED = (ASTRAL.repeat(99) + '\r\n').repeat(50);
+
+/**
  * The re-render values of a form whose fields were all absent: the default status and priority,
  * and `''` for the text fields.
  */
@@ -337,6 +346,20 @@ const DEFAULT_INPUT: TaskInput = {
   priority: 'Medium',
   dueDate: null,
 };
+
+/** A stored task's title and description, as the edit route passes them to `parseTaskForm`. */
+type StoredText = Pick<TaskInput, 'title' | 'description'>;
+
+/** A text field that `parseTaskForm` compares with the stored task on an edit. */
+type TextField = keyof StoredText;
+
+/**
+ * The stored text of an edited task: the title `Buy milk` and no description, except `text` in
+ * `field`.
+ */
+function storedWith(field: TextField, text: string): StoredText {
+  return { title: DEFAULT_INPUT.title, description: '', [field]: text };
+}
 
 /**
  * Asserts that `run` throws the malformed-request error the error handler renders as 400
@@ -482,6 +505,11 @@ describe('parseTaskForm', () => {
       errors: { description: DESCRIPTION_TOO_LONG_TEXT },
     },
     {
+      name: 'a 5,050-code-point description holding CRLF line breaks, with no stored description',
+      body: { title: 'Buy milk', description: DESCRIPTION_5000_LF_SUBMITTED },
+      errors: { description: DESCRIPTION_TOO_LONG_TEXT },
+    },
+    {
       name: 'an empty body',
       body: {},
       errors: { title: TITLE_REQUIRED_TEXT },
@@ -513,90 +541,224 @@ describe('parseTaskForm', () => {
     });
   });
 
-  it('builds the line-break boundary title of 200 code points, submitted as 201', () => {
-    expect([...TITLE_200_LF]).toHaveLength(200);
-    expect([...TITLE_200_LF_SUBMITTED]).toHaveLength(201);
+  it.each<{ name: string; text: string; codePoints: number }>([
+    { name: 'title', text: TITLE_200_LF, codePoints: 200 },
+    { name: 'title as submitted', text: TITLE_200_LF_SUBMITTED, codePoints: 201 },
+    { name: 'description', text: DESCRIPTION_5000_LF, codePoints: 5000 },
+    { name: 'description as submitted', text: DESCRIPTION_5000_LF_SUBMITTED, codePoints: 5050 },
+  ])('builds the line-break boundary $name of $codePoints code points', ({ text, codePoints }) => {
+    expect([...text]).toHaveLength(codePoints);
   });
 
-  // A browser submits every line break as CRLF, so on an edit a title equal to the stored one in
-  // that form is the stored title left alone; any other submission is taken as sent.
-  it.each<{ name: string; storedTitle: string | undefined; title: string; value: string }>([
+  // A browser submits every line break as CRLF, so on an edit a title or description equal to the
+  // stored one in that form is the stored text left alone; any other submission is taken as sent.
+  it.each<{
+    name: string;
+    field: TextField;
+    stored: string | undefined;
+    submitted: string;
+    value: string;
+  }>([
     {
       name: 'an unchanged LF title submitted with CRLF as stored',
-      storedTitle: 'Plan\nreview',
-      title: 'Plan\r\nreview',
+      field: 'title',
+      stored: 'Plan\nreview',
+      submitted: 'Plan\r\nreview',
       value: 'Plan\nreview',
     },
     {
       name: 'an unchanged CR title submitted with CRLF as stored',
-      storedTitle: 'Plan\rreview',
-      title: 'Plan\r\nreview',
+      field: 'title',
+      stored: 'Plan\rreview',
+      submitted: 'Plan\r\nreview',
       value: 'Plan\rreview',
     },
     {
       name: 'an unchanged CRLF title as stored',
-      storedTitle: 'Plan\r\nreview',
-      title: 'Plan\r\nreview',
+      field: 'title',
+      stored: 'Plan\r\nreview',
+      submitted: 'Plan\r\nreview',
       value: 'Plan\r\nreview',
     },
     {
       name: 'an unchanged title mixing CR, LF and CRLF, submitted with CRLF, as stored',
-      storedTitle: 'a\rb\nc\r\nd',
-      title: 'a\r\nb\r\nc\r\nd',
+      field: 'title',
+      stored: 'a\rb\nc\r\nd',
+      submitted: 'a\r\nb\r\nc\r\nd',
       value: 'a\rb\nc\r\nd',
     },
     {
       name: 'an unchanged 200-code-point LF title submitted as 201 code points as stored',
-      storedTitle: TITLE_200_LF,
-      title: TITLE_200_LF_SUBMITTED,
+      field: 'title',
+      stored: TITLE_200_LF,
+      submitted: TITLE_200_LF_SUBMITTED,
       value: TITLE_200_LF,
     },
     {
       name: 'an LF title sent with its LF as stored',
-      storedTitle: 'Plan\nreview',
-      title: 'Plan\nreview',
+      field: 'title',
+      stored: 'Plan\nreview',
+      submitted: 'Plan\nreview',
       value: 'Plan\nreview',
     },
     {
       name: 'an edited LF title as submitted, with CRLF',
-      storedTitle: 'Plan\nreview',
-      title: 'Plan\r\nreviews',
+      field: 'title',
+      stored: 'Plan\nreview',
+      submitted: 'Plan\r\nreviews',
       value: 'Plan\r\nreviews',
     },
     {
       name: 'an LF title edited to drop its line break as submitted',
-      storedTitle: 'Plan\nreview',
-      title: 'Plan review',
+      field: 'title',
+      stored: 'Plan\nreview',
+      submitted: 'Plan review',
       value: 'Plan review',
     },
     {
       name: 'a CRLF title edited to LF as submitted',
-      storedTitle: 'Plan\r\nreview',
-      title: 'Plan\nreview',
+      field: 'title',
+      stored: 'Plan\r\nreview',
+      submitted: 'Plan\nreview',
       value: 'Plan\nreview',
     },
     {
       name: 'a CRLF title with no stored title as submitted',
-      storedTitle: undefined,
-      title: 'Plan\r\nreview',
+      field: 'title',
+      stored: undefined,
+      submitted: 'Plan\r\nreview',
       value: 'Plan\r\nreview',
     },
-  ])('takes $name', ({ storedTitle, title, value }) => {
-    expect(parseTaskForm({ title, priority: 'High' }, storedTitle)).toEqual({
+    {
+      name: 'an unchanged LF description submitted with CRLF as stored',
+      field: 'description',
+      stored: 'Line one\nLine two',
+      submitted: 'Line one\r\nLine two',
+      value: 'Line one\nLine two',
+    },
+    {
+      name: 'an unchanged CR description submitted with CRLF as stored',
+      field: 'description',
+      stored: 'Line one\rLine two',
+      submitted: 'Line one\r\nLine two',
+      value: 'Line one\rLine two',
+    },
+    {
+      name: 'an unchanged CRLF description as stored',
+      field: 'description',
+      stored: 'Line one\r\nLine two',
+      submitted: 'Line one\r\nLine two',
+      value: 'Line one\r\nLine two',
+    },
+    {
+      name: 'an unchanged description mixing CR, LF and CRLF, submitted with CRLF, as stored',
+      field: 'description',
+      stored: '\na\rb\nc\r\nd\n',
+      submitted: '\r\na\r\nb\r\nc\r\nd\r\n',
+      value: '\na\rb\nc\r\nd\n',
+    },
+    {
+      name: 'an unchanged 5,000-code-point LF description submitted as 5,050 as stored',
+      field: 'description',
+      stored: DESCRIPTION_5000_LF,
+      submitted: DESCRIPTION_5000_LF_SUBMITTED,
+      value: DESCRIPTION_5000_LF,
+    },
+    {
+      name: 'an LF description sent with its LF as stored',
+      field: 'description',
+      stored: 'Line one\nLine two',
+      submitted: 'Line one\nLine two',
+      value: 'Line one\nLine two',
+    },
+    {
+      name: 'an edited LF description as submitted, with CRLF',
+      field: 'description',
+      stored: 'Line one\nLine two',
+      submitted: 'Line one\r\nLine three',
+      value: 'Line one\r\nLine three',
+    },
+    {
+      name: 'an LF description edited to drop its line break as submitted',
+      field: 'description',
+      stored: 'Line one\nLine two',
+      submitted: 'Line one Line two',
+      value: 'Line one Line two',
+    },
+    {
+      name: 'a CRLF description edited to LF as submitted',
+      field: 'description',
+      stored: 'Line one\r\nLine two',
+      submitted: 'Line one\nLine two',
+      value: 'Line one\nLine two',
+    },
+    {
+      name: 'a CRLF description with no stored description as submitted',
+      field: 'description',
+      stored: undefined,
+      submitted: 'Line one\r\nLine two',
+      value: 'Line one\r\nLine two',
+    },
+  ])('takes $name', ({ field, stored, submitted, value }) => {
+    const body = { title: DEFAULT_INPUT.title, priority: 'High', [field]: submitted };
+    const task = stored === undefined ? undefined : storedWith(field, stored);
+    expect(parseTaskForm(body, task)).toEqual({
       ok: true,
-      value: { ...DEFAULT_INPUT, title: value, priority: 'High' },
+      value: { ...DEFAULT_INPUT, priority: 'High', [field]: value },
     });
   });
 
-  it.each<{ name: string; storedTitle: string; title: string }>([
-    { name: 'LF', storedTitle: 'Plan\nreview', title: 'Plan\r\nreview' },
-    { name: 'CR', storedTitle: 'Plan\rreview', title: 'Plan\r\nreview' },
-    { name: '200-code-point LF', storedTitle: TITLE_200_LF, title: TITLE_200_LF_SUBMITTED },
-  ])('re-renders the unchanged $name title of a refused edit as stored', (c) => {
-    expect(parseTaskForm({ title: c.title, dueDate: '2026-02-30' }, c.storedTitle)).toEqual({
+  it.each<{ name: string; field: TextField; stored: string; submitted: string }>([
+    { name: 'LF title', field: 'title', stored: 'Plan\nreview', submitted: 'Plan\r\nreview' },
+    { name: 'CR title', field: 'title', stored: 'Plan\rreview', submitted: 'Plan\r\nreview' },
+    {
+      name: '200-code-point LF title',
+      field: 'title',
+      stored: TITLE_200_LF,
+      submitted: TITLE_200_LF_SUBMITTED,
+    },
+    {
+      name: 'LF description',
+      field: 'description',
+      stored: 'Line one\nLine two',
+      submitted: 'Line one\r\nLine two',
+    },
+    {
+      name: 'CR description',
+      field: 'description',
+      stored: 'Line one\rLine two',
+      submitted: 'Line one\r\nLine two',
+    },
+    {
+      name: '5,000-code-point LF description',
+      field: 'description',
+      stored: DESCRIPTION_5000_LF,
+      submitted: DESCRIPTION_5000_LF_SUBMITTED,
+    },
+  ])('re-renders the unchanged $name of a refused edit as stored', (c) => {
+    const body = { title: DEFAULT_INPUT.title, [c.field]: c.submitted, dueDate: '2026-02-30' };
+    expect(parseTaskForm(body, storedWith(c.field, c.stored))).toEqual({
       ok: false,
       errors: { dueDate: INVALID_DATE_TEXT },
-      values: { ...ABSENT_VALUES, title: c.storedTitle, dueDate: '2026-02-30' },
+      values: {
+        ...ABSENT_VALUES,
+        title: DEFAULT_INPUT.title,
+        [c.field]: c.stored,
+        dueDate: '2026-02-30',
+      },
+    });
+  });
+
+  // Only an unchanged description is the stored one; a changed one is counted as submitted.
+  it.each<{ name: string; description: string }>([
+    { name: 'with CRLF line breaks', description: `${DESCRIPTION_5000_LF_SUBMITTED}x` },
+    { name: 'with LF line breaks', description: `${DESCRIPTION_5000_LF}x` },
+  ])('refuses a description changed $name past the limit of a stored 5,000', (c) => {
+    const body = { title: DEFAULT_INPUT.title, description: c.description };
+    expect(parseTaskForm(body, storedWith('description', DESCRIPTION_5000_LF))).toEqual({
+      ok: false,
+      errors: { description: DESCRIPTION_TOO_LONG_TEXT },
+      values: { ...ABSENT_VALUES, title: DEFAULT_INPUT.title, description: c.description },
     });
   });
 });

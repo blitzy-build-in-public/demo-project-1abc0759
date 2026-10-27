@@ -59,7 +59,10 @@ export interface TaskFormValues {
    * with the CRLF line breaks a browser submits.
    */
   title: string;
-  /** Submitted description, with its line breaks as sent. */
+  /**
+   * Submitted description, with its line breaks as sent; on an edit, the stored description when
+   * the submission is that description with the CRLF line breaks a browser submits.
+   */
   description: string;
   /** Submitted status, `''` when sent blank, or `DEFAULT_STATUS` when the field was absent. */
   status: string;
@@ -105,14 +108,15 @@ function asFormSubmitted(text: string): string {
 }
 
 /**
- * The submitted title to validate. A browser cannot send back a lone CR or LF of the stored
- * title, so a submission equal to the stored title as {@link asFormSubmitted} writes it is the
- * title left alone, and the stored title is kept. Any other submission is a changed title, taken
- * exactly as sent.
+ * The submitted title or description to validate, `stored` being the edited task's text of the
+ * same field. A browser cannot send back a lone CR or LF of the stored text, so a submission
+ * equal to the stored text as {@link asFormSubmitted} writes it is the field left alone, and the
+ * stored text is kept. Any other submission, and every submission when nothing is stored, is
+ * changed text, taken exactly as sent.
  */
-function submittedTitle(raw: string, storedTitle: string | undefined): string {
-  if (storedTitle !== undefined && raw !== storedTitle && raw === asFormSubmitted(storedTitle)) {
-    return storedTitle;
+function submittedText(raw: string, stored: string | undefined): string {
+  if (stored !== undefined && raw !== stored && raw === asFormSubmitted(stored)) {
+    return stored;
   }
   return raw;
 }
@@ -123,12 +127,14 @@ function submittedTitle(raw: string, storedTitle: string | undefined): string {
  * Rules, each failure giving its exact inline message:
  * - `title` is trimmed; empty gives {@link TITLE_REQUIRED_MESSAGE}, more than `TITLE_MAX_CHARS`
  *   (200) code points gives {@link TITLE_TOO_LONG_MESSAGE}. On an edit, a submitted title that
- *   equals `storedTitle` once each of its line breaks is written as CRLF, the form a browser
- *   submits, is `storedTitle` itself, so an edit that leaves the title alone never alters it.
+ *   equals `stored.title` once each of its line breaks is written as CRLF, the form a browser
+ *   submits, is `stored.title` itself, so an edit that leaves the title alone never alters it.
  * - `description` is optional and not trimmed; more than `DESCRIPTION_MAX_CHARS` (5,000) code
- *   points gives {@link DESCRIPTION_TOO_LONG_MESSAGE}. Browsers submit textarea line breaks as
- *   CRLF, and the CR and the LF each count as one code point, because the description is stored
- *   as submitted, on an edit too.
+ *   points gives {@link DESCRIPTION_TOO_LONG_MESSAGE}. It is stored as submitted: browsers submit
+ *   textarea line breaks as CRLF, and the CR and the LF each count as one code point. On an edit,
+ *   a submitted description that equals `stored.description` once each of its line breaks is
+ *   written as CRLF is `stored.description` itself, so an edit that leaves the description alone
+ *   never alters or lengthens it.
  * - `status` absent takes `DEFAULT_STATUS` (`To do`); a submitted value that is not an exact
  *   label, `''` included, gives {@link INVALID_STATUS_MESSAGE}.
  * - `priority` absent takes `DEFAULT_PRIORITY` (`Medium`); a submitted value that is not an exact
@@ -139,10 +145,11 @@ function submittedTitle(raw: string, storedTitle: string | undefined): string {
  * Other body fields, such as `_csrf`, are ignored.
  *
  * @param body - `req.body` from `express.urlencoded({ extended: false })`, typed as `unknown`.
- * @param storedTitle - The edited task's stored title; omitted when creating a task. When the
- *   submitted title differs from it only by line breaks written as CRLF, the stored title is the
- *   one validated, returned and re-rendered, its line breaks kept exactly. Every title rule and
- *   the U+0000 check apply to it as to any submitted title.
+ * @param stored - The edited task's stored title and description; omitted when creating a task.
+ *   When a submitted title or description differs from its stored text only by line breaks
+ *   written as CRLF, the stored text is the one validated, returned and re-rendered, its line
+ *   breaks kept exactly. Every rule of that field and the U+0000 check apply to it as to any
+ *   submitted text.
  * @returns `{ ok: true, value }` with the trimmed title and the other fields as validated, or
  *   `{ ok: false, errors, values }` with every failed field's message and the submitted values,
  *   as {@link TaskFormValues} records them.
@@ -151,13 +158,16 @@ function submittedTitle(raw: string, storedTitle: string | undefined): string {
  */
 export function parseTaskForm(
   body: unknown,
-  storedTitle?: string,
+  stored?: Pick<TaskInput, 'title' | 'description'>,
 ): FormResult<TaskInput, TaskFormValues> {
   // Only a missing status or priority takes the default. A blank one was submitted, so like any
   // other value that is not an exact label it is invalid, and it is kept for the re-render.
   const values: TaskFormValues = {
-    title: submittedTitle(readField(body, TASK_FORM_FIELDS.title) ?? '', storedTitle),
-    description: readField(body, TASK_FORM_FIELDS.description) ?? '',
+    title: submittedText(readField(body, TASK_FORM_FIELDS.title) ?? '', stored?.title),
+    description: submittedText(
+      readField(body, TASK_FORM_FIELDS.description) ?? '',
+      stored?.description,
+    ),
     status: readField(body, TASK_FORM_FIELDS.status) ?? DEFAULT_STATUS,
     priority: readField(body, TASK_FORM_FIELDS.priority) ?? DEFAULT_PRIORITY,
     dueDate: readField(body, TASK_FORM_FIELDS.dueDate) ?? '',

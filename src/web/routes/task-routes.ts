@@ -131,8 +131,8 @@ function toFormValues(task: Task): TaskFormValues {
  * - `POST /tasks/new`: 303 to `/tasks`; 422 form with inline errors and the entered values, nothing
  *   saved.
  * - `GET /tasks/:id/edit`: 200 form with the stored values.
- * - `POST /tasks/:id/edit`: 303 to `/tasks`; 422 as for creation. A title submitted unchanged,
- *   its line breaks sent as CRLF, keeps the stored title exactly.
+ * - `POST /tasks/:id/edit`: 303 to `/tasks`; 422 as for creation. A title or description
+ *   submitted unchanged, its line breaks sent as CRLF, keeps the stored text exactly.
  * - `POST /tasks/:id/status`: moves the task to `status` (an exact label, else 400) and answers 303
  *   to `/tasks` with the echoed filters.
  * - `POST /tasks/:id/delete`: with `confirm=yes` deletes the task and answers 303 to `/tasks` with
@@ -267,9 +267,11 @@ export function createTaskRouter(deps: { tasks: TaskService; csrf: Csrf }): Rout
       // reveal the task exists.
       const task = await loadOwnedTask(tasks, user.id, id);
       const body: unknown = req.body;
-      // A browser submits every line break as CRLF, so the stored title lets the parser recognise
-      // it unchanged and keep a lone CR or LF in it, rather than rewriting or lengthening it.
-      const parsed = parseTaskForm(body, task.title);
+      // A browser submits every line break as CRLF, so the stored title and description let the
+      // parser recognise each one unchanged and keep a lone CR or LF in it, rather than rewriting
+      // or lengthening it: an unchanged description of up to 5,000 code points never blocks an
+      // edit of another field.
+      const parsed = parseTaskForm(body, task);
       if (!parsed.ok) {
         sendHtml(
           res,

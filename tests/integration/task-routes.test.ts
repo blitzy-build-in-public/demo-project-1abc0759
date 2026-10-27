@@ -1052,6 +1052,99 @@ describe('a title holding a line break', () => {
   );
 });
 
+/** The description textarea's start tag as a form with a valid description renders it. */
+const DESCRIPTION_TEXTAREA =
+  '<textarea id="description" name="description" rows="6" aria-describedby="description-hint">';
+
+/**
+ * A stored description holding lone CR or LF line breaks and the same description as a browser
+ * submits it from the edit form's textarea, every line break written as CRLF. The last has
+ * exactly 5,000 code points (50 lines of 99 characters and an LF), the longest accepted, and is
+ * submitted as 5,050.
+ */
+const UNCHANGED_DESCRIPTION_CASES: readonly {
+  name: string;
+  description: string;
+  submitted: string;
+}[] = [
+  {
+    name: 'an unchanged LF description as CRLF',
+    description: 'Line one\nLine two',
+    submitted: 'Line one\r\nLine two',
+  },
+  {
+    name: 'an unchanged CR description as CRLF',
+    description: 'Line one\rLine two',
+    submitted: 'Line one\r\nLine two',
+  },
+  {
+    name: 'an unchanged 5,000-code-point LF description as CRLF',
+    description: `${'d'.repeat(99)}\n`.repeat(50),
+    submitted: `${'d'.repeat(99)}\r\n`.repeat(50),
+  },
+];
+
+describe('a description holding a lone line break', () => {
+  test.each([
+    ...UNCHANGED_DESCRIPTION_CASES.map((c) => ({
+      ...c,
+      stored: c.description,
+      outcome: 'it exactly',
+    })),
+    {
+      name: 'a changed LF description as CRLF',
+      description: 'Line one\nLine two',
+      submitted: 'Line one\r\nLine three',
+      stored: 'Line one\r\nLine three',
+      outcome: 'the description as submitted',
+    },
+  ])('a priority edit sending $name stores $outcome', async (c) => {
+    const task = await insertTask(pool, userA.userId, {
+      title: 'Notes',
+      description: c.description,
+      priority: 'Low',
+    });
+    expect(task.description).toBe(c.description);
+    // What a browser sends: the edit form's fields, the textarea's line breaks as CRLF.
+    const edited = await postAs(userA, `/tasks/${task.id}/edit`, {
+      ...formFieldsOf(task),
+      description: c.submitted,
+      priority: 'High',
+    });
+    expect(edited.status).toBe(303);
+    expect(edited.location).toBe('/tasks');
+    const after = await storedTask(userA.userId, task.id);
+    expect(after.description).toBe(c.stored);
+    expect(after).toMatchObject({
+      title: task.title,
+      status: task.status,
+      priority: 'High',
+      dueDate: task.dueDate,
+    });
+  });
+
+  test.each(UNCHANGED_DESCRIPTION_CASES)(
+    'a refused edit sending $name re-renders the stored description verbatim',
+    async (c) => {
+      const task = await insertTask(pool, userA.userId, {
+        title: 'Notes',
+        description: c.description,
+      });
+      const before = await tasksForOwner(pool, userA.userId);
+      const res = await postAs(userA, `/tasks/${task.id}/edit`, {
+        ...formFieldsOf(task),
+        description: c.submitted,
+        dueDate: '2026-02-30',
+      });
+      expect(res.status).toBe(422);
+      expectFieldError(res, 'dueDate', INVALID_DATE);
+      expect(res.body).not.toContain('id="description-error"');
+      expect(res.body).toContain(`${DESCRIPTION_TEXTAREA}\n${c.description}</textarea>`);
+      expect(await tasksForOwner(pool, userA.userId)).toEqual(before);
+    },
+  );
+});
+
 describe('a missing status or priority takes its default, a blank one is refused', () => {
   test('a refused form without status or priority preselects To do and Medium', async () => {
     const res = await createViaForm(userA.client, { title: '' });
@@ -1099,6 +1192,11 @@ describe('code-point length limits', () => {
       field: 'description',
       value: EMOJI.repeat(2500) + 'b'.repeat(2500),
     },
+    {
+      name: 'a 5000-code-point description of 4,998 characters and a CRLF',
+      field: 'description',
+      value: 'b'.repeat(2499) + '\r\n' + 'b'.repeat(2499),
+    },
   ])('$name is accepted and stored exactly', async ({ field, value }) => {
     const res = await createViaForm(userA.client, { title: 'Boundary', [field]: value });
     expect(res.status).toBe(303);
@@ -1118,11 +1216,66 @@ describe('code-point length limits', () => {
       value: EMOJI.repeat(2500) + 'b'.repeat(2501),
       message: DESCRIPTION_TOO_LONG,
     },
+    {
+      name: 'a 5001-code-point description of 4,999 characters and a CRLF',
+      field: 'description',
+      value: 'b'.repeat(2499) + '\r\n' + 'b'.repeat(2500),
+      message: DESCRIPTION_TOO_LONG,
+    },
   ])('$name is refused', async ({ field, value, message }) => {
     const res = await createViaForm(userA.client, { title: 'Boundary', [field]: value });
     expect(res.status).toBe(422);
     expectFieldError(res, field, message);
     expect(await countRows(pool, 'tasks')).toBe(0);
+  });
+
+  test('both task forms state each limit, a description line break counting as 2', async () => {
+    const task = await insertTask(pool, userA.userId, { title: 'Stored' });
+    for (const path of ['/tasks/new', `/tasks/${task.id}/edit`]) {
+      const res = await userA.client.get(path);
+      expect(res.status).toBe(200);
+      expect(res.body).toContain('<p class="hint" id="title-hint">Up to 200 characters</p>');
+      expect(res.body).toContain(
+        '<p class="hint" id="description-hint">' +
+          'Up to 5,000 characters (each line break counts as 2)</p>',
+      );
+    }
+  });
+
+  // A changed title in the textarea is counted as the browser submits it, each line break as CRLF.
+  test.each<{ name: string; title: string; control: 'input' | 'textarea'; hint: string }>([
+    {
+      name: 'a single-line title',
+      title: 'Stored',
+      control: 'input',
+      hint: 'Up to 200 characters',
+    },
+    {
+      name: 'a CRLF title',
+      title: 'Plan\r\nreview',
+      control: 'textarea',
+      hint: 'Up to 200 characters (each line break counts as 2)',
+    },
+    {
+      name: 'an LF title',
+      title: 'Plan\nreview',
+      control: 'textarea',
+      hint: 'Up to 200 characters (each line break counts as 2)',
+    },
+    {
+      name: 'a CR title',
+      title: 'Plan\rreview',
+      control: 'textarea',
+      hint: 'Up to 200 characters (each line break counts as 2)',
+    },
+  ])('the edit form of $name gives its title $control the matching hint', async (c) => {
+    const task = await insertTask(pool, userA.userId, { title: c.title });
+    const res = await userA.client.get(`/tasks/${task.id}/edit`);
+    expect(res.status).toBe(200);
+    const control = controlTag(res.body, 'title');
+    expect(control.startsWith(`<${c.control} `)).toBe(true);
+    expect(control).toContain(' aria-describedby="title-hint"');
+    expect(res.body).toContain(`<p class="hint" id="title-hint">${c.hint}</p>`);
   });
 });
 

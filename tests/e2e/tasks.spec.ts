@@ -107,6 +107,12 @@ const LINE_BREAK_TITLES: readonly { name: string; title: string; shown: string }
 ];
 
 /**
+ * The description's hint on the task form: a browser submits each line break as CRLF, and the
+ * description is counted as submitted.
+ */
+const DESCRIPTION_HINT = 'Up to 5,000 characters (each line break counts as 2)';
+
+/**
  * Tasks in the long list: five of the task table's 50-row groups. The first screen renders the
  * first and the last two always render, so Control+End passes two groups that render only during
  * the scroll before it lands in the last.
@@ -665,6 +671,56 @@ function defineSharedFlows(deleteFromList: DeleteFromList): void {
       ]);
     });
   }
+
+  test('keeps a 5,000-code-point description with LF line breaks through a priority edit', async ({
+    page,
+  }) => {
+    const { email } = await signUpAndLogIn(page);
+    // 50 lines of 99 characters and an LF: exactly 5,000 code points, the longest accepted, which
+    // a browser submits as 5,050 with each LF written as CRLF.
+    const description = `${'d'.repeat(99)}\n`.repeat(50);
+    expect([...description]).toHaveLength(5000);
+    const titleText = 'Long notes';
+    await page.goto('/tasks/new');
+    await expect(page.locator('#description-hint')).toHaveText(DESCRIPTION_HINT);
+    // A request posting the form's own CSRF token with the page's cookies creates the task. Its
+    // form encoding sends each LF unchanged, as a client other than a browser can store it.
+    const csrf = await page.locator('form[action="/tasks/new"] input[name="_csrf"]').inputValue();
+    const created = await page.request.post('/tasks/new', {
+      form: { _csrf: csrf, title: titleText, description, priority: 'Low' },
+      maxRedirects: 0,
+    });
+    expect(created.status()).toBe(303);
+    const { id, description: storedDescription } = await storedTask(email, titleText);
+    expect(storedDescription).toBe(description);
+
+    await page.goto(`/tasks/${id}/edit`);
+    const form = page.locator(`form[action="/tasks/${id}/edit"]`);
+    const descriptionField = form.getByLabel('Description', { exact: true });
+    await expect(descriptionField).toHaveValue(description);
+    await expect(descriptionField).toHaveAccessibleDescription(DESCRIPTION_HINT);
+    await form.getByLabel('Priority', { exact: true }).selectOption('Medium');
+    const saved = await clickAndAwaitPost(
+      page,
+      form.getByRole('button', { name: 'Save', exact: true }),
+      `/tasks/${id}/edit`,
+    );
+    // The browser submits every line break as CRLF, whatever the stored description holds.
+    const submitted = new URLSearchParams(saved.request().postData() ?? '').get('description');
+    expect(submitted).toBe(description.replaceAll('\n', '\r\n'));
+    expect([...(submitted ?? '')]).toHaveLength(5050);
+    expect(saved.status()).toBe(303);
+    await expectUnfilteredList(page);
+    await expectListedTask(page, titleText, {
+      status: 'To do',
+      priority: 'Medium',
+      dueDate: '\u2014',
+    });
+    // The server recognises the unchanged description, so the stored one keeps its LF line breaks.
+    expect(await userTasks(email)).toEqual([
+      expect.objectContaining({ id, description, priority: 'Medium' }),
+    ]);
+  });
 
   test('limits the title and description in code points, not UTF-16 units', async ({ page }) => {
     // Filling the 5,000-character description is the slow step on a busy host.

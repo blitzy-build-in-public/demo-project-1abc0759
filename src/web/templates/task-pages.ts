@@ -309,6 +309,14 @@ function editTaskId(view: TaskFormPageView): TaskId {
 const LINE_BREAK = /[\r\n]/;
 
 /**
+ * Whether the title is edited in the two-row textarea rather than the single-line input: it holds
+ * a line break, which a text input would strip. The title control and its hint both follow this.
+ */
+function isMultiLineTitle(title: string): boolean {
+  return LINE_BREAK.test(title);
+}
+
+/**
  * The title control, `attrs` being its `aria-describedby`, `aria-invalid` and `autofocus`.
  *
  * A text input strips CR and LF from its value, so a title holding a line break, which the title
@@ -316,11 +324,12 @@ const LINE_BREAK = /[\r\n]/;
  * therefore edited in a two-row textarea with the same attributes and no `maxlength`; every other
  * title keeps the single-line input. Browsers submit each line break of a form as CRLF; on an
  * edit the server recognises the unchanged title, so its line breaks are kept exactly, and a
- * changed title is stored as the browser submits it, with CRLF line breaks. The line feed after
- * `<textarea>` keeps a leading line break, as for the description.
+ * changed title is stored as the browser submits it, with CRLF line breaks, so its hint
+ * ({@link titleHint}) says each line break counts as 2. The line feed after `<textarea>` keeps a
+ * leading line break, as for the description.
  */
 function renderTitleControl(title: string, attrs: SafeHtml): SafeHtml {
-  if (LINE_BREAK.test(title)) {
+  if (isMultiLineTitle(title)) {
     return html`<textarea id="title" name="${
       TASK_FORM_FIELDS.title
     }" required rows="2"${attrs}>\n${title}</textarea>`;
@@ -328,6 +337,18 @@ function renderTitleControl(title: string, attrs: SafeHtml): SafeHtml {
   return html`<input type="text" id="title" name="${
     TASK_FORM_FIELDS.title
   }" required value="${title}"${attrs}>`;
+}
+
+/**
+ * The title's hint, for the control {@link renderTitleControl} renders. The textarea's hint adds
+ * that each line break counts as 2: a browser submits every line break as CRLF, and a changed
+ * title is counted and stored as submitted, so each line break takes 2 of the 200 code points.
+ * The single-line input cannot hold a line break, so its hint states the limit alone.
+ */
+function titleHint(title: string): string {
+  return isMultiLineTitle(title)
+    ? 'Up to 200 characters (each line break counts as 2)'
+    : 'Up to 200 characters';
 }
 
 /**
@@ -353,17 +374,20 @@ function renderTaskFields(view: TaskFormPageView): SafeHtml {
   )}${focus('title')}`;
   // The line feed right after <textarea> is required: the HTML parser drops one leading line feed
   // there, so without it a description that begins with a line break would lose it on each edit.
+  // The description hint, like the title textarea's (titleHint), says each line break counts as 2:
+  // a browser submits every line break as CRLF, and the description is stored and counted as
+  // submitted, so each line break takes 2 of the 5,000 code points.
   return html`${renderErrorSummary(invalid)}${csrfField(csrfToken)}
       <label for="title">Title</label>
       ${renderTitleControl(values.title, titleAttrs)}
-      <p class="hint" id="title-hint">Up to 200 characters</p>
+      <p class="hint" id="title-hint">${titleHint(values.title)}</p>
       ${fieldError('title-error', errors.title)}
       <label for="description">Description</label>
       <textarea id="description" name="${TASK_FORM_FIELDS.description}" rows="6"${describedBy(
         'description-hint',
         errors.description && 'description-error',
       )}${invalidAttr(errors.description)}${focus('description')}>\n${values.description}</textarea>
-      <p class="hint" id="description-hint">Up to 5,000 characters</p>
+      <p class="hint" id="description-hint">Up to 5,000 characters (each line break counts as 2)</p>
       ${fieldError('description-error', errors.description)}
       <label for="status">Status</label>
       <select id="status" name="${TASK_FORM_FIELDS.status}"${describedBy(
