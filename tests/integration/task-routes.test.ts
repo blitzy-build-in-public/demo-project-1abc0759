@@ -209,9 +209,11 @@ function expectErrorPage(res: HttpResult, status: number, message: string): void
   expect(res.body).toContain(`<p>${message}</p>`);
 }
 
-/** Asserts an inline message beside one field of a re-rendered task form. */
+/** Asserts an inline message beside one field of a re-rendered task form, announced as an alert. */
 function expectFieldError(res: HttpResult, field: string, message: string): void {
-  expect(res.body).toContain(`id="${field}-error">${message}</p>`);
+  expect(res.body).toContain(
+    `<p class="field-error" id="${field}-error" role="alert">${message}</p>`,
+  );
 }
 
 beforeAll(async () => {
@@ -227,8 +229,11 @@ beforeEach(async () => {
 
 afterAll(async () => {
   // Guarded so that a failed start reports its own error rather than a TypeError here.
-  await app?.close();
-  await pool?.end();
+  try {
+    await app?.close();
+  } finally {
+    await pool?.end();
+  }
 });
 
 describe('create, edit, change status and delete (SC4)', () => {
@@ -439,6 +444,17 @@ describe('task form defaults', () => {
   });
 });
 
+/**
+ * Matches the `field` select of a form re-rendered after a blank submission: the blank value is
+ * its only selected option, labelled " (invalid)", and no default is preselected in its place.
+ */
+function blankSelection(field: 'status' | 'priority'): RegExp {
+  return new RegExp(
+    `<select id="${field}"[^>]*>(?:<option value="[^"]+">[^<]*</option>)*` +
+      '<option value="" selected> \\(invalid\\)</option></select>',
+  );
+}
+
 /** One invalid task-form submission: the offending field, its value and the inline message. */
 interface InvalidFormCase {
   name: string;
@@ -497,6 +513,20 @@ const INVALID_FORM_CASES: readonly InvalidFormCase[] = [
     message: INVALID_PRIORITY,
     rendered: /<option[^>]*value="Urgent"[^>]*selected[^>]*>Urgent \(invalid\)<\/option>/,
   },
+  {
+    name: 'a blank status',
+    field: 'status',
+    value: '',
+    message: INVALID_STATUS,
+    rendered: blankSelection('status'),
+  },
+  {
+    name: 'a blank priority',
+    field: 'priority',
+    value: '',
+    message: INVALID_PRIORITY,
+    rendered: blankSelection('priority'),
+  },
 ];
 
 /** Asserts a 422 re-render with the case's message beside its field and its kept value. */
@@ -554,6 +584,252 @@ describe('task form validation (422, nothing saved)', () => {
     expect(res.body).toContain('value="&lt;script&gt;x&lt;/script&gt;"');
     expect(res.body).not.toContain('<script>x');
     expect(await countRows(pool, 'tasks')).toBe(0);
+  });
+});
+
+/** The error summary of a re-rendered task form, without its closing tag. */
+const ERROR_SUMMARY =
+  /<section class="error-summary" aria-labelledby="error-summary-heading">([\s\S]*?)<\/section>/;
+
+/** One link of the error summary: its fragment target and its text. */
+const SUMMARY_LINK = /<a href="([^"]*)">([^<]*)<\/a>/g;
+
+/** An `autofocus` attribute anywhere on the page. */
+const AUTOFOCUS = /\sautofocus(?=[\s>])/g;
+
+/** The links of a page's error summary as `[href, text]` pairs, in page order. */
+function summaryLinks(body: string): [string, string][] {
+  const summary = ERROR_SUMMARY.exec(body);
+  if (summary === null) {
+    throw new Error('summaryLinks: the page has no error summary');
+  }
+  const content = summary[1] ?? '';
+  expect(content).toContain('<h2 id="error-summary-heading">The task was not saved</h2>');
+  // Not a live region: the inline messages are the alerts, so the summary would repeat them.
+  expect(content).not.toMatch(/role=|aria-live/);
+  return [...content.matchAll(SUMMARY_LINK)].map((m) => [m[1] ?? '', m[2] ?? '']);
+}
+
+/** The start tag of the form control whose id is `id`. */
+function controlTag(body: string, id: string): string {
+  const tag = new RegExp(`<(?:input|textarea|select)\\b[^>]*\\sid="${id}"[^>]*>`).exec(body);
+  if (tag === null) {
+    throw new Error(`controlTag: the page has no control with id "${id}"`);
+  }
+  return tag[0];
+}
+
+/** Asserts that the page sets `autofocus` once, on the control whose id is `id`. */
+function expectAutofocusOn(body: string, id: string): void {
+  expect(body.match(AUTOFOCUS)).toHaveLength(1);
+  expect(controlTag(body, id)).toMatch(AUTOFOCUS);
+}
+
+describe('failed form: error summary and focus', () => {
+  test('a form shown before any submission has no error summary and focuses nothing', async () => {
+    const task = await insertTask(pool, userA.userId, { title: 'Stored' });
+    for (const path of ['/tasks/new', `/tasks/${task.id}/edit`]) {
+      const res = await userA.client.get(path);
+      expect(res.status).toBe(200);
+      expect(res.body).not.toContain('error-summary');
+      expect(res.body).not.toMatch(AUTOFOCUS);
+    }
+  });
+
+  test('every message is listed in field order and the first invalid field focused', async () => {
+    const res = await createViaForm(userA.client, {
+      title: '',
+      description: 'd'.repeat(5001),
+      status: 'Blocked',
+      priority: 'Urgent',
+      dueDate: '2026-02-30',
+    });
+    expect(res.status).toBe(422);
+    expect(summaryLinks(res.body)).toEqual([
+      ['#title', TITLE_REQUIRED],
+      ['#description', DESCRIPTION_TOO_LONG],
+      ['#status', INVALID_STATUS],
+      ['#priority', INVALID_PRIORITY],
+      ['#dueDate', INVALID_DATE],
+    ]);
+    expectFieldError(res, 'title', TITLE_REQUIRED);
+    expectFieldError(res, 'description', DESCRIPTION_TOO_LONG);
+    expectFieldError(res, 'status', INVALID_STATUS);
+    expectFieldError(res, 'priority', INVALID_PRIORITY);
+    expectFieldError(res, 'dueDate', INVALID_DATE);
+    // The summary opens the form, ahead of the CSRF field and the first control.
+    expect(res.body.indexOf('class="error-summary"')).toBeLessThan(res.body.indexOf('id="title"'));
+    expectAutofocusOn(res.body, 'title');
+    expect(await countRows(pool, 'tasks')).toBe(0);
+  });
+
+  test.each(INVALID_FORM_CASES)(
+    'with only $name, the summary links that field and it is focused',
+    async (c) => {
+      const res = await createViaForm(userA.client, { title: 'Valid title', [c.field]: c.value });
+      expectInvalidForm(res, c);
+      expect(summaryLinks(res.body)).toEqual([[`#${c.field}`, c.message]]);
+      expectAutofocusOn(res.body, c.field);
+    },
+  );
+});
+
+/** The title textarea's start tag as the task form renders it, before its extra attributes. */
+const TITLE_TEXTAREA = '<textarea id="title" name="title" required rows="2"';
+
+/**
+ * A stored title holding a lone CR or LF and the same title as a browser submits it from the
+ * edit form's textarea, every line break written as CRLF. The last title has exactly 200 code
+ * points (100 + LF + 99), the longest accepted, and is submitted as 201.
+ */
+const UNCHANGED_TITLE_CASES: readonly { name: string; title: string; submitted: string }[] = [
+  { name: 'an unchanged LF title as CRLF', title: 'Plan\nreview', submitted: 'Plan\r\nreview' },
+  { name: 'an unchanged CR title as CRLF', title: 'Plan\rreview', submitted: 'Plan\r\nreview' },
+  {
+    name: 'an unchanged 200-code-point LF title as CRLF',
+    title: `${'a'.repeat(100)}\n${'b'.repeat(99)}`,
+    submitted: `${'a'.repeat(100)}\r\n${'b'.repeat(99)}`,
+  },
+];
+
+describe('a title holding a line break', () => {
+  test('is edited in a textarea holding it, and a priority-only edit keeps it', async () => {
+    const title = 'Plan\r\nreview';
+    expect((await createViaForm(userA.client, { title })).status).toBe(303);
+    const task = await onlyTask(userA.userId);
+    expect(task.title).toBe(title);
+
+    const form = await userA.client.get(`/tasks/${task.id}/edit`);
+    expect(form.status).toBe(200);
+    // A single-line input would strip the line break; the textarea keeps it, with no maxlength.
+    expect(form.body).toContain(`${TITLE_TEXTAREA} aria-describedby="title-hint">\n${title}<`);
+    expect(controlTag(form.body, 'title')).not.toContain('maxlength');
+    expect(form.body).not.toMatch(/<input\b[^>]*\sname="title"/);
+
+    // A browser submits the textarea's line break as the CRLF it holds.
+    const edited = await postAs(userA, `/tasks/${task.id}/edit`, {
+      ...formFieldsOf(task),
+      priority: 'High',
+    });
+    expect(edited.status).toBe(303);
+    expect(await storedTask(userA.userId, task.id)).toMatchObject({ title, priority: 'High' });
+  });
+
+  test.each<{ name: string; title: string; fields: FormFields; attrs: string }>([
+    {
+      name: 'a CRLF line break',
+      title: 'Plan\r\nreview',
+      fields: { dueDate: '2026-02-30' },
+      attrs: ' aria-describedby="title-hint"',
+    },
+    {
+      name: 'an LF line break',
+      title: 'Plan\nreview',
+      fields: { dueDate: '2026-02-30' },
+      attrs: ' aria-describedby="title-hint"',
+    },
+    {
+      name: 'a CR line break',
+      title: 'Plan\rreview',
+      fields: { dueDate: '2026-02-30' },
+      attrs: ' aria-describedby="title-hint"',
+    },
+    {
+      name: 'a line break, over the length limit',
+      title: `Plan\n${'a'.repeat(200)}`,
+      fields: {},
+      attrs: ' aria-describedby="title-hint title-error" aria-invalid="true" autofocus',
+    },
+  ])('a refused form keeps a title with $name verbatim in the textarea', async (c) => {
+    const res = await createViaForm(userA.client, { title: c.title, ...c.fields });
+    expect(res.status).toBe(422);
+    expect(res.body).toContain(`${TITLE_TEXTAREA}${c.attrs}>\n${c.title}</textarea>`);
+    expect(await countRows(pool, 'tasks')).toBe(0);
+  });
+
+  test.each([
+    ...UNCHANGED_TITLE_CASES.map((c) => ({ ...c, stored: c.title, outcome: 'it exactly' })),
+    {
+      name: 'a changed LF title as CRLF',
+      title: 'Plan\nreview',
+      submitted: 'Plan\r\nreviews',
+      stored: 'Plan\r\nreviews',
+      outcome: 'the title as submitted',
+    },
+  ])('a priority edit sending $name stores $outcome', async (c) => {
+    const task = await insertTask(pool, userA.userId, { title: c.title, priority: 'Low' });
+    expect(task.title).toBe(c.title);
+    // What a browser sends: the edit form's fields, the textarea's line breaks as CRLF.
+    const edited = await postAs(userA, `/tasks/${task.id}/edit`, {
+      ...formFieldsOf(task),
+      title: c.submitted,
+      priority: 'High',
+    });
+    expect(edited.status).toBe(303);
+    expect(edited.location).toBe('/tasks');
+    const after = await storedTask(userA.userId, task.id);
+    expect(after.title).toBe(c.stored);
+    expect(after).toMatchObject({
+      description: task.description,
+      status: task.status,
+      priority: 'High',
+      dueDate: task.dueDate,
+    });
+  });
+
+  test.each(UNCHANGED_TITLE_CASES)(
+    'a refused edit sending $name re-renders the stored title verbatim',
+    async (c) => {
+      const task = await insertTask(pool, userA.userId, { title: c.title });
+      const before = await tasksForOwner(pool, userA.userId);
+      const res = await postAs(userA, `/tasks/${task.id}/edit`, {
+        ...formFieldsOf(task),
+        title: c.submitted,
+        dueDate: '2026-02-30',
+      });
+      expect(res.status).toBe(422);
+      expectFieldError(res, 'dueDate', INVALID_DATE);
+      expect(res.body).not.toContain('id="title-error"');
+      expect(res.body).toContain(
+        `${TITLE_TEXTAREA} aria-describedby="title-hint">\n${c.title}</textarea>`,
+      );
+      expect(await tasksForOwner(pool, userA.userId)).toEqual(before);
+    },
+  );
+});
+
+describe('a missing status or priority takes its default, a blank one is refused', () => {
+  test('a refused form without status or priority preselects To do and Medium', async () => {
+    const res = await createViaForm(userA.client, { title: '' });
+    expect(res.status).toBe(422);
+    expectFieldError(res, 'title', TITLE_REQUIRED);
+    expect(res.body).toMatch(/<option[^>]*value="To do"[^>]*selected/);
+    expect(res.body).toMatch(/<option[^>]*value="Medium"[^>]*selected/);
+    expect(res.body).not.toContain('(invalid)');
+    expect(await countRows(pool, 'tasks')).toBe(0);
+  });
+
+  test('editing a Done task with a blank status is refused and keeps it Done', async () => {
+    const original = await insertTask(pool, userA.userId, {
+      title: 'Finished work',
+      status: 'Done',
+      priority: 'High',
+    });
+    expect(original.completedAt).not.toBeNull();
+    const before = await tasksForOwner(pool, userA.userId);
+
+    clock.advance(STEP_MS);
+    const res = await postAs(userA, `/tasks/${original.id}/edit`, {
+      ...formFieldsOf(original),
+      status: '',
+    });
+    expect(res.status).toBe(422);
+    expectFieldError(res, 'status', INVALID_STATUS);
+    expect(res.body).toMatch(blankSelection('status'));
+    expect(await tasksForOwner(pool, userA.userId)).toEqual(before);
+    const after = await storedTask(userA.userId, original.id);
+    expect(after.status).toBe('Done');
+    expect(after.completedAt).toEqual(original.completedAt);
   });
 });
 

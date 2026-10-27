@@ -102,16 +102,20 @@ export function csrfField(token: string): SafeHtml {
  * An inline validation message for one field, linked from the field through
  * {@link describedBy}. The message is rendered exactly as given (escaped, never reworded).
  *
+ * The paragraph carries `role="alert"`, like the login and report messages, so assistive
+ * technology announces the message when the re-rendered form loads, not only when its field is
+ * reached; the link from the field keeps it in the field's description as well.
+ *
  * @param id - Element id the field's `aria-describedby` refers to.
  * @param message - The validation message, or `undefined` (or `''`) when the field is valid.
- * @returns `<p class="field-error" id="<id>"><message></p>`, or empty markup when there is no
- *   message.
+ * @returns `<p class="field-error" id="<id>" role="alert"><message></p>`, or empty markup when
+ *   there is no message.
  */
 export function fieldError(id: string, message: string | undefined): SafeHtml {
   if (message === undefined || message === '') {
     return html``;
   }
-  return html`<p class="field-error" id="${id}">${message}</p>`;
+  return html`<p class="field-error" id="${id}" role="alert">${message}</p>`;
 }
 
 /**

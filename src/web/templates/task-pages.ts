@@ -10,12 +10,7 @@
 
 import type { AuthenticatedUser } from '../../auth/auth-service';
 import { formatUtcDateTime } from '../../shared/dates';
-import {
-  DEFAULT_PRIORITY,
-  DEFAULT_STATUS,
-  TASK_PRIORITIES,
-  TASK_STATUSES,
-} from '../../shared/task-values';
+import { TASK_PRIORITIES, TASK_STATUSES } from '../../shared/task-values';
 import type { Task, TaskFilters, TaskId } from '../../tasks/types';
 import { filtersToQuery } from '../validation/params';
 import type { TaskFormValues } from '../validation/task-form';
@@ -124,6 +119,58 @@ function hasError(message: string | undefined): message is string {
 /** ` aria-invalid="true"` for a field with an inline message, otherwise nothing. */
 function invalidAttr(message: string | undefined): SafeHtml | false {
   return hasError(message) && html` aria-invalid="true"`;
+}
+
+/** A task-form field; its control's id is the field name itself. */
+type FormField = keyof TaskFormValues;
+
+/** The task form's fields in page order, which is also the order of the error summary. */
+const FORM_FIELDS: readonly FormField[] = ['title', 'description', 'status', 'priority', 'dueDate'];
+
+/** Id of the error summary's heading, which names the summary. */
+const ERROR_SUMMARY_HEADING_ID = 'error-summary-heading';
+
+/** A field of a re-rendered task form that failed validation, with its inline message. */
+interface InvalidField {
+  field: FormField;
+  message: string;
+}
+
+/** The fields of the form that carry an inline message, in page order; empty when none does. */
+function invalidFields(errors: TaskFormPageView['errors']): readonly InvalidField[] {
+  const invalid: InvalidField[] = [];
+  for (const field of FORM_FIELDS) {
+    const message = errors[field];
+    if (hasError(message)) {
+      invalid.push({ field, message });
+    }
+  }
+  return invalid;
+}
+
+/**
+ * The error summary that opens a re-rendered task form: a heading and, in page order, one link
+ * per inline message to its field's control, so the failure is found without moving back through
+ * the form. The links are plain fragment links, which need no script. Nothing is rendered when no
+ * field is invalid.
+ *
+ * It is a labelled section, not a live region: each inline message already carries
+ * `role="alert"`, so announcing the summary as well would read every message twice.
+ */
+function renderErrorSummary(invalid: readonly InvalidField[]): SafeHtml {
+  if (invalid.length === 0) {
+    return html``;
+  }
+  const items = invalid.map(
+    ({ field, message }) => html`
+          <li><a href="#${field}">${message}</a></li>`,
+  );
+  return html`<section class="error-summary" aria-labelledby="${ERROR_SUMMARY_HEADING_ID}">
+        <h2 id="${ERROR_SUMMARY_HEADING_ID}">The task was not saved</h2>
+        <ul>${items}
+        </ul>
+      </section>
+      `;
 }
 
 /** Hidden echoes of the active list filters, read back by the status and delete routes. */
@@ -236,8 +283,30 @@ function editTaskId(view: TaskFormPageView): TaskId {
   return id;
 }
 
+/** CR or LF: the characters a single-line text input strips from its value. */
+const LINE_BREAK = /[\r\n]/;
+
 /**
- * The fields, Save button and Cancel link of the task form.
+ * The title control, `attrs` being its `aria-describedby`, `aria-invalid` and `autofocus`.
+ *
+ * A text input strips CR and LF from its value, so a title holding a line break, which the title
+ * rule accepts, would lose it on the next save, an unrelated edit included. Such a title is
+ * therefore edited in a two-row textarea with the same attributes and no `maxlength`; every other
+ * title keeps the single-line input. Browsers submit each line break of a form as CRLF; on an
+ * edit the server recognises the unchanged title, so its line breaks are kept exactly, and a
+ * changed title is stored as the browser submits it, with CRLF line breaks. The line feed after
+ * `<textarea>` keeps a leading line break, as for the description.
+ */
+function renderTitleControl(title: string, attrs: SafeHtml): SafeHtml {
+  if (LINE_BREAK.test(title)) {
+    return html`<textarea id="title" name="title" required rows="2"${attrs}>\n${title}</textarea>`;
+  }
+  return html`<input type="text" id="title" name="title" required value="${title}"${attrs}>`;
+}
+
+/**
+ * The error summary of a re-rendered form, then the fields, Save button and Cancel link of the
+ * task form.
  *
  * No `maxlength` is set on the title or description: it counts UTF-16 code units, so a valid
  * 200-code-point title holding characters outside the Basic Multilingual Plane would be blocked by
@@ -245,34 +314,43 @@ function editTaskId(view: TaskFormPageView): TaskId {
  */
 function renderTaskFields(view: TaskFormPageView): SafeHtml {
   const { values, errors, csrfToken } = view;
-  const status = values.status === '' ? DEFAULT_STATUS : values.status;
-  const priority = values.priority === '' ? DEFAULT_PRIORITY : values.priority;
+  // Shown as given: a blank status or priority was submitted, so it matches no option and gets the
+  // selected "(invalid)" option beside its message rather than a default.
+  const { status, priority } = values;
+  const invalid = invalidFields(errors);
+  // Only the first invalid control in page order takes `autofocus`: on load the browser focuses
+  // it, scrolls it into view and announces its label with the linked message.
+  const firstInvalid = invalid[0]?.field;
+  const focus = (field: FormField): SafeHtml | false => field === firstInvalid && html` autofocus`;
+  const titleAttrs = html`${describedBy('title-hint', errors.title && 'title-error')}${invalidAttr(
+    errors.title,
+  )}${focus('title')}`;
   // The line feed right after <textarea> is required: the HTML parser drops one leading line feed
   // there, so without it a description that begins with a line break would lose it on each edit.
-  return html`${csrfField(csrfToken)}
+  return html`${renderErrorSummary(invalid)}${csrfField(csrfToken)}
       <label for="title">Title</label>
-      <input type="text" id="title" name="title" required value="${values.title}"${describedBy(
-        'title-hint',
-        errors.title && 'title-error',
-      )}${invalidAttr(errors.title)}>
+      ${renderTitleControl(values.title, titleAttrs)}
       <p class="hint" id="title-hint">Up to 200 characters</p>
       ${fieldError('title-error', errors.title)}
       <label for="description">Description</label>
       <textarea id="description" name="description" rows="6"${describedBy(
         'description-hint',
         errors.description && 'description-error',
-      )}${invalidAttr(errors.description)}>\n${values.description}</textarea>
+      )}${invalidAttr(errors.description)}${focus('description')}>\n${values.description}</textarea>
       <p class="hint" id="description-hint">Up to 5,000 characters</p>
       ${fieldError('description-error', errors.description)}
       <label for="status">Status</label>
       <select id="status" name="status"${describedBy(errors.status && 'status-error')}${invalidAttr(
         errors.status,
-      )}>${selectOptions(STATUS_OPTIONS, status)}</select>
+      )}${focus('status')}>${selectOptions(STATUS_OPTIONS, status)}</select>
       ${fieldError('status-error', errors.status)}
       <label for="priority">Priority</label>
       <select id="priority" name="priority"${describedBy(
         errors.priority && 'priority-error',
-      )}${invalidAttr(errors.priority)}>${selectOptions(PRIORITY_OPTIONS, priority)}</select>
+      )}${invalidAttr(errors.priority)}${focus('priority')}>${selectOptions(
+        PRIORITY_OPTIONS,
+        priority,
+      )}</select>
       ${fieldError('priority-error', errors.priority)}
       <label for="dueDate">Due date</label>
       ${dateInput({
@@ -281,6 +359,7 @@ function renderTaskFields(view: TaskFormPageView): SafeHtml {
         value: values.dueDate,
         describedBy: [errors.dueDate && 'dueDate-error'],
         invalid: hasError(errors.dueDate),
+        autofocus: firstInvalid === 'dueDate',
       })}
       ${fieldError('dueDate-error', errors.dueDate)}
       <button type="submit">Save</button>
@@ -313,10 +392,18 @@ function renderEditExtras(view: TaskFormPageView, id: TaskId): SafeHtml {
  * Renders the new-task or edit-task form page, initially or after a failed submission.
  *
  * Every field keeps the value in `view.values`: text and the description as given (line breaks
- * included); an empty status or priority shows its default (To do, Medium); a status or priority
- * matching no option shows an extra selected "<value> (invalid)" option; a due date that is not a
- * valid date stays visible in a text field. Each message in `view.errors` appears verbatim beside
- * its field, linked through `aria-describedby`, and the field is marked `aria-invalid`.
+ * included); a status or priority matching no option, a blank one included, shows an extra
+ * selected "<value> (invalid)" option; a due date that is not a valid date stays visible in a
+ * text field. Each message in `view.errors` appears verbatim beside its field, linked through
+ * `aria-describedby`, and the field is marked `aria-invalid`.
+ *
+ * When any field is invalid, the form opens with an error summary: a section labelled by its
+ * "The task was not saved" heading that lists every message, in field order (title, description,
+ * status, priority, due date), as a link to its field. The first invalid field in that order
+ * takes `autofocus`, and no other does; a valid form has neither summary nor `autofocus`.
+ *
+ * A title holding a line break (CR or LF) is shown in a two-row textarea rather than the
+ * single-line input, which would strip the line break from it; any other title uses the input.
  *
  * In edit mode the page also shows the created time, the completed time when set (both in UTC),
  * and a separate Delete form, and loads `/static/confirm-delete.js`.

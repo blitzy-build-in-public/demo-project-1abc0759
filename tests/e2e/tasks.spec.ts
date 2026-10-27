@@ -58,6 +58,25 @@ const DUE_DATE_INPUT = /<input\b[^>]*\bname="dueDate"[^>]*>/;
 /** The task form's priority `<select>` up to its options' end, then its closing tag. */
 const PRIORITY_SELECT = /(<select\b[^>]*\bname="priority"[^>]*>[\s\S]*?)(<\/select>)/;
 
+/** The task form's status `<select>` up to its options' end, then its closing tag. */
+const STATUS_SELECT = /(<select\b[^>]*\bname="status"[^>]*>[\s\S]*?)(<\/select>)/;
+
+/**
+ * Titles holding a line break, each with the value its edit-form textarea shows: the HTML parser
+ * turns every CR and CRLF into LF. The last title has exactly 200 code points, the longest
+ * accepted, so the browser's CRLF makes the submitted title 201.
+ */
+const LINE_BREAK_TITLES: readonly { name: string; title: string; shown: string }[] = [
+  { name: 'a CRLF line break', title: 'Plan\r\nreview', shown: 'Plan\nreview' },
+  { name: 'an LF line break', title: 'Plan\nreview', shown: 'Plan\nreview' },
+  { name: 'a CR line break', title: 'Plan\rreview', shown: 'Plan\nreview' },
+  {
+    name: 'an LF line break at 200 code points',
+    title: `${'a'.repeat(100)}\n${'b'.repeat(99)}`,
+    shown: `${'a'.repeat(100)}\n${'b'.repeat(99)}`,
+  },
+];
+
 /**
  * Clicks `control` and returns the response to the `POST` it submits to `path`. The wait is
  * registered before the click, so a fast response cannot be missed. After a redirect the
@@ -173,11 +192,20 @@ function containing(text: string): RegExp {
 }
 
 /**
- * Asserts `message` is shown as `field`'s inline error: visible, part of the field's accessible
- * description (the form links it through `aria-describedby`), and the field marked invalid.
+ * Asserts `message` is shown as `field`'s inline error: visible in the field's own alert, the
+ * element `<field id>-error` (the form's error summary repeats the text as a link), part of the
+ * field's accessible description (the form links it through `aria-describedby`), and the field
+ * marked invalid.
  */
 async function expectInlineError(field: Locator, message: string): Promise<void> {
-  await expect(field.page().getByText(message, { exact: true })).toBeVisible();
+  const id = await field.getAttribute('id');
+  if (id === null) {
+    throw new Error('expectInlineError: the field has no id to find its inline error by');
+  }
+  const inline = field.page().locator(`[id="${id}-error"]`);
+  await expect(inline).toBeVisible();
+  await expect(inline).toHaveText(message);
+  await expect(inline).toHaveRole('alert');
   await expect(field).toHaveAccessibleDescription(containing(message));
   await expect(field).toHaveAttribute('aria-invalid', 'true');
 }
@@ -305,7 +333,7 @@ function defineSharedFlows(deleteFromList: DeleteFromList): void {
     page,
   }) => {
     const { email } = await signUpAndLogIn(page);
-    // Created out of order: the list sorts by due date, undated last, then by creation.
+    // Created out of order: the list sorts by due date, undated last, then by id.
     const tasks: readonly NewTask[] = [
       { title: 'T1', status: 'To do', priority: 'High', dueDate: '2030-03-10' },
       { title: 'T2', status: 'To do', priority: 'High' },
@@ -406,6 +434,11 @@ function defineSharedFlows(deleteFromList: DeleteFromList): void {
     expect(refused.status()).toBe(422);
 
     await expectInlineError(title, 'Title is required.');
+    // The error summary links the message to its field, which the page focused on load.
+    const summary = form.getByRole('region', { name: 'The task was not saved', exact: true });
+    await expect(summary.getByRole('link')).toHaveText(['Title is required.']);
+    await expect(summary.getByRole('link')).toHaveAttribute('href', '#title');
+    await expect(title).toBeFocused();
     await expect(title).toHaveValue('   ');
     // The browser submits the line break as CRLF, and parsing the re-rendered textarea turns it
     // back into the LF of the DOM value.
@@ -415,6 +448,49 @@ function defineSharedFlows(deleteFromList: DeleteFromList): void {
     await expect(dueDate).toHaveValue('2030-05-05');
     expect(await userTasks(email)).toEqual([]);
   });
+
+  for (const c of LINE_BREAK_TITLES) {
+    test(`keeps a title holding ${c.name} through a priority-only edit`, async ({ page }) => {
+      const { email } = await signUpAndLogIn(page);
+      // The new-task form's single-line input cannot take a line break, so the task is created by
+      // a request posting the form's own CSRF token with the page's cookies. Its form encoding
+      // sends each line break unchanged, so the stored title is exactly the original.
+      await page.goto('/tasks/new');
+      const csrf = await page
+        .locator('form[action="/tasks/new"] input[name="_csrf"]')
+        .inputValue();
+      const created = await page.request.post('/tasks/new', {
+        form: { _csrf: csrf, title: c.title },
+        maxRedirects: 0,
+      });
+      expect(created.status()).toBe(303);
+      const { id } = await storedTask(email, c.title);
+
+      await page.goto(`/tasks/${id}/edit`);
+      const form = page.locator(`form[action="/tasks/${id}/edit"]`);
+      const titleField = form.getByLabel('Title', { exact: true });
+      // The title is edited in a textarea, whose DOM value holds each line break as LF; a text
+      // input would have stripped it.
+      await expect(form.locator('textarea[name="title"]')).toHaveCount(1);
+      await expect(form.locator('input[name="title"]')).toHaveCount(0);
+      await expect(titleField).toHaveValue(c.shown);
+      await form.getByLabel('Priority', { exact: true }).selectOption('High');
+      const saved = await clickAndAwaitPost(
+        page,
+        form.getByRole('button', { name: 'Save', exact: true }),
+        `/tasks/${id}/edit`,
+      );
+      // The browser submits every line break as CRLF, whatever the stored title holds.
+      const submitted = new URLSearchParams(saved.request().postData() ?? '').get('title');
+      expect(submitted).toBe(c.shown.replaceAll('\n', '\r\n'));
+      expect(saved.status()).toBe(303);
+      await expectUnfilteredList(page);
+      // The server recognises the unchanged title, so the stored one keeps its line breaks.
+      expect(await userTasks(email)).toEqual([
+        expect.objectContaining({ id, title: c.title, priority: 'High' }),
+      ]);
+    });
+  }
 
   test('limits the title and description in code points, not UTF-16 units', async ({ page }) => {
     // Filling the 5,000-character description is the slow step on a busy host.
@@ -453,6 +529,44 @@ function defineSharedFlows(deleteFromList: DeleteFromList): void {
     const stored = await storedTask(email, emojiTitle);
     expect(stored.description).toBe(description5000);
     expect([...stored.description]).toHaveLength(5000);
+  });
+
+  test('refuses a 5,001-code-point description and keeps it in the form', async ({ page }) => {
+    // Filling the 5,001-character description is the slow step on a busy host.
+    test.setTimeout(60_000);
+    const { email } = await signUpAndLogIn(page);
+    // U+1F600 lies outside the Basic Multilingual Plane: one code point, two UTF-16 units. It has
+    // no line break, which the browser would submit as CRLF and so lengthen by a code point.
+    const description5001 = '\u{1F600}'.repeat(1000) + 'x'.repeat(4001);
+    expect([...description5001]).toHaveLength(5001);
+    expect(description5001).toHaveLength(6001);
+    const titleText = 'Overlong description';
+    await page.goto('/tasks/new');
+    const form = page.locator('form[action="/tasks/new"]');
+    const title = form.getByLabel('Title', { exact: true });
+    const description = form.getByLabel('Description', { exact: true });
+    await title.fill(titleText);
+    await description.fill(description5001);
+    // No `maxlength` may cut the value in the browser: the server sees all 5,001 code points.
+    await expect(description).toHaveValue(description5001);
+    const refused = await clickAndAwaitPost(
+      page,
+      form.getByRole('button', { name: 'Save', exact: true }),
+      '/tasks/new',
+    );
+    expect(refused.status()).toBe(422);
+
+    await expectInlineError(description, 'Description must be at most 5,000 characters.');
+    // The description is the only invalid field, so it alone is listed and it takes the focus.
+    const summary = form.getByRole('region', { name: 'The task was not saved', exact: true });
+    await expect(summary.getByRole('link')).toHaveText([
+      'Description must be at most 5,000 characters.',
+    ]);
+    await expect(summary.getByRole('link')).toHaveAttribute('href', '#description');
+    await expect(description).toBeFocused();
+    await expect(description).toHaveValue(description5001);
+    await expect(title).toHaveValue(titleText);
+    expect(await userTasks(email)).toEqual([]);
   });
 }
 
@@ -616,6 +730,65 @@ test.describe('tasks without JavaScript', () => {
     ]);
     await expectInlineError(priority, 'Choose a valid priority.');
     await expect(title).toHaveValue('Fallback task');
+    expect(await userTasks(email)).toEqual([]);
+  });
+
+  test('keeps an unknown status visible after a failed submission', async ({ page }) => {
+    const { email } = await signUpAndLogIn(page);
+    // The real form offers only the three statuses. Its page is rewritten on the way to the
+    // browser to offer an extra "Blocked" status, as a stale or tampered form would; only GET is
+    // rewritten, so the submission and the 422 page that answers it are the server's own.
+    await page.route('**/tasks/new', async (route) => {
+      if (route.request().method() !== 'GET') {
+        await route.continue();
+        return;
+      }
+      const response = await route.fetch();
+      const body = await response.text();
+      const rewritten = body.replace(STATUS_SELECT, '$1<option value="Blocked">Blocked</option>$2');
+      // A markup change must fail the test rather than leave the page unrewritten.
+      if (rewritten === body) {
+        throw new Error('the new-task page lacks the status select to rewrite');
+      }
+      // The fetched Content-Length no longer fits the body; without it the new length is sent.
+      const headers = Object.fromEntries(
+        Object.entries(response.headers()).filter(([name]) => name !== 'content-length'),
+      );
+      await route.fulfill({ response, body: rewritten, headers });
+    });
+
+    await page.goto('/tasks/new');
+    const form = page.locator('form[action="/tasks/new"]');
+    const title = form.getByLabel('Title', { exact: true });
+    const status = form.getByLabel('Status', { exact: true });
+    const priority = form.getByLabel('Priority', { exact: true });
+    await expect(status.locator('option')).toHaveText(['To do', 'In progress', 'Done', 'Blocked']);
+    await title.fill('Blocked task');
+    await status.selectOption('Blocked');
+    await priority.selectOption('High');
+    const refused = await clickAndAwaitPost(
+      page,
+      form.getByRole('button', { name: 'Save', exact: true }),
+      '/tasks/new',
+    );
+    expect(refused.status()).toBe(422);
+
+    await expect(status).toHaveValue('Blocked');
+    await expect(status.locator('option:checked')).toHaveText('Blocked (invalid)');
+    await expect(status.locator('option')).toHaveText([
+      'To do',
+      'In progress',
+      'Done',
+      'Blocked (invalid)',
+    ]);
+    await expectInlineError(status, 'Choose a valid status.');
+    // The status is the only invalid field, so it alone is listed and it takes the focus.
+    const summary = form.getByRole('region', { name: 'The task was not saved', exact: true });
+    await expect(summary.getByRole('link')).toHaveText(['Choose a valid status.']);
+    await expect(summary.getByRole('link')).toHaveAttribute('href', '#status');
+    await expect(status).toBeFocused();
+    await expect(title).toHaveValue('Blocked task');
+    await expect(priority).toHaveValue('High');
     expect(await userTasks(email)).toEqual([]);
   });
 });

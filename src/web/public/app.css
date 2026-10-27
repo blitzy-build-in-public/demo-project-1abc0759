@@ -127,6 +127,8 @@ textarea {
 }
 
 textarea { min-height: 8rem; resize: vertical; }
+/* A title holding a line break is edited in a textarea; its two rows set its height. */
+textarea#title { min-height: 0; }
 /* The thicker border is a non-colour cue beside the inline message. */
 [aria-invalid="true"] { border-width: 2px; border-color: var(--color-error); }
 
@@ -218,6 +220,22 @@ form[method="get"] label:not(:first-child) { margin-inline-start: 0.75rem; }
 }
 
 .field-error { max-width: var(--field-width); margin-block: 0.25rem 0; padding-block: 0.25rem; }
+
+/* The error summary opening a re-rendered task form. It is not an alert (its field messages are),
+   so it takes the error look by class; its links keep the error colour in every state. */
+.error-summary {
+  max-width: var(--field-width);
+  margin-block: 0 1rem;
+  padding-block: 0.75rem;
+  padding-inline: 1rem;
+  border: 2px solid var(--color-error);
+  border-radius: var(--radius);
+  background: var(--color-error-bg);
+}
+
+.error-summary h2 { margin-block: 0 0.5rem; color: var(--color-error); font-size: 1.125rem; }
+.error-summary ul { margin: 0; padding-inline-start: 1.25rem; }
+.error-summary a { color: var(--color-error); font-weight: 600; }
 
 [role="status"],
 .notice {

@@ -43,23 +43,27 @@ export const DESCRIPTION_TOO_LONG_MESSAGE = 'Description must be at most 5,000 c
 export const INVALID_DATE_MESSAGE = 'Enter a valid date (YYYY-MM-DD).';
 
 /**
- * The task form's fields exactly as submitted, used to re-render the form after a validation
- * failure.
+ * The task form's fields as submitted, used to re-render the form after a validation failure.
  *
- * Values are the raw strings, untrimmed, with `''` for an absent field. The template applies the
- * entered-value rules to them: a `dueDate` that is not a valid date is re-rendered in a text field
- * rather than `type=date` (which a browser would empty), and a `status` or `priority` that matches
- * no option gets an extra selected `<value> (invalid)` option. An empty `status` or `priority`
- * shows the default option.
+ * Values are the raw strings, untrimmed. An absent `title`, `description` or `dueDate` is `''`.
+ * An absent `status` or `priority` holds the default it took (`To do`, `Medium`), so the form
+ * shows that default again; a submitted one is kept as sent, and `''` is a blank submission,
+ * which is invalid. The template applies the entered-value rules to them: a `dueDate` that is not
+ * a valid date is re-rendered in a text field rather than `type=date` (which a browser would
+ * empty), and a `status` or `priority` that matches no option, a blank one included, gets an
+ * extra selected `<value> (invalid)` option.
  */
 export interface TaskFormValues {
-  /** Submitted title, untrimmed. */
+  /**
+   * Submitted title, untrimmed; on an edit, the stored title when the submission is that title
+   * with the CRLF line breaks a browser submits.
+   */
   title: string;
   /** Submitted description, with its line breaks as sent. */
   description: string;
-  /** Submitted status label, or `''`. */
+  /** Submitted status, `''` when sent blank, or `DEFAULT_STATUS` when the field was absent. */
   status: string;
-  /** Submitted priority label, or `''`. */
+  /** Submitted priority, `''` when sent blank, or `DEFAULT_PRIORITY` when the field was absent. */
   priority: string;
   /** Submitted due date text, or `''`. */
   dueDate: string;
@@ -75,37 +79,74 @@ function codePointLength(text: string): number {
   return [...text].length;
 }
 
+/** A line break in any form: CRLF, or a lone CR or LF. */
+const ANY_LINE_BREAK = /\r\n|\r|\n/g;
+
+/**
+ * `text` as a browser submits it from a form control. The HTML Standard's conversion of a form's
+ * entry list to name-value pairs replaces every CR not followed by LF, and every LF not preceded
+ * by CR, with CRLF, so no form can submit a lone CR or LF.
+ */
+function asFormSubmitted(text: string): string {
+  return text.replace(ANY_LINE_BREAK, '\r\n');
+}
+
+/**
+ * The submitted title to validate. A browser cannot send back a lone CR or LF of the stored
+ * title, so a submission equal to the stored title as {@link asFormSubmitted} writes it is the
+ * title left alone, and the stored title is kept. Any other submission is a changed title, taken
+ * exactly as sent.
+ */
+function submittedTitle(raw: string, storedTitle: string | undefined): string {
+  if (storedTitle !== undefined && raw !== storedTitle && raw === asFormSubmitted(storedTitle)) {
+    return storedTitle;
+  }
+  return raw;
+}
+
 /**
  * Validates a submitted task form.
  *
  * Rules, each failure giving its exact inline message:
  * - `title` is trimmed; empty gives {@link TITLE_REQUIRED_MESSAGE}, more than `TITLE_MAX_CHARS`
- *   (200) code points gives {@link TITLE_TOO_LONG_MESSAGE}.
+ *   (200) code points gives {@link TITLE_TOO_LONG_MESSAGE}. On an edit, a submitted title that
+ *   equals `storedTitle` once each of its line breaks is written as CRLF, the form a browser
+ *   submits, is `storedTitle` itself, so an edit that leaves the title alone never alters it.
  * - `description` is optional and not trimmed; more than `DESCRIPTION_MAX_CHARS` (5,000) code
  *   points gives {@link DESCRIPTION_TOO_LONG_MESSAGE}. Browsers submit textarea line breaks as
  *   CRLF, and the CR and the LF each count as one code point, because the description is stored
- *   as submitted.
- * - `status` absent or `''` takes `DEFAULT_STATUS` (`To do`); anything but an exact label gives
- *   {@link INVALID_STATUS_MESSAGE}.
- * - `priority` absent or `''` takes `DEFAULT_PRIORITY` (`Medium`); anything but an exact label
- *   gives {@link INVALID_PRIORITY_MESSAGE}.
+ *   as submitted, on an edit too.
+ * - `status` absent takes `DEFAULT_STATUS` (`To do`); a submitted value that is not an exact
+ *   label, `''` included, gives {@link INVALID_STATUS_MESSAGE}.
+ * - `priority` absent takes `DEFAULT_PRIORITY` (`Medium`); a submitted value that is not an exact
+ *   label, `''` included, gives {@link INVALID_PRIORITY_MESSAGE}.
  * - `dueDate` absent or `''` means no due date; otherwise it must be a real `YYYY-MM-DD` date with
  *   a year from `0001` to `9999`, untrimmed, or it gives {@link INVALID_DATE_MESSAGE}.
  *
  * Other body fields, such as `_csrf`, are ignored.
  *
  * @param body - `req.body` from `express.urlencoded({ extended: false })`, typed as `unknown`.
+ * @param storedTitle - The edited task's stored title; omitted when creating a task. When the
+ *   submitted title differs from it only by line breaks written as CRLF, the stored title is the
+ *   one validated, returned and re-rendered, its line breaks kept exactly. Every title rule and
+ *   the U+0000 check apply to it as to any submitted title.
  * @returns `{ ok: true, value }` with the trimmed title and the other fields as validated, or
- *   `{ ok: false, errors, values }` with every failed field's message and the raw submitted values.
+ *   `{ ok: false, errors, values }` with every failed field's message and the submitted values,
+ *   as {@link TaskFormValues} records them.
  * @throws `BadRequestError` when a field is repeated or otherwise not a single string, or when
  *   the title or description contains U+0000.
  */
-export function parseTaskForm(body: unknown): FormResult<TaskInput, TaskFormValues> {
+export function parseTaskForm(
+  body: unknown,
+  storedTitle?: string,
+): FormResult<TaskInput, TaskFormValues> {
+  // Only a missing status or priority takes the default. A blank one was submitted, so like any
+  // other value that is not an exact label it is invalid, and it is kept for the re-render.
   const values: TaskFormValues = {
-    title: readField(body, 'title') ?? '',
+    title: submittedTitle(readField(body, 'title') ?? '', storedTitle),
     description: readField(body, 'description') ?? '',
-    status: readField(body, 'status') ?? '',
-    priority: readField(body, 'priority') ?? '',
+    status: readField(body, 'status') ?? DEFAULT_STATUS,
+    priority: readField(body, 'priority') ?? DEFAULT_PRIORITY,
     dueDate: readField(body, 'dueDate') ?? '',
   };
   // A malformed request returns 400 and changes no data. PostgreSQL text cannot store U+0000, so
@@ -127,18 +168,14 @@ export function parseTaskForm(body: unknown): FormResult<TaskInput, TaskFormValu
   }
 
   let status: TaskStatus | null = null;
-  if (values.status === '') {
-    status = DEFAULT_STATUS;
-  } else if (isTaskStatus(values.status)) {
+  if (isTaskStatus(values.status)) {
     status = values.status;
   } else {
     errors.status = INVALID_STATUS_MESSAGE;
   }
 
   let priority: TaskPriority | null = null;
-  if (values.priority === '') {
-    priority = DEFAULT_PRIORITY;
-  } else if (isTaskPriority(values.priority)) {
+  if (isTaskPriority(values.priority)) {
     priority = values.priority;
   } else {
     errors.priority = INVALID_PRIORITY_MESSAGE;
