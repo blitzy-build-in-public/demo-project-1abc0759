@@ -48,8 +48,9 @@ const DIGIT_PATTERN = /\p{Nd}/u;
 
 /**
  * Normalises an email address into the account-independent key used for login lockout: the
- * value stored in `login_attempts.email` and passed to `DataAccess.withLoginLock`. Failures are
- * counted per normalised email, whether or not an account exists for it.
+ * value stored in `login_attempts.email`, passed to `DataAccess.withLoginLock`, and the value the
+ * login looks the account up by. Failures are counted per normalised email, whether or not an
+ * account exists for it.
  *
  * @param raw - The email as submitted.
  * @returns The email trimmed and lower-cased.

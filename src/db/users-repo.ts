@@ -73,7 +73,8 @@ export interface UsersRepo {
    * This is the only function that reads the password hash. Only `authService.logIn` may call it,
    * and the returned hash must never reach templates, logs or any shape passed to the web layer.
    *
-   * @param email - The submitted email; compared with `lower(email) = lower($1)`.
+   * @param email - The normalised email `normalizeEmail` produced, the caller's login lockout
+   *   key; compared with `lower(email) = lower($1)`.
    * @returns The id, stored email and bcrypt hash, or `null` when no account has that email.
    * @throws `DatabaseUnavailableError` when the database cannot be reached.
    */

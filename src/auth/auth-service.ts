@@ -29,6 +29,9 @@ export const BCRYPT_COST = 12;
 /** Age after which failed-login rows are deleted by {@link AuthService.purgeExpired}: 24 hours. */
 export const LOGIN_ATTEMPT_RETENTION_MS = 86_400_000;
 
+/** Any character outside ASCII (U+0000 to U+007F). */
+const NON_ASCII_PATTERN = /[^\u0000-\u007f]/;
+
 /**
  * The signed-in user attached to a request once its session has been authenticated.
  *
@@ -173,15 +176,13 @@ export function createAuthService(deps: AuthServiceDeps): AuthService {
   /**
    * The serialised part of a login, run while the login lock for `key` is held.
    *
+   * `key` is the normalised email and the only value the attempt uses: it is the lockout key the
+   * failures are read and recorded under, and the account is looked up by it too.
+   *
    * Every statement goes through `tx`: the top-level repositories run on other pooled
    * connections, outside the locked transaction, which would break the serialisation.
    */
-  async function attemptLogin(
-    tx: TxRepos,
-    key: string,
-    email: string,
-    password: string,
-  ): Promise<LogInResult> {
+  async function attemptLogin(tx: TxRepos, key: string, password: string): Promise<LogInResult> {
     // Taken inside the lock, so the time reflects when the serialised work actually runs.
     const now = clock.now();
 
@@ -192,7 +193,13 @@ export function createAuthService(deps: AuthServiceDeps): AuthService {
       return { ok: false, reason: 'locked' };
     }
 
-    const creds = await tx.users.findCredentialsByEmail(email);
+    // The account is looked up by the lockout key itself, so the lookup and the lockout always
+    // agree on which email an attempt is for. Sign-up accepts ASCII emails only, and outside ASCII
+    // JavaScript's toLowerCase and PostgreSQL's lower() disagree ('İ', U+0130, becomes 'i' plus
+    // U+0307 here but plain 'i' in SQL), so a non-ASCII key is never looked up: a variant spelling
+    // would otherwise reach an account under a fresh lockout key. It takes the no-account path,
+    // compared against the dummy hash and recorded under its own key like any unknown email.
+    const creds = NON_ASCII_PATTERN.test(key) ? null : await tx.users.findCredentialsByEmail(key);
     // A password over the byte limit can never be a stored one, since sign-up rejects it, and
     // bcrypt would silently compare only its first 72 bytes and could accept it. It is treated
     // as wrong, compared against the dummy hash so its timing matches any other failure.
@@ -269,7 +276,7 @@ export function createAuthService(deps: AuthServiceDeps): AuthService {
         return { ok: false, reason: 'invalid' };
       }
       const key = normalizeEmail(input.email);
-      return dal.withLoginLock(key, (tx) => attemptLogin(tx, key, email, input.password));
+      return dal.withLoginLock(key, (tx) => attemptLogin(tx, key, input.password));
     },
 
     async authenticate(sessionToken: string): Promise<AuthenticatedUser | null> {
