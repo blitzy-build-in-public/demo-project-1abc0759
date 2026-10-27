@@ -288,6 +288,14 @@ describe('buildTaskUpdate', () => {
   });
 });
 
+/** The inline task-form messages, written out so the suite does not trust the constants. */
+const TITLE_REQUIRED_TEXT = 'Title is required.';
+const TITLE_TOO_LONG_TEXT = 'Title must be at most 200 characters.';
+const DESCRIPTION_TOO_LONG_TEXT = 'Description must be at most 5,000 characters.';
+const INVALID_DATE_TEXT = 'Enter a valid date (YYYY-MM-DD).';
+const INVALID_STATUS_TEXT = 'Choose a valid status.';
+const INVALID_PRIORITY_TEXT = 'Choose a valid priority.';
+
 /** U+1F600, a character outside the Basic Multilingual Plane: one code point, two UTF-16 units. */
 const ASTRAL = '\u{1F600}';
 
@@ -338,6 +346,39 @@ function expectBadRequest(run: () => unknown): void {
   expect(run).toThrow(BadRequestError);
   expect(run).toThrow(expect.objectContaining({ status: 400, publicMessage: 'Bad request.' }));
 }
+
+describe('task form messages', () => {
+  it.each<{ name: string; actual: string; expected: string }>([
+    {
+      name: 'TITLE_REQUIRED_MESSAGE',
+      actual: TITLE_REQUIRED_MESSAGE,
+      expected: TITLE_REQUIRED_TEXT,
+    },
+    {
+      name: 'TITLE_TOO_LONG_MESSAGE',
+      actual: TITLE_TOO_LONG_MESSAGE,
+      expected: TITLE_TOO_LONG_TEXT,
+    },
+    {
+      name: 'DESCRIPTION_TOO_LONG_MESSAGE',
+      actual: DESCRIPTION_TOO_LONG_MESSAGE,
+      expected: DESCRIPTION_TOO_LONG_TEXT,
+    },
+    { name: 'INVALID_DATE_MESSAGE', actual: INVALID_DATE_MESSAGE, expected: INVALID_DATE_TEXT },
+    {
+      name: 'INVALID_STATUS_MESSAGE',
+      actual: INVALID_STATUS_MESSAGE,
+      expected: INVALID_STATUS_TEXT,
+    },
+    {
+      name: 'INVALID_PRIORITY_MESSAGE',
+      actual: INVALID_PRIORITY_MESSAGE,
+      expected: INVALID_PRIORITY_TEXT,
+    },
+  ])('$name is $expected', ({ actual, expected }) => {
+    expect(actual).toBe(expected);
+  });
+});
 
 describe('parseTaskForm', () => {
   it.each<{ name: string; body: Readonly<Record<string, string | readonly string[]>> }>([
@@ -413,55 +454,55 @@ describe('parseTaskForm', () => {
     {
       name: 'a status containing U+0000',
       body: { title: 'Buy milk', status: 'To\u0000do' },
-      errors: { status: INVALID_STATUS_MESSAGE },
+      errors: { status: INVALID_STATUS_TEXT },
     },
     {
       name: 'a priority containing U+0000',
       body: { title: 'Buy milk', priority: 'Hi\u0000gh' },
-      errors: { priority: INVALID_PRIORITY_MESSAGE },
+      errors: { priority: INVALID_PRIORITY_TEXT },
     },
     {
       name: 'a due date containing U+0000',
       body: { title: 'Buy milk', dueDate: '2026-01-01\u0000' },
-      errors: { dueDate: INVALID_DATE_MESSAGE },
+      errors: { dueDate: INVALID_DATE_TEXT },
     },
     {
       name: 'a title of 201 code points',
       body: { title: TITLE_201 },
-      errors: { title: TITLE_TOO_LONG_MESSAGE },
+      errors: { title: TITLE_TOO_LONG_TEXT },
     },
     {
       name: 'a 201-code-point title holding a CRLF line break, with no stored title',
       body: { title: TITLE_200_LF_SUBMITTED },
-      errors: { title: TITLE_TOO_LONG_MESSAGE },
+      errors: { title: TITLE_TOO_LONG_TEXT },
     },
     {
       name: 'a description of 5,001 code points',
       body: { title: 'Buy milk', description: DESCRIPTION_5001 },
-      errors: { description: DESCRIPTION_TOO_LONG_MESSAGE },
+      errors: { description: DESCRIPTION_TOO_LONG_TEXT },
     },
     {
       name: 'an empty body',
       body: {},
-      errors: { title: TITLE_REQUIRED_MESSAGE },
+      errors: { title: TITLE_REQUIRED_TEXT },
     },
     {
       name: 'a blank status',
       body: { title: 'Buy milk', status: '' },
-      errors: { status: INVALID_STATUS_MESSAGE },
+      errors: { status: INVALID_STATUS_TEXT },
     },
     {
       name: 'a blank priority',
       body: { title: 'Buy milk', priority: '' },
-      errors: { priority: INVALID_PRIORITY_MESSAGE },
+      errors: { priority: INVALID_PRIORITY_TEXT },
     },
     {
       name: 'a blank title, status and priority',
       body: { title: '', status: '', priority: '' },
       errors: {
-        title: TITLE_REQUIRED_MESSAGE,
-        status: INVALID_STATUS_MESSAGE,
-        priority: INVALID_PRIORITY_MESSAGE,
+        title: TITLE_REQUIRED_TEXT,
+        status: INVALID_STATUS_TEXT,
+        priority: INVALID_PRIORITY_TEXT,
       },
     },
   ])('returns only the inline message for $name, with the raw values', ({ body, errors }) => {
@@ -554,7 +595,7 @@ describe('parseTaskForm', () => {
   ])('re-renders the unchanged $name title of a refused edit as stored', (c) => {
     expect(parseTaskForm({ title: c.title, dueDate: '2026-02-30' }, c.storedTitle)).toEqual({
       ok: false,
-      errors: { dueDate: INVALID_DATE_MESSAGE },
+      errors: { dueDate: INVALID_DATE_TEXT },
       values: { ...ABSENT_VALUES, title: c.storedTitle, dueDate: '2026-02-30' },
     });
   });

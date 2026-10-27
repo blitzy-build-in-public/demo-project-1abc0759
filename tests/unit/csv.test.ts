@@ -6,8 +6,9 @@
  * written bare. The file starts with a UTF-8 byte-order mark, the header row is exact, and every
  * record, the header included, ends with CRLF, so an export with no tasks is the byte-order mark,
  * the header and one CRLF. Cells that look like spreadsheet formulas are exported unchanged,
- * because exported values must equal the stored task data. The independent RFC 4180 parser in
- * `tests/helpers/csv-parse.ts` is the oracle for the round trip.
+ * because exported values must equal the stored task data. The round trip parses the built file
+ * with the independent RFC 4180 parser in `tests/helpers/csv-parse.ts` and compares the records
+ * with the fixtures' stored values written out literally, never with the mapper's own output.
  */
 
 import { buildCsv, CSV_HEADER, escapeCsvField, taskToCsvRow } from '../../src/reports/csv';
@@ -197,6 +198,23 @@ describe('taskToCsvRow', () => {
     ]);
   });
 
+  it(
+    'keeps a formula-looking title and a description with CRLF, LF, a comma, quotes and BMP ' +
+      'and astral Unicode exactly as stored, with the missing completion time empty',
+    () => {
+      expect(taskToCsvRow(tricky)).toEqual([
+        '44',
+        '=SUM(A1:A2)',
+        'line1\r\nline2\nline3, with "quotes"\nCafé ☕ \u{1D49C}',
+        'In progress',
+        'Low',
+        '2026-11-01',
+        '2026-10-20T00:00:00.000Z',
+        '',
+      ]);
+    },
+  );
+
   it.each<[string, TaskRecord]>([
     ['done', done],
     ['open', open],
@@ -215,7 +233,35 @@ describe('taskToCsvRow', () => {
 
 describe('round trip through an independent RFC 4180 parser', () => {
   const rows = [done, open, tricky].map((task) => taskToCsvRow(task));
-  const expected = { bom: true, records: [Array.from(CSV_HEADER), ...rows] };
+  // The expected records are the fixtures' stored values written out literally, never the
+  // mapper's output, so a field that taskToCsvRow or buildCsv altered fails the round trip.
+  const expected = {
+    bom: true,
+    records: [
+      Array.from(CSV_HEADER),
+      [
+        '42',
+        'Buy milk, eggs',
+        'He said "now"',
+        'Done',
+        'High',
+        '2026-10-30',
+        '2026-10-21T09:15:30.123Z',
+        '2026-10-22T10:00:00.456Z',
+      ],
+      ['43', 'Plan trip', '', 'To do', 'Medium', '', '2026-10-21T23:59:59.999Z', ''],
+      [
+        '44',
+        '=SUM(A1:A2)',
+        'line1\r\nline2\nline3, with "quotes"\nCafé ☕ \u{1D49C}',
+        'In progress',
+        'Low',
+        '2026-11-01',
+        '2026-10-20T00:00:00.000Z',
+        '',
+      ],
+    ],
+  };
 
   it('parses the text back to the header and the exact stored values', () => {
     expect(parseCsv(buildCsv(rows))).toEqual(expected);

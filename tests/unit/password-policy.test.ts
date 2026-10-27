@@ -18,6 +18,8 @@
  * Assertions compare against the message text itself, not only the exported constants, so a
  * changed constant fails the suite. Every boundary fixture is measured by its own assertion, so
  * a fixture that drifts off its boundary fails instead of silently testing something else.
+ * The space-padded password fixtures change result once trimmed, so a policy that trimmed the
+ * password would fail the suite.
  */
 
 import {
@@ -92,6 +94,15 @@ const ASTRAL_TEN_PASSWORD = SCRIPT_A.repeat(9) + '1';
 
 /** 9 code points held in 17 UTF-16 units, so a `.length` check would wrongly accept it. */
 const ASTRAL_NINE_PASSWORD = SCRIPT_A.repeat(8) + '1';
+
+/** 10 code points ending in 8 spaces: valid only untrimmed, since trimmed it is `a1`. */
+const TRAILING_PADDED_PASSWORD = 'a1' + ' '.repeat(8);
+
+/** 10 code points starting with 8 spaces: valid only untrimmed, since trimmed it is `a1`. */
+const LEADING_PADDED_PASSWORD = ' '.repeat(8) + 'a1';
+
+/** 73 UTF-8 bytes with a space at each end: trimmed it is 71 bytes and would be accepted. */
+const PADDED_OVERLONG_PASSWORD = ' ' + 'a'.repeat(70) + '1' + ' ';
 
 /** A named input for a table-driven case. */
 interface InputCase {
@@ -172,6 +183,12 @@ describe('boundary fixtures', () => {
     expect(ASTRAL_TEN_PASSWORD).toHaveLength(19);
     expect([...ASTRAL_NINE_PASSWORD]).toHaveLength(9);
     expect(ASTRAL_NINE_PASSWORD).toHaveLength(17);
+    expect([...TRAILING_PADDED_PASSWORD]).toHaveLength(10);
+    expect([...TRAILING_PADDED_PASSWORD.trim()]).toHaveLength(2);
+    expect([...LEADING_PADDED_PASSWORD]).toHaveLength(10);
+    expect([...LEADING_PADDED_PASSWORD.trim()]).toHaveLength(2);
+    expect(Buffer.byteLength(PADDED_OVERLONG_PASSWORD, 'utf8')).toBe(73);
+    expect(Buffer.byteLength(PADDED_OVERLONG_PASSWORD.trim(), 'utf8')).toBe(71);
   });
 });
 
@@ -246,6 +263,8 @@ describe('validatePassword', () => {
     { name: '10 astral code points in 19 UTF-16 units', input: ASTRAL_TEN_PASSWORD },
     { name: 'a non-ASCII decimal digit (U+0663)', input: 'abcdefghi\u0663' },
     { name: 'surrounding spaces, which are kept', input: '  abcdefghi1  ' },
+    { name: 'a1 and 8 trailing spaces, kept as 10 code points', input: TRAILING_PADDED_PASSWORD },
+    { name: '8 leading spaces and a1, kept as 10 code points', input: LEADING_PADDED_PASSWORD },
     { name: 'exactly 72 UTF-8 bytes of accented letters', input: MAX_BYTES_ACCENTED_PASSWORD },
     { name: 'exactly 72 ASCII bytes', input: 'a'.repeat(71) + '1' },
   ])('accepts $name', ({ input }) => {
@@ -267,6 +286,10 @@ describe('validatePassword', () => {
   it.each<InputCase>([
     { name: '73 UTF-8 bytes of accented letters', input: OVERLONG_ACCENTED_PASSWORD },
     { name: '73 ASCII bytes', input: 'a'.repeat(72) + '1' },
+    {
+      name: '73 bytes once its two surrounding spaces are kept and counted',
+      input: PADDED_OVERLONG_PASSWORD,
+    },
   ])('rejects $name with the too-long message', ({ input }) => {
     expect(validatePassword(input)).toBe(TOO_LONG_TEXT);
   });
