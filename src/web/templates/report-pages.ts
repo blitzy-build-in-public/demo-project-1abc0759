@@ -72,8 +72,9 @@ const EXPORT_STATUS_OPTIONS: readonly SelectOption[] = [
  * - **Export:** a `GET /reports/export` form with From, To and Status, and the export message
  *   when `exportForm.message` is set.
  *
- * Invalid dates stay visible as text fields and an unknown status as a selected "(invalid)"
- * option, through the shared `dateInput` and `selectOptions` helpers. Every value is escaped.
+ * Invalid dates, blanks included (a range needs both dates), stay visible as text fields and an
+ * unknown status as a selected "(invalid)" option, through the shared `dateInput` and
+ * `selectOptions` helpers. Valid dates stay in date fields. Every value is escaped.
  *
  * @param view - The user, CSRF token, summary, completions result and export form state.
  * @returns The HTML document.
@@ -136,6 +137,7 @@ function completionsSection(completions: ReportsPageView['completions']): SafeHt
     describedBy: described,
     invalid,
     autofocus: invalid,
+    emptyIsValid: false,
   });
   const toInput = dateInput({
     id: 'completions-to',
@@ -143,6 +145,7 @@ function completionsSection(completions: ReportsPageView['completions']): SafeHt
     value: to,
     describedBy: described,
     invalid,
+    emptyIsValid: false,
   });
   const result = completions.ok
     ? completionsData(completions.report)
@@ -230,6 +233,7 @@ function exportSection(form: ReportsPageView['exportForm']): SafeHtml {
     describedBy: dateDescribed,
     invalid: rangeInvalid,
     autofocus: rangeInvalid,
+    emptyIsValid: false,
   });
   const exportTo = dateInput({
     id: 'export-to',
@@ -237,6 +241,7 @@ function exportSection(form: ReportsPageView['exportForm']): SafeHtml {
     value: form.to,
     describedBy: dateDescribed,
     invalid: rangeInvalid,
+    emptyIsValid: false,
   });
   const statusOptions = selectOptions(EXPORT_STATUS_OPTIONS, form.status);
   const messageArea =

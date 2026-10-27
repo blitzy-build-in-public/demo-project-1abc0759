@@ -180,17 +180,27 @@ export interface DateInputOptions {
    * it into view and announces its linked message. At most one field per page may set it.
    */
   autofocus?: boolean;
+  /**
+   * Whether an empty value is a valid entry (default `true`), as for the optional due date, and
+   * so renders as an empty date control. Report range fields pass `false`: a blank there fails
+   * `parseIsoDate` like any other invalid date, so it re-renders as the text field.
+   */
+  emptyIsValid?: boolean;
 }
 
 /**
  * A date field that never loses what the user typed.
  *
- * An empty value or a valid `YYYY-MM-DD` date renders as `<input type="date">`. Any other value
- * renders as `<input type="text" inputmode="numeric" placeholder="YYYY-MM-DD">` holding the
- * submitted string, because a browser sanitises an invalid value in a `type=date` control to
- * empty. No `required`, `min` or `max` is set: the server is the only validator.
+ * A valid `YYYY-MM-DD` date, or an empty value unless `emptyIsValid` is `false`, renders as
+ * `<input type="date">`. Any other value renders as
+ * `<input type="text" inputmode="numeric" placeholder="YYYY-MM-DD">` holding the submitted string,
+ * because a browser sanitises an invalid value in a `type=date` control to empty. The choice
+ * depends on the value alone, never on the `invalid` flag, so a failed date renders as text even
+ * when another control of its form is the one flagged invalid. No `required`, `min` or `max` is
+ * set: the server is the only validator.
  *
- * @param opts - The field's id, name, value, described-by ids, invalid flag and autofocus flag.
+ * @param opts - The field's id, name, value, described-by ids, invalid, autofocus and
+ *   empty-is-valid flags.
  * @returns The `<input>` element.
  */
 export function dateInput(opts: DateInputOptions): SafeHtml {
@@ -199,7 +209,7 @@ export function dateInput(opts: DateInputOptions): SafeHtml {
   const invalid = opts.invalid === true && html` aria-invalid="true"`;
   const autofocus = opts.autofocus === true && html` autofocus`;
   const attrs = html`id="${id}" name="${name}" value="${value}"${described}${invalid}${autofocus}`;
-  if (value !== '' && parseIsoDate(value) === null) {
+  if (parseIsoDate(value) === null && (value !== '' || opts.emptyIsValid === false)) {
     return html`<input type="text" inputmode="numeric" placeholder="YYYY-MM-DD" ${attrs}>`;
   }
   return html`<input type="date" ${attrs}>`;

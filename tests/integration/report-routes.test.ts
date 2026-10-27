@@ -17,6 +17,8 @@
  * sign-up, open no connection and need no database.
  */
 
+import { randomBytes } from 'node:crypto';
+
 import type { Pool } from 'pg';
 
 import type { Queryable } from '../../src/db/query';
@@ -39,8 +41,12 @@ import type { TaskFixture } from '../helpers/test-db';
 /** A task row as the database-truth reader returns it. */
 type StoredTask = Awaited<ReturnType<typeof tasksForOwner>>[number];
 
-/** Password of every account these tests create; it meets the sign-up policy. */
-const PASSWORD = 'ReportsPassw0rd';
+/**
+ * Password of every account these tests create, generated afresh on each run so no secret is
+ * fixed in the source. It meets the sign-up policy: 27 code points and 27 UTF-8 bytes, with the
+ * fixed prefix supplying a letter and the fixed suffix a decimal digit.
+ */
+const PASSWORD = 'Pw' + randomBytes(12).toString('hex') + '9';
 
 /** Milliseconds in one UTC day. */
 const DAY_MS = 86_400_000;
@@ -127,6 +133,20 @@ interface CompletionTruthRow {
   n: number;
 }
 
+/**
+ * How a report date input renders: `date` is the date control, and `text` is the text field
+ * that holds an entered value a date control would sanitise to empty (plan 0.5.5).
+ */
+type DateField = 'date' | 'text';
+
+/** A rejected completions range: its query, its message and how From and To re-render. */
+interface RangeFailureCase {
+  query: string;
+  message: string;
+  /** The rendering of the From and To inputs, in that order. */
+  fields: readonly [DateField, DateField];
+}
+
 /** Open-task counts straight from the table; `$2` is today's UTC date. */
 const SUMMARY_TRUTH_SQL = `
   SELECT
@@ -193,6 +213,42 @@ function completionRows(body: string): DayRow[] {
     rows.push({ day, count: Number(count) });
   }
   return rows;
+}
+
+/** Reads the `value` of the `<input>` carrying `id="<id>"`, whatever its attribute order. */
+function inputValue(body: string, id: string): string {
+  const tag = new RegExp(`<input\\b(?=[^>]*\\sid="${id}")[^>]*\\svalue="([^"]*)"`);
+  const value = tag.exec(body)?.[1];
+  if (value === undefined) {
+    throw new Error(`input "${id}" with a value not found on the page`);
+  }
+  return value;
+}
+
+/** Returns the whole `<input ...>` tag carrying `id="<id>"`, whatever its attribute order. */
+function inputTag(body: string, id: string): string {
+  const tag = new RegExp(`<input\\b(?=[^>]*\\sid="${id}")[^>]*>`).exec(body)?.[0];
+  if (tag === undefined) {
+    throw new Error(`input "${id}" not found on the page`);
+  }
+  return tag;
+}
+
+/**
+ * Asserts that the `<input>` carrying `id="<id>"` renders as `field`: a `type="date"` control
+ * without the fallback's attributes, or a `type="text"` field with `inputmode="numeric"` and
+ * `placeholder="YYYY-MM-DD"`.
+ */
+function expectDateField(body: string, id: string, field: DateField): void {
+  const tag = inputTag(body, id);
+  expect(tag).toMatch(new RegExp(`\\stype="${field}"`));
+  if (field === 'text') {
+    expect(tag).toMatch(/\sinputmode="numeric"/);
+    expect(tag).toMatch(/\splaceholder="YYYY-MM-DD"/);
+  } else {
+    expect(tag).not.toMatch(/\sinputmode=/);
+    expect(tag).not.toMatch(/\splaceholder=/);
+  }
 }
 
 /**
@@ -285,8 +341,11 @@ describe('report routes', () => {
   });
 
   afterAll(async () => {
-    await app.close();
-    await pool.end();
+    try {
+      await app.close();
+    } finally {
+      await pool.end();
+    }
   });
 
   /** Logs `email` in on `client` through the login form, landing on `/tasks`. */
@@ -476,20 +535,25 @@ describe('report routes', () => {
       expect(body).not.toContain(NO_COMPLETIONS);
     });
 
-    it.each(['/reports', '/reports?from=&to='])(
-      'GET %s uses the default range: the 30 days ending today (UTC)',
-      async (path) => {
-        await seed(a.userId, COMPLETIONS_MIX);
+    it('GET /reports uses the default range: the 30 days ending today (UTC)', async () => {
+      await seed(a.userId, COMPLETIONS_MIX);
 
-        const rows = completionRows(await getPage(a.client, path, 200));
+      const body = await getPage(a.client, '/reports', 200);
+      const rows = completionRows(body);
 
-        expect(rows).toHaveLength(30);
-        expect(rows[0]?.day).toBe('2026-09-22');
-        expect(rows[29]?.day).toBe('2026-10-21');
-        expect(rows).toEqual(await completionsTruth(a.userId, '2026-09-22', '2026-10-21'));
-        expect(rows.reduce((sum, row) => sum + row.count, 0)).toBe(7);
-      },
-    );
+      expect(rows).toHaveLength(30);
+      expect(rows[0]?.day).toBe('2026-09-22');
+      expect(rows[29]?.day).toBe('2026-10-21');
+      expect(rows).toEqual(await completionsTruth(a.userId, '2026-09-22', '2026-10-21'));
+      expect(rows.reduce((sum, row) => sum + row.count, 0)).toBe(7);
+      // Both forms are prefilled with the default range, whose real dates stay date controls.
+      for (const prefix of ['completions', 'export']) {
+        expect(inputValue(body, `${prefix}-from`)).toBe('2026-09-22');
+        expect(inputValue(body, `${prefix}-to`)).toBe('2026-10-21');
+        expectDateField(body, `${prefix}-from`, 'date');
+        expectDateField(body, `${prefix}-to`, 'date');
+      }
+    });
 
     it('shows zero rows and the empty-period message when nothing was completed', async () => {
       await seed(a.userId, COMPLETIONS_MIX);
@@ -508,21 +572,37 @@ describe('report routes', () => {
   });
 
   describe('range validation (FR-14)', () => {
-    it.each([
-      { query: 'from=2026-10-21&to=2026-10-01', message: START_AFTER_END },
-      { query: 'from=2025-01-01&to=2026-01-02', message: RANGE_TOO_LONG },
-      { query: 'from=2026-10-01', message: INVALID_DATES },
-      { query: 'to=2026-10-21', message: INVALID_DATES },
-      { query: 'from=2026-10-01&to=', message: INVALID_DATES },
-      { query: 'from=2026-02-30&to=2026-03-01', message: INVALID_DATES },
+    // `fields` gives how From and To re-render: a real date stays a date control, while a blank,
+    // unsent or impossible date fails and so becomes the text field holding what was entered.
+    it.each<RangeFailureCase>([
+      {
+        query: 'from=2026-10-21&to=2026-10-01',
+        message: START_AFTER_END,
+        fields: ['date', 'date'],
+      },
+      { query: 'from=2025-01-01&to=2026-01-02', message: RANGE_TOO_LONG, fields: ['date', 'date'] },
+      { query: 'from=2026-10-01', message: INVALID_DATES, fields: ['date', 'text'] },
+      { query: 'to=2026-10-21', message: INVALID_DATES, fields: ['text', 'date'] },
+      { query: 'from=2026-10-01&to=', message: INVALID_DATES, fields: ['date', 'text'] },
+      { query: 'from=2026-02-30&to=2026-03-01', message: INVALID_DATES, fields: ['text', 'date'] },
+      // Blank dates are supplied values, so they fail rather than select the default range.
+      { query: 'from=&to=', message: INVALID_DATES, fields: ['text', 'text'] },
+      { query: 'from=', message: INVALID_DATES, fields: ['text', 'text'] },
+      { query: 'to=', message: INVALID_DATES, fields: ['text', 'text'] },
     ])(
       'GET /reports?$query answers 422 "$message" with the summary and no data',
-      async ({ query, message }) => {
+      async ({ query, message, fields: [fromField, toField] }) => {
         await seed(a.userId, [openTask('Still counted', 'To do', 'High', null)]);
 
         const body = await getPage(a.client, `/reports?${query}`, 422);
 
         expect(body).toContain(message);
+        // The range form keeps the dates as entered, a blank or unsent one as an empty field.
+        const entered = new URLSearchParams(query);
+        expect(inputValue(body, 'completions-from')).toBe(entered.get('from') ?? '');
+        expect(inputValue(body, 'completions-to')).toBe(entered.get('to') ?? '');
+        expectDateField(body, 'completions-from', fromField);
+        expectDateField(body, 'completions-to', toField);
         expect(body).toContain('data-testid="open-todo"');
         expect(summaryCounts(body)).toEqual({ ...ZERO_SUMMARY, 'open-todo': 1, 'open-high': 1 });
         expect(body).not.toContain('id="completions-table"');
@@ -674,6 +754,21 @@ describe('report routes', () => {
       expect(res.body).toBe(HEADER_ONLY_EXPORT);
     });
 
+    it('exports the default range when neither date is sent', async () => {
+      await seed(a.userId, EXPORT_MIX);
+
+      const res = await a.client.get('/reports/export');
+
+      expect(res.status).toBe(200);
+      expect(res.headers.get('content-disposition')).toBe(
+        'attachment; filename="tasks-2026-09-22-to-2026-10-21.csv"',
+      );
+      const stored = await tasksForOwner(pool, a.userId);
+      const data = parseCsv(res.bytes).records.slice(1);
+      expect(data).toEqual(expectedCsvRecords(stored, '2026-09-22', '2026-10-21', null));
+      expect(data).toHaveLength(6);
+    });
+
     it('answers an invalid range with the 422 reports page and no file', async () => {
       await seed(a.userId, [openTask('Open and undated', 'In progress', 'Low', null)]);
 
@@ -692,6 +787,50 @@ describe('report routes', () => {
       expect(completionRows(res.body).map((row) => row.day)).toEqual(
         expectedDays('2026-09-22', '2026-10-21'),
       );
+    });
+
+    // Blank dates are supplied values, so they fail rather than export the default range.
+    it.each(['from=&to=&status=', 'from=&status=', 'to=&status='])(
+      'GET /reports/export?%s answers 422 with the blanks kept and no file',
+      async (query) => {
+        await seed(a.userId, [openTask('Open and undated', 'In progress', 'Low', null)]);
+
+        const res = await a.client.get(`/reports/export?${query}`);
+
+        expect(res.status).toBe(422);
+        expect(res.headers.get('content-type')).toMatch(/^text\/html/);
+        expect(res.headers.get('content-disposition')).toBeNull();
+        expect(res.body).toContain(INVALID_DATES);
+        expect(summaryCounts(res.body)).toEqual({
+          ...ZERO_SUMMARY,
+          'open-in-progress': 1,
+          'open-low': 1,
+        });
+        expect(completionRows(res.body).map((row) => row.day)).toEqual(
+          expectedDays('2026-09-22', '2026-10-21'),
+        );
+        expect(inputValue(res.body, 'export-from')).toBe('');
+        expect(inputValue(res.body, 'export-to')).toBe('');
+        expectDateField(res.body, 'export-from', 'text');
+        expectDateField(res.body, 'export-to', 'text');
+      },
+    );
+
+    it('answers blank dates and an unknown status with the range message and no file', async () => {
+      const res = await a.client.get('/reports/export?from=&to=&status=Urgent');
+
+      expect(res.status).toBe(422);
+      expect(res.headers.get('content-type')).toMatch(/^text\/html/);
+      expect(res.headers.get('content-disposition')).toBeNull();
+      // The range is checked first, so its message is the one shown.
+      expect(res.body).toContain(INVALID_DATES);
+      expect(res.body).not.toContain(INVALID_STATUS);
+      expect(res.body).toContain('<option value="Urgent" selected>Urgent (invalid)</option>');
+      // The select carries the invalid flag, yet the blanks failed too and stay text fields.
+      expect(inputValue(res.body, 'export-from')).toBe('');
+      expect(inputValue(res.body, 'export-to')).toBe('');
+      expectDateField(res.body, 'export-from', 'text');
+      expectDateField(res.body, 'export-to', 'text');
     });
 
     it('answers an unknown status with 422 "Choose a valid status." and no file', async () => {

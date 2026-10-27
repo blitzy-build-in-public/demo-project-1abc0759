@@ -2,10 +2,11 @@
  * Unit tests of the report date-range rules, the zero-filled completions report and the UTC date
  * helpers they rest on (pure functions, no database and no clock).
  *
- * Report ranges are inclusive at both ends and span at most 366 days. A value is absent when it is
- * `undefined` or `''`, and the default range (today − 29 to today) applies only when both are
- * absent. Years `0001` and `9999` are the limits of `IsoDate`, so ranges at either end must be
- * accepted and listed day by day without ever computing a date outside them.
+ * Report ranges are inclusive at both ends and span at most 366 days. A value is absent only when
+ * it is `undefined`; `''` is a supplied value that fails to parse. The default range (today − 29
+ * to today) applies only when both are absent. Years `0001` and `9999` are the limits of
+ * `IsoDate`, so ranges at either end must be accepted and listed day by day without ever computing
+ * a date outside them.
  */
 
 import { zeroFillCompletions } from '../../src/reports/completions';
@@ -76,17 +77,26 @@ describe('defaultRange', () => {
 });
 
 describe('parseDateRange', () => {
-  test.each<{ name: string; input: RangeInput }>([
-    { name: 'both values are absent', input: {} },
-    {
-      name: 'both values are empty, as an emptied GET form submits them',
-      input: { from: '', to: '' },
-    },
-  ])('uses the default range when $name', ({ input }) => {
-    expect(parseDateRange(input, TODAY)).toEqual({ ok: true, range: DEFAULT_FOR_TODAY });
+  test('uses the default range when both values are absent', () => {
+    expect(parseDateRange({}, TODAY)).toEqual({ ok: true, range: DEFAULT_FOR_TODAY });
   });
 
   test.each<{ name: string; input: RangeInput; message: string }>([
+    {
+      name: 'both values empty, as an emptied GET form submits them',
+      input: { from: '', to: '' },
+      message: 'Enter valid start and end dates.',
+    },
+    {
+      name: 'only an empty start date supplied',
+      input: { from: '' },
+      message: 'Enter valid start and end dates.',
+    },
+    {
+      name: 'only an empty end date supplied',
+      input: { to: '' },
+      message: 'Enter valid start and end dates.',
+    },
     {
       name: 'only the start date supplied',
       input: { from: '2026-10-01' },

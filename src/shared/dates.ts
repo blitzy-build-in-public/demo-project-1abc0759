@@ -113,8 +113,8 @@ function inclusiveCount(from: DateParts, to: DateParts): number {
  *
  * The value must be exactly `YYYY-MM-DD` with no surrounding whitespace, a year from `0001` to
  * `9999`, a month from `01` to `12` and a day that exists in that month, Gregorian leap years
- * included (`2024-02-29` is accepted, `2026-02-29` and `1900-02-29` are rejected). Callers treat an
- * empty value as absent before calling.
+ * included (`2024-02-29` is accepted, `2026-02-29` and `1900-02-29` are rejected). An empty value
+ * is rejected; a caller for which it means absent, such as the optional due date, checks first.
  *
  * @param raw - The submitted text.
  * @returns The input unchanged, which is already canonical, or `null` when it is not a valid date.

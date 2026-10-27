@@ -42,29 +42,22 @@ export function defaultRange(today: IsoDate): DateRange {
 }
 
 /**
- * Returns a submitted value, or `null` when it was not supplied.
- *
- * An emptied `type=date` field in a GET form still submits its name with an empty value, so `''`
- * means "not supplied" exactly as a missing parameter does. Values are not trimmed: any other text
- * goes to the strict {@link parseIsoDate}.
- */
-function suppliedValue(raw: string | undefined): string | null {
-  return raw === undefined || raw === '' ? null : raw;
-}
-
-/**
  * Validates a report range submitted as `from` and `to` query values.
  *
+ * A value is absent only when it is `undefined`, meaning the parameter was not sent. Any string
+ * sent, the empty string included, is a supplied value and must parse.
+ *
  * Rules, applied in order:
- * - neither value supplied (`undefined` or `''`): the {@link defaultRange} for `today`;
- * - only one supplied, or either not a valid `YYYY-MM-DD` date: "Enter valid start and end dates.";
+ * - both values absent: the {@link defaultRange} for `today`;
+ * - only one absent, or either not a valid `YYYY-MM-DD` date (`''` included): "Enter valid start
+ *   and end dates.";
  * - `from` after `to`: "Start date must be on or before end date." Equal dates are a one-day range;
  * - more than {@link MAX_RANGE_DAYS} inclusive days: "Date range cannot be longer than 366 days."
  *
  * Both ends are inclusive, and dates after `today` are allowed: `today` is used only for the
- * default range.
+ * default range. Values are not trimmed: they go to the strict {@link parseIsoDate} as sent.
  *
- * @param input - The raw `from` and `to` values, each a string or absent.
+ * @param input - The raw `from` and `to` values, each a string or `undefined` when absent.
  * @param today - The current UTC day.
  * @returns The accepted range, or the message for the first rule that failed.
  * @throws RangeError only from {@link defaultRange}, when `today` is not a valid {@link IsoDate}.
@@ -73,17 +66,17 @@ export function parseDateRange(
   input: { from?: string; to?: string },
   today: IsoDate,
 ): DateRangeResult {
-  const rawFrom = suppliedValue(input.from);
-  const rawTo = suppliedValue(input.to);
-  if (rawFrom === null && rawTo === null) {
+  // Range dates are both or neither: only a request sending neither gets the default. An emptied
+  // `type=date` field still submits `''`, which counts as supplied and so must parse.
+  if (input.from === undefined && input.to === undefined) {
     return { ok: true, range: defaultRange(today) };
   }
-  if (rawFrom === null || rawTo === null) {
+  if (input.from === undefined || input.to === undefined) {
     return { ok: false, message: INVALID_DATES_MESSAGE };
   }
 
-  const from = parseIsoDate(rawFrom);
-  const to = parseIsoDate(rawTo);
+  const from = parseIsoDate(input.from);
+  const to = parseIsoDate(input.to);
   if (from === null || to === null) {
     return { ok: false, message: INVALID_DATES_MESSAGE };
   }
