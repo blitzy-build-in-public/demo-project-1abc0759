@@ -11,7 +11,9 @@
  *
  * The configuration is never logged, whole or in part: `DATABASE_URL` carries the database
  * password and `SESSION_SECRET` is a secret. Once it is read, every component logs through one
- * logger that also redacts the database user name and password from driver error text.
+ * logger that also redacts the database user name and password, where each stands as the
+ * credential, from driver error text, and the driver's `PG*` variables are deleted, so that
+ * `DATABASE_URL` alone decides how the pool connects.
  */
 
 import http from 'node:http';
@@ -20,7 +22,7 @@ import type { Socket } from 'node:net';
 
 import { createApp } from './app';
 import { createAuthService } from './auth/auth-service';
-import { ConfigError, databaseCredentials, loadConfig } from './config';
+import { ConfigError, databaseCredentials, loadConfig, removePgVariables } from './config';
 import type { AppConfig } from './config';
 import { createDataAccess } from './db/data-access';
 import { runMigrations } from './db/migrate';
@@ -349,7 +351,9 @@ function fixThreadPoolSize(env: NodeJS.ProcessEnv): void {
  * 2. Parses the environment with `loadConfig(process.env)`. An invalid variable logs the fixed
  *    configuration message alone, with no error object, and sets exit code 1.
  * 3. Creates the logger every later step and component uses, which replaces the user name and
- *    password of `DATABASE_URL` by `[redacted]` in each logged error's message and stack, then the
+ *    password of `DATABASE_URL`, where each stands as the credential, by `[redacted]` in each
+ *    logged error's message and stack. Then it deletes every `PG*` variable from `process.env`,
+ *    so the driver takes no connection setting from anything but `DATABASE_URL`, and creates the
  *    pool, which opens no connection yet.
  * 4. Applies every pending migration; the runner logs `migrations applied`. A failure, including
  *    an unreachable database, logs `migration failed`, ends the pool and sets exit code 1, so the
@@ -400,11 +404,15 @@ export async function main(): Promise<void> {
       return;
     }
 
-    // Every later line goes through a logger that redacts the database user name, which can be
-    // an email address, and password from driver error text, since PostgreSQL quotes the user
-    // name in its own messages. The pool, the runner, the application and the purge job log
-    // through it too.
+    // Every later line goes through a logger that redacts the database password and user name,
+    // which can be an email address, from driver error text, since PostgreSQL quotes the user
+    // name in its own messages. Each is redacted only as the credential, so a path, a module or
+    // a database name holding the same characters stays readable. The pool, the runner, the
+    // application and the purge job log through it too.
     logger = createLogger(process.stdout, { redact: databaseCredentials(config.databaseUrl) });
+    // The driver would otherwise take connection settings from any `PG*` variable, so
+    // `DATABASE_URL` alone decides where and how every connection goes.
+    removePgVariables(process.env);
     pool = createPool(config.databaseUrl, logger);
 
     try {

@@ -17,12 +17,15 @@
  * reduced to strings and finite numbers, and a line that cannot be serialized is replaced by a
  * reduced one.
  *
- * A logger can also be given values to redact ({@link LoggerOptions}): the process entry points
- * pass the database user name and password, because PostgreSQL quotes the user name, which can
- * be an email address, in its own messages, for example
- * `password authentication failed for user "…"` (SQLSTATE 28P01). Every occurrence is replaced by
+ * A logger can also be given credentials to redact ({@link LoggerOptions}): the process entry
+ * points pass the database user name and password, because PostgreSQL quotes the user name,
+ * which can be an email address, in its own messages, for example
+ * `password authentication failed for user "…"` (SQLSTATE 28P01). They are replaced by
  * `[redacted]` in a logged error's message and stack, the only parts of a line that carry driver
- * text, before the line is serialized, so a JSON string escape can never hide one. Everything
+ * text, before the line is serialized, so a JSON string escape can never hide one. Each is
+ * replaced only where it stands as the credential: a user name in a URL, a quoted role or a
+ * `user=` setting, and a password in a URL or a password setting, so the same characters in a
+ * file path, a database name or a word stay readable ({@link RedactedCredentials}). Everything
  * else is written as given.
  */
 
@@ -76,17 +79,47 @@ const REDACTED = '[redacted]';
 /** `err.message` when redacting it failed, so that the unredacted text is never written. */
 const UNREDACTABLE_MESSAGE = '[unredactable message]';
 
+/**
+ * Database credentials a logger replaces by `[redacted]` in a logged error's `message` and
+ * `stack`. Empty strings are ignored, and with none left every line is written exactly as
+ * without them.
+ */
+export interface RedactedCredentials {
+  /**
+   * Role names, each replaced only where it stands as the credential, so the same characters
+   * elsewhere, in a file path, a database name or ordinary words, are kept:
+   * - the user-info part of a URL, `//<name>:` or `//<name>@`;
+   * - PostgreSQL's quoted role, `user "<name>"` or `role "<name>"`, where the quotes hold
+   *   exactly the name;
+   * - a `user=<name>` setting, the value optionally in quotes, ending at a quote, whitespace,
+   *   `&`, `,`, `;`, `)` or the end of the text.
+   */
+  userNames?: readonly string[];
+  /**
+   * Passwords, each replaced only where it stands as the credential, so the same characters
+   * elsewhere, in a file path, a module name or ordinary words, are kept (a password `index`
+   * leaves `pg-pool/index.js` intact, and a password `password` leaves
+   * `client password must be a string` intact):
+   * - the user-info part of a URL, between `:` and `@`, as in `//<user>:<password>@`;
+   * - the whole value of a password setting, `password=<password>`, `password: <password>`,
+   *   `"password":"<password>"` or `PASSWORD '<password>'`, the key in lower, upper or
+   *   capitalised case and the value optionally in quotes, ending at a quote, whitespace, `&`,
+   *   `,`, `;`, `)`, `}` or the end of the text. The key followed by a space and an unquoted
+   *   word, as in `password authentication failed`, is not a setting.
+   */
+  passwords?: readonly string[];
+}
+
 /** Options of {@link createLogger}. */
 export interface LoggerOptions {
   /**
-   * Values to replace by `[redacted]` wherever they occur in a logged error's `message` and
-   * `stack`, such as the database user name and password. Empty strings are ignored, and with
-   * none left every line is written exactly as without this option. Nothing else in a line is
-   * redacted: `time`, `level`, `msg`, the fields and the error's `name` and `code` are values the
-   * code produces, and rewriting them would corrupt the line whenever a credential equals one of
-   * them, such as a user named `error` or a password of `28P01`.
+   * Credentials to redact from a logged error's `message` and `stack`, such as the database
+   * user name and password. Nothing else in a line is redacted: `time`, `level`, `msg`, the
+   * fields and the error's `name` and `code` are values the code produces, and rewriting them
+   * would corrupt the line whenever a credential equals one of them, such as a user named
+   * `error` or a password of `28P01`.
    */
-  redact?: readonly string[];
+  redact?: RedactedCredentials;
 }
 
 /**
@@ -176,21 +209,81 @@ function serializeError(err: unknown): SerializedError {
   };
 }
 
+/** Returns `value` escaped, so that a pattern matches it only as literal text. */
+function escapePattern(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 /**
- * Builds one pattern matching any of `values`, or returns `null` when no non-empty value is
- * given. Each value is escaped, so it matches only as literal text. The alternatives are the
- * distinct values longest first, so a value that contains another is replaced whole rather than
- * in part, and a single pass never matches inside a {@link REDACTED} marker it has just written.
+ * The text before a password setting's value: the key in lower, upper or capitalised case, then
+ * either `=` or `:` with optional quotes and spaces around them (`password=`, `password: `,
+ * `"password":"`), or spaces and the single quote that opens an SQL string (`PASSWORD '`).
+ * Spaces and an unquoted word are not a setting, so `password authentication failed` holds no
+ * value, and nor is a double-quoted word, which in SQL names an identifier, never a value.
  */
-function redactionPattern(values: readonly string[]): RegExp | null {
-  const distinct = [...new Set(values)]
-    .filter((value) => typeof value === 'string' && value !== '')
-    .sort((a, b) => b.length - a.length);
-  if (distinct.length === 0) {
+const PASSWORD_SETTING_PREFIX = `(?:password|PASSWORD|Password)(?:['"]?\\s*[=:]\\s*['"]?|\\s+')`;
+
+/**
+ * The patterns of a password standing as the credential: the user-info part of a URL, between
+ * `:` and `@`, and the whole value of a password setting (see {@link PASSWORD_SETTING_PREFIX}),
+ * ending at a quote, whitespace, `&`, `,`, `;`, `)`, `}` or the end of the text. Only these
+ * contexts match, because neither the driver nor PostgreSQL echoes a password anywhere else,
+ * while a short or common password is often an ordinary word or file name (`index`, `app`,
+ * `password`), and replacing it everywhere would garble every stack path and message holding it.
+ */
+function passwordPatterns(password: string): string[] {
+  const value = escapePattern(password);
+  return [
+    `(?<=:)${value}(?=@)`,
+    `(?<=${PASSWORD_SETTING_PREFIX})${value}(?=['"\\s&,;)}]|$)`,
+  ];
+}
+
+/**
+ * The patterns of a user name standing as the credential: a URL's user-info part, PostgreSQL's
+ * quoted role in its English messages, and a `user=` setting. Only these contexts match, because
+ * a role name is often an ordinary word that also names the database, a directory or a module
+ * (`app`, `tasktracker`), and replacing it everywhere would make paths and names unreadable.
+ */
+function userNamePatterns(userName: string): string[] {
+  const name = escapePattern(userName);
+  return [
+    `(?<=\\/\\/)${name}(?=[:@])`,
+    `(?<=\\b(?:user|role) ")${name}(?=")`,
+    `(?<=\\buser=['"]?)${name}(?=['"\\s&,;)]|$)`,
+  ];
+}
+
+/** Returns the distinct non-empty strings of `values`, which a caller that casts may not hold. */
+function distinctValues(values: readonly string[] | undefined): string[] {
+  return [...new Set(values ?? [])].filter((value) => typeof value === 'string' && value !== '');
+}
+
+/**
+ * Builds one pattern matching every password and every user name where it stands as the
+ * credential (see {@link RedactedCredentials}), or returns `null` when no non-empty value is
+ * given. Each value is escaped, so it matches only as literal text. The alternatives are ordered
+ * by their value's length, longest first, so a value that contains another is replaced whole
+ * rather than in part, and a single pass never matches inside a {@link REDACTED} marker it has
+ * just written.
+ */
+function redactionPattern(credentials: RedactedCredentials): RegExp | null {
+  const alternatives: { length: number; source: string }[] = [];
+  for (const password of distinctValues(credentials.passwords)) {
+    for (const source of passwordPatterns(password)) {
+      alternatives.push({ length: password.length, source });
+    }
+  }
+  for (const userName of distinctValues(credentials.userNames)) {
+    for (const source of userNamePatterns(userName)) {
+      alternatives.push({ length: userName.length, source });
+    }
+  }
+  if (alternatives.length === 0) {
     return null;
   }
-  const alternatives = distinct.map((value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
-  return new RegExp(alternatives.join('|'), 'g');
+  alternatives.sort((a, b) => b.length - a.length);
+  return new RegExp(alternatives.map((alternative) => alternative.source).join('|'), 'gu');
 }
 
 /**
@@ -279,7 +372,7 @@ function serializeEntry(entry: Record<string, unknown>): string {
  * Creates a logger that writes one JSON line per call to `out`.
  *
  * @param out Destination stream; defaults to the process's standard output.
- * @param options Values to redact from logged errors' message and stack; none by default.
+ * @param options Credentials to redact from logged errors' message and stack; none by default.
  * @returns A {@link Logger} whose methods write synchronously and never buffer or filter.
  */
 export function createLogger(
@@ -287,7 +380,7 @@ export function createLogger(
   options: LoggerOptions = {},
 ): Logger {
   // Built once, so every line is redacted by the same pattern; `null` leaves lines unchanged.
-  const pattern = redactionPattern(options.redact ?? []);
+  const pattern = redactionPattern(options.redact ?? {});
   // Serialization is guarded; `out.write` is not, so stream failures surface as the stream
   // reports them.
   const writeLine = (entry: Record<string, unknown>): void => {

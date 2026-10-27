@@ -71,7 +71,8 @@ export class CsrfError extends HttpError {
 /**
  * The database could not be reached: a network failure (`ECONNREFUSED`, `ECONNRESET`, `ENOTFOUND`,
  * `ETIMEDOUT`, `EAI_AGAIN`), SQLSTATE class `08`, `57P01`–`57P03` or `53300`, a pool connection
- * timeout, a terminated connection, or a statement pg refuses because its client's connection is
+ * timeout, a terminated connection, a statement the server left unanswered past the pool's query
+ * timeout ("Query read timeout"), or a statement pg refuses because its client's connection is
  * already gone ("not queryable").
  *
  * Raised by the data-access layer with the driver error kept as `cause`, so the logger can record

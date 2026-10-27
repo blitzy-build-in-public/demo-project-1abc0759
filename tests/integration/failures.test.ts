@@ -13,7 +13,8 @@
  *   a reachable database purges and logs its counts, and a run never overlaps another.
  * - The server's start-up and shutdown, running `main()` from `src/server.ts` in this process:
  *   a failed authentication of an email-shaped database role logs `migration failed` once with
- *   the role and password redacted and exits 1 without listening; a log write that throws at
+ *   the role and password redacted and exits 1 without listening, while a missing database whose
+ *   name begins with the role's is logged with that name intact; a log write that throws at
  *   start-up still releases the port, the purge job, the signal handlers and the pool and exits
  *   1, and one that throws during a shutdown still closes everything and exits 0 exactly once,
  *   neither leaving an unhandled rejection. A `SIGTERM` while a connection has sent no byte,
@@ -1283,6 +1284,33 @@ describe('server start-up and shutdown', () => {
     expect(createdPools().map((pool) => pool.ended)).toEqual([true]);
     expect(jobs).toEqual([]);
     expect(addedListeners()).toEqual([]);
+  });
+
+  it('logs a missing database named after the role with its name intact, and exits 1', async () => {
+    const url = new URL(DATABASE_URL);
+    // The role's own name begins the database's, as with the documented `tasktracker` defaults;
+    // the random suffix keeps it from naming any database that exists.
+    const missing = `${decodeURIComponent(url.username)}_missing_${randomBytes(4).toString('hex')}`;
+    url.pathname = `/${missing}`;
+    process.env.DATABASE_URL = url.toString();
+
+    await expect(startServer()).resolves.toBeUndefined();
+
+    expect(process.exitCode).toBe(1);
+    const entries = logged();
+    expect(entries.map((entry) => entry.msg)).toEqual(['migration failed']);
+    expect(entries[0]).toMatchObject({
+      level: 'error',
+      err: {
+        code: '3D000',
+        message: `database "${missing}" does not exist`,
+        stack: expect.stringContaining(`database "${missing}" does not exist`),
+      },
+    });
+    expect(chunks.join('')).not.toContain(MARKER);
+    expect(chunks.join('')).not.toContain(decodeURIComponent(url.password));
+    expect(await isListening(port)).toBe(false);
+    expect(createdPools().map((pool) => pool.ended)).toEqual([true]);
   });
 
   it.each<[string, readonly string[], 'configured' | 'wrong', readonly string[]]>([

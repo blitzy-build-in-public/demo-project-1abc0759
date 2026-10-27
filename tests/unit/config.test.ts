@@ -7,7 +7,9 @@
  * cases where it is missing also show that both functions read only their argument.
  *
  * The `DATABASE_URL` forms that need care (`postgresql://`, scheme case, whitespace, control
- * characters and percent-escapes) are covered here as well, each case for both functions.
+ * characters, percent-escapes, and a missing host, user name or database) are covered here as
+ * well, each case for both functions, and so is `removePgVariables`, which the entry points call
+ * so that `pg` takes no connection setting from a `PG*` variable.
  *
  * This file also covers `assertTestDatabaseUrl` from `tests/helpers/test-db.ts`, the guard both
  * global setups run before they migrate the database `DATABASE_URL` names, and before the
@@ -19,7 +21,7 @@
 
 import pg from 'pg';
 
-import { ConfigError, loadConfig, loadDatabaseUrl } from '../../src/config';
+import { ConfigError, loadConfig, loadDatabaseUrl, removePgVariables } from '../../src/config';
 import type { AppConfig } from '../../src/config';
 
 import { assertTestDatabaseUrl } from '../helpers/test-db';
@@ -205,6 +207,83 @@ describe('DATABASE_URL forms', () => {
   ])('accepts %j and returns it unchanged', (value) => {
     expect(loadConfig({ DATABASE_URL: value, SESSION_SECRET: SECRET }).databaseUrl).toBe(value);
     expect(loadDatabaseUrl({ DATABASE_URL: value })).toBe(value);
+  });
+
+  // `pg` fills a missing host, user name or database from `PGHOST`, `PGUSER`, `PGDATABASE`, the
+  // `USER` variable or its defaults. It reads the host and the user name from the last non-empty
+  // `host` or `user` query parameter, else from the URL, and the database from the path alone.
+  test.each([
+    'postgres://',
+    'postgresql://',
+    'postgres:///d',
+    'postgres://h/d',
+    'postgres://:p@h/d',
+    'postgres://h/d?user=',
+    'postgres://h/d?user=u&user=',
+    'postgres:///d?user=u',
+    'postgres:///d?user=u&host=',
+    'postgres://u@h',
+    'postgres://u:p@h/',
+    'postgres://u:p@h:5432?database=d',
+  ])('refuses %j, which lacks a host, a user name or a database', (value) => {
+    expectConfigError(
+      () => loadConfig({ DATABASE_URL: value, SESSION_SECRET: SECRET }),
+      DATABASE_URL_MESSAGE,
+    );
+    expectConfigError(() => loadDatabaseUrl({ DATABASE_URL: value }), DATABASE_URL_MESSAGE);
+  });
+
+  // Each is also resolved by `pg`'s own parser, which must read the same host, user name and
+  // database from the URL that the check found there.
+  test.each<[string, string, string, string]>([
+    ['postgres://u@h/d', 'h', 'u', 'd'],
+    ['postgres://h/d?user=u', 'h', 'u', 'd'],
+    ['postgres://h/d?user=&user=u', 'h', 'u', 'd'],
+    ['postgres://u@h/d?host=', 'h', 'u', 'd'],
+    ['postgres:///d?host=%2Fvar%2Frun%2Fpostgresql&user=u', '/var/run/postgresql', 'u', 'd'],
+    ['postgres://alice%40example.com:p@[::1]:5432/d', '::1', 'alice@example.com', 'd'],
+  ])('accepts %j, from which pg reads host %j, user %j and database %j', (value, h, u, d) => {
+    expect(loadDatabaseUrl({ DATABASE_URL: value })).toBe(value);
+    const client = new pg.Client({ connectionString: value });
+    expect([client.host, client.user, client.database]).toEqual([h, u, d]);
+  });
+});
+
+describe('removePgVariables', () => {
+  test('deletes every PG-prefixed variable in place and keeps every other one', () => {
+    const environment: NodeJS.ProcessEnv = {
+      DATABASE_URL: DB,
+      SESSION_SECRET: SECRET,
+      PORT: '3000',
+      NODE_ENV: 'test',
+      HOME: '/home/node',
+      USER: 'node',
+      PG: 'bare prefix',
+      PGHOST: '127.0.0.1',
+      PGPORT: '5433',
+      PGUSER: 'other',
+      PGPASSWORD: 'other-password',
+      PGDATABASE: 'other',
+      PGSSLMODE: 'require',
+      PGAPPNAME: 'other-app',
+      PGPASSFILE: '/tmp/pgpass',
+      PGCONNECT_TIMEOUT: '1',
+      pghost: 'lower case, which pg never reads',
+      NOT_PGHOST: 'prefix elsewhere',
+    };
+
+    expect(removePgVariables(environment)).toBeUndefined();
+
+    expect(environment).toEqual({
+      DATABASE_URL: DB,
+      SESSION_SECRET: SECRET,
+      PORT: '3000',
+      NODE_ENV: 'test',
+      HOME: '/home/node',
+      USER: 'node',
+      pghost: 'lower case, which pg never reads',
+      NOT_PGHOST: 'prefix elsewhere',
+    });
   });
 });
 

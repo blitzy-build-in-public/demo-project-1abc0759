@@ -29,7 +29,7 @@ listening.
 
 | Variable | Required | Default | Effect | Message when missing or invalid |
 |----------|----------|---------|--------|---------------------------------|
-| `DATABASE_URL` | Yes | — | PostgreSQL connection string for the application and the migration runner. It must begin with `postgres://` or `postgresql://` and contain no whitespace; percent-encode special characters (a space as `%20`, `%` as `%25`). | `DATABASE_URL must be a postgres:// connection string` |
+| `DATABASE_URL` | Yes | — | PostgreSQL connection string for the application and the migration runner. It must begin with `postgres://` or `postgresql://` and contain no whitespace; percent-encode special characters (a space as `%20`, `%` as `%25`). It must name the host, the user name (each in the URL or a `host` or `user` query parameter) and the database (in the path). It is the only source of connection settings: the driver's `PG*` variables (`PGHOST`, `PGUSER`, `PGPASSWORD`, `PGSSLMODE` and the like) and password files (`~/.pgpass`, `PGPASSFILE`) are ignored. | `DATABASE_URL must be a postgres:// connection string` |
 | `SESSION_SECRET` | Yes | — | At least 32 characters. Keys both the session-cookie signature and the CSRF HMAC, so rotating it logs every user out and expires every open form. | `SESSION_SECRET is required (at least 32 characters)` |
 | `PORT` | No | `3000` | HTTP listen port, an integer from 1 to 65535. | `PORT must be an integer between 1 and 65535` |
 | `NODE_ENV` | No | `development` | `production`, `development` or `test`. `production` adds `Secure` to both cookies (`sid` and `csrf`); the container image sets it. | `NODE_ENV must be production, development or test` |
@@ -90,6 +90,9 @@ npm run start:local       # then open http://localhost:3000
 - The server applies every pending migration before it listens. The runner holds a PostgreSQL
   advisory lock for its whole run, so replicas starting at the same moment apply each migration
   exactly once.
+- The runner's statements share the pool's 5-second query timeout with every other statement. A
+  migration statement that runs longer fails the run as database-unavailable, and a replica that
+  waits longer than that for another replica's run exits with 1, for its restart policy to retry.
 - `npm run migrate` (or `npm run migrate:local`) applies pending migrations without starting the
   server. It needs only `DATABASE_URL` and exits with 0 when every pending migration was applied
   or none was pending, 1 for an invalid `DATABASE_URL` or a failed migration, and 2 for invalid

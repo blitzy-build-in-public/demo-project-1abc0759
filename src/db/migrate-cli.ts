@@ -15,17 +15,20 @@
  *
  * Every line written once `DATABASE_URL` is accepted, the runner's and the pool's included, has
  * the database user name and password of that URL replaced by `[redacted]` in the error's
- * message and stack, the only parts of a line that carry driver text. The user name can be an
- * email address, and PostgreSQL quotes it in its own messages, for example
- * `password authentication failed for user "…"` (SQLSTATE 28P01). The envelope (`time`, `level`,
- * `msg`), the fields and the error's name and code are kept as written. The redaction is the
- * shared logger's own, the boundary `src/server.ts` uses as well: `databaseCredentials` in
- * `src/config.ts` lists the values, and `createLogger` replaces them before a line is serialized.
+ * message and stack, the only parts of a line that carry driver text, where each stands as the
+ * credential. The user name can be an email address, and PostgreSQL quotes it in its own
+ * messages, for example `password authentication failed for user "…"` (SQLSTATE 28P01); the
+ * same characters in a file path or a database name, such as
+ * `database "<user>_missing" does not exist` or `pg-pool/index.js` for a password `index`, are
+ * kept. The envelope (`time`, `level`, `msg`), the fields and the error's name and code are kept
+ * as written. The redaction is the shared logger's own, the boundary `src/server.ts` uses as well:
+ * `databaseCredentials` in `src/config.ts` lists the values, and `createLogger` replaces them
+ * before a line is serialized.
  */
 
 import { parseArgs } from 'node:util';
 
-import { ConfigError, databaseCredentials, loadDatabaseUrl } from '../config';
+import { ConfigError, databaseCredentials, loadDatabaseUrl, removePgVariables } from '../config';
 import { createLogger } from '../shared/logger';
 import type { Logger } from '../shared/logger';
 import { runMigrations } from './migrate';
@@ -39,7 +42,8 @@ const USAGE = [
   'Applies every pending migration to the database named by DATABASE_URL, then exits.',
   '',
   'Environment:',
-  '  DATABASE_URL  Required. A postgres:// or postgresql:// connection string.',
+  '  DATABASE_URL  Required. A postgres:// or postgresql:// connection string naming',
+  '                the host, the user and the database. PG* variables are ignored.',
   '',
   'Options:',
   '  -h, --help    Print this usage and exit, without reading DATABASE_URL or connecting.',
@@ -78,13 +82,13 @@ function parseCliArgs(args: readonly string[]): CliRequest {
 
 /**
  * Creates the CLI's logger on standard output. With a URL, the logger redacts that URL's database
- * user name and password from every logged error's message and stack (see
- * `databaseCredentials`); without one, or with one that carries no credentials, lines are written
- * unchanged.
+ * user name and password, where each stands as the credential, from every logged error's
+ * message and stack (see `databaseCredentials`); without one, or with one that carries no
+ * credentials, lines are written unchanged.
  */
 function createCliLogger(databaseUrl: string | undefined): Logger {
   return createLogger(process.stdout, {
-    redact: databaseUrl === undefined ? [] : databaseCredentials(databaseUrl),
+    redact: databaseUrl === undefined ? {} : databaseCredentials(databaseUrl),
   });
 }
 
@@ -97,6 +101,8 @@ function createCliLogger(databaseUrl: string | undefined): Logger {
  *   argument text, and sets exit code 2. Neither reads `DATABASE_URL` nor opens a connection.
  * - An invalid `DATABASE_URL` logs the fixed configuration message alone, with no error object,
  *   and sets exit code 1 without opening a connection. `SESSION_SECRET` is not required.
+ * - Once `DATABASE_URL` is accepted, every `PG*` variable is deleted from `process.env` before
+ *   the pool is created, so the driver takes no connection setting from anything else.
  * - `runMigrations` logs `migrations applied` with `count` and `versions` on success, which sets
  *   exit code 0.
  * - A migration failure, including an unreachable database, logs `migration failed` with the
@@ -108,7 +114,8 @@ function createCliLogger(databaseUrl: string | undefined): Logger {
  *   `migration unlock failed`, `idle client error` and `pool end failed`, has the database user
  *   name (which can be an email address) and password of `DATABASE_URL` replaced by
  *   `[redacted]` in the error's message and stack, the only parts of a line that carry driver
- *   text. The envelope, the fields and the error code are kept.
+ *   text, where each stands as the credential. The envelope, the fields and the error code are
+ *   kept.
  *
  * The result is reported through `process.exitCode` rather than `process.exit()`, so the log
  * lines written to stdout are flushed before the process ends.
@@ -150,6 +157,9 @@ export async function main(args: readonly string[] = []): Promise<void> {
 
   // The pool and the runner log through this logger too, so their driver errors are redacted.
   const logger = createCliLogger(databaseUrl);
+  // The driver would otherwise take connection settings from any `PG*` variable, so
+  // `DATABASE_URL` alone decides where and how the migrations connect.
+  removePgVariables(process.env);
   const pool = createPool(databaseUrl, logger);
   try {
     await runMigrations(pool, logger);

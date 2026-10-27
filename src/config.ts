@@ -2,9 +2,11 @@
  * Environment configuration: the only module that parses and validates environment variables.
  *
  * The process entry points pass their environment in, so this module never reads the global one
- * and every rule can be exercised with a plain object. Error messages are fixed strings and never
- * include the received value, because `DATABASE_URL` carries a password and `SESSION_SECRET` is a
- * secret. {@link databaseCredentials} lists the credentials of an accepted `DATABASE_URL`, which
+ * and every rule can be exercised with a plain object. They also pass it to
+ * {@link removePgVariables}, so the database driver cannot take connection settings from
+ * anything but `DATABASE_URL`. Error messages are fixed strings and never include the received
+ * value, because `DATABASE_URL` carries a password and `SESSION_SECRET` is a secret.
+ * {@link databaseCredentials} lists the credentials of an accepted `DATABASE_URL`, which
  * the entry points hand to their loggers to redact from driver error text.
  */
 
@@ -45,6 +47,14 @@ const MIN_PORT = 1;
 const MAX_PORT = 65535;
 const DEFAULT_NODE_ENV: AppConfig['nodeEnv'] = 'development';
 
+/**
+ * Returns the value the driver's connection-string parser takes for the query parameter `name`:
+ * the last one given, or `''` when there is none.
+ */
+function lastQueryValue(url: URL, name: string): string {
+  return url.searchParams.getAll(name).at(-1) ?? '';
+}
+
 function parseDatabaseUrl(raw: string | undefined): string {
   if (raw === undefined || raw.trim() === '') {
     throw new ConfigError(DATABASE_URL_MESSAGE);
@@ -62,15 +72,25 @@ function parseDatabaseUrl(raw: string | undefined): string {
   ) {
     throw new ConfigError(DATABASE_URL_MESSAGE);
   }
-  let protocol: string;
+  let url: URL;
   try {
-    protocol = new URL(raw).protocol;
+    url = new URL(raw);
   } catch {
     // The parser's error carries the input, which includes the password, so it is discarded
     // rather than attached as `cause`.
     throw new ConfigError(DATABASE_URL_MESSAGE);
   }
-  if (protocol !== 'postgres:' && protocol !== 'postgresql:') {
+  if (url.protocol !== 'postgres:' && url.protocol !== 'postgresql:') {
+    throw new ConfigError(DATABASE_URL_MESSAGE);
+  }
+  // The driver fills a host, user name or database the URL lacks from its `PG*` variables, the
+  // `USER` variable or its own defaults, so such a URL would connect to a server, as a role or
+  // to a database this value does not name. It reads the host and the user name from the last
+  // `host` and `user` query parameters when they are non-empty, else from the URL itself, and
+  // the database from the path alone.
+  const host = lastQueryValue(url, 'host') || url.hostname;
+  const user = lastQueryValue(url, 'user') || url.username;
+  if (host === '' || user === '' || url.pathname.slice(1) === '') {
     throw new ConfigError(DATABASE_URL_MESSAGE);
   }
   return raw;
@@ -116,8 +136,10 @@ function parseNodeEnv(raw: string | undefined): AppConfig['nodeEnv'] {
  * Variables are checked in this order, and the first failure throws a {@link ConfigError}:
  * - `DATABASE_URL`: required; a URL beginning with `postgres://` or `postgresql://` (scheme
  *   case-insensitive), with no whitespace, no control characters, and every `%` starting a
- *   two-hex-digit escape (encode a space as `%20` and a literal `%` as `%25`), returned
- *   unchanged. Otherwise: `DATABASE_URL must be a postgres:// connection string`.
+ *   two-hex-digit escape (encode a space as `%20` and a literal `%` as `%25`). It must name a
+ *   host and a user name, each in the URL or in a non-empty `host` or `user` query parameter,
+ *   and a database in its path, so that no driver variable or default fills them in. It is
+ *   returned unchanged. Otherwise: `DATABASE_URL must be a postgres:// connection string`.
  * - `SESSION_SECRET`: required; at least 32 characters, not trimmed.
  *   Otherwise: `SESSION_SECRET is required (at least 32 characters)`.
  * - `PORT`: optional, default `3000` when unset or empty; decimal digits only, 1 to 65535.
@@ -150,18 +172,45 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
  * @returns The `postgres://` or `postgresql://` connection string, unchanged.
  * @throws {ConfigError} `DATABASE_URL must be a postgres:// connection string` when the value is
  *   missing, blank, not a URL, does not begin with `postgres://` or `postgresql://` (scheme
- *   case-insensitive), contains whitespace or a control character, or has a `%` that does not
- *   start a two-hex-digit escape (encode a space as `%20` and a literal `%` as `%25`).
+ *   case-insensitive), contains whitespace or a control character, has a `%` that does not
+ *   start a two-hex-digit escape (encode a space as `%20` and a literal `%` as `%25`), or lacks
+ *   a host, a user name (each given in the URL or a non-empty `host` or `user` query parameter)
+ *   or a database name in its path.
  */
 export function loadDatabaseUrl(env: NodeJS.ProcessEnv): string {
   return parseDatabaseUrl(env.DATABASE_URL);
 }
 
 /**
- * Query parameters that the driver's connection-string parser reads as the user name and the
- * password, taking precedence over the URL's user-info part.
+ * Deletes every variable whose name begins with `PG` from `env`, in place.
+ *
+ * The PostgreSQL driver reads such variables (`PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`,
+ * `PGSSLMODE`, `PGAPPNAME`, `PGPASSFILE` and others) each time it creates a client, and takes
+ * from them any connection setting the connection string leaves open, the TLS mode included.
+ * The application reads only its four variables, so each entry point calls this once its
+ * configuration is accepted and before it creates a pool, which leaves `DATABASE_URL` the only
+ * source of the connection.
+ *
+ * @param env - The process environment, passed in by the entry point; never read globally.
  */
-const CREDENTIAL_PARAMS: readonly string[] = ['user', 'password'];
+export function removePgVariables(env: NodeJS.ProcessEnv): void {
+  for (const name of Object.keys(env)) {
+    if (name.startsWith('PG')) {
+      delete env[name];
+    }
+  }
+}
+
+/**
+ * The credentials of a connection string, as {@link databaseCredentials} lists them. Each list
+ * holds distinct non-empty values, longest first, and is empty when the URL carries none.
+ */
+export interface DatabaseCredentials {
+  /** The user name of the user-info part, as written and decoded, and every `user` parameter. */
+  userNames: string[];
+  /** The password of the user-info part, as written and decoded, and every `password` parameter. */
+  passwords: string[];
+}
 
 /** Returns `value` percent-decoded, or unchanged when it holds a malformed escape. */
 function percentDecode(value: string): string {
@@ -172,38 +221,48 @@ function percentDecode(value: string): string {
   }
 }
 
+/** Returns the distinct non-empty `values`, longest first. */
+function distinctLongestFirst(values: readonly string[]): string[] {
+  const distinct = new Set(values.filter((value) => value !== ''));
+  return [...distinct].sort((a, b) => b.length - a.length);
+}
+
 /**
  * Lists the credentials a connection string carries, for the entry points' loggers to redact:
  * the user name and password of its user-info part, and every `user` and `password` query
- * parameter.
+ * parameter, which the driver's connection-string parser reads in preference to that part.
  *
  * The driver sends the percent-decoded user name, and that is the form PostgreSQL quotes in its
  * messages, so `alice%40example.com` is reported as `alice@example.com`. The user-info values are
  * therefore listed both as written and decoded; the query API already returns decoded values.
+ * User names and passwords are listed apart because the logger redacts each only where it
+ * stands as the credential, and the contexts differ: a user name in a URL, a quoted role or a
+ * `user=` setting, a password in a URL or a password setting.
  *
  * @param databaseUrl - A connection string accepted by {@link loadConfig} or
  *   {@link loadDatabaseUrl}.
- * @returns The distinct non-empty values, longest first; empty when the URL carries none.
+ * @returns The user names and the passwords, each distinct, non-empty and longest first.
  * @throws {ConfigError} `DATABASE_URL must be a postgres:// connection string` when
  *   `databaseUrl` does not parse as a URL; the parser's own error, which quotes the input, is
  *   discarded.
  */
-export function databaseCredentials(databaseUrl: string): string[] {
+export function databaseCredentials(databaseUrl: string): DatabaseCredentials {
   let url: URL;
   try {
     url = new URL(databaseUrl);
   } catch {
     throw new ConfigError(DATABASE_URL_MESSAGE);
   }
-  const values = [
-    url.username,
-    percentDecode(url.username),
-    url.password,
-    percentDecode(url.password),
-  ];
-  for (const name of CREDENTIAL_PARAMS) {
-    values.push(...url.searchParams.getAll(name));
-  }
-  const distinct = new Set(values.filter((value) => value !== ''));
-  return [...distinct].sort((a, b) => b.length - a.length);
+  return {
+    userNames: distinctLongestFirst([
+      url.username,
+      percentDecode(url.username),
+      ...url.searchParams.getAll('user'),
+    ]),
+    passwords: distinctLongestFirst([
+      url.password,
+      percentDecode(url.password),
+      ...url.searchParams.getAll('password'),
+    ]),
+  };
 }

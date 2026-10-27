@@ -11,8 +11,8 @@
  * Check fixtures are raw INSERTs with every column and timestamp bound explicitly, never the
  * database's `now()`: the helper defaults deliberately satisfy every check.
  *
- * The suites before `database schema` cover that code without the test database, so they need no
- * truncation:
+ * The suites before `database schema` cover that code without changing any table of the test
+ * database, so they need no truncation:
  * - the migration runner, against a fake pool: the client goes back with a plain `release()`
  *   after a clean run and is destroyed once when the advisory unlock fails, whatever the logger
  *   does, and a connection the server ends mid-migration rejects with the emitted error as its
@@ -21,8 +21,14 @@
  *   logged error, exit codes 0, 1 and 2, and `--help` and rejected arguments that neither read
  *   `DATABASE_URL` nor connect. Its runner is a spy scoped to those tests, never a module mock,
  *   so every other suite here runs the real runner;
+ * - the same `main` against the test database with the driver's `PG*` variables set: none of
+ *   them, and no password file, changes the connection `DATABASE_URL` names or supplies the
+ *   password it leaves out, and a URL lacking a host, user name or database is refused although
+ *   those variables would complete it;
  * - the pool's connection teardown, against a fake PostgreSQL server: a connection pg rejects
- *   closes its socket at once, and a connected client keeps its socket;
+ *   closes its socket at once, a connected client keeps its socket, and a statement the server
+ *   leaves unanswered rejects as database-unavailable within one query timeout and destroys its
+ *   connection, on the pool, on a checked-out client and in a transaction;
  * - the logger's serialisation of errors and fields, its guards against hostile inputs (throwing
  *   getters, proxies, cyclic and BigInt values) and its redaction of the values it is given.
  *
@@ -52,9 +58,15 @@ import * as migrateModule from '../../src/db/migrate';
 import { main as runMigrateCli } from '../../src/db/migrate-cli';
 import { createPool } from '../../src/db/pool';
 import * as poolModule from '../../src/db/pool';
+import { checkOut, query, withTransaction } from '../../src/db/query';
 import { DatabaseUnavailableError } from '../../src/shared/errors';
 import { createLogger } from '../../src/shared/logger';
-import type { LogFields, Logger, LoggerOptions } from '../../src/shared/logger';
+import type {
+  LogFields,
+  Logger,
+  LoggerOptions,
+  RedactedCredentials,
+} from '../../src/shared/logger';
 
 import { CaptureLogger } from '../helpers/capture-logger';
 import {
@@ -578,11 +590,219 @@ describe('migrate CLI main', () => {
   });
 });
 
+describe('migrate CLI main and the driver PG* variables', () => {
+  /** The integration database, already migrated by the global setup, so a run applies nothing. */
+  const DATABASE_URL = testDatabaseUrl();
+
+  /** The real runner, taken before any test spies on it. */
+  const realRunMigrations = migrateModule.runMigrations;
+
+  /** pg's message when SCRAM authentication starts with no password to use. */
+  const NO_PASSWORD_ERROR = 'SASL: SCRAM-SERVER-FIRST-MESSAGE: client password must be a string';
+
+  /** The session the migration run connects as, read through the CLI's own pool. */
+  interface SessionRow {
+    role: string;
+    database: string;
+    applicationName: string;
+    ssl: boolean;
+  }
+
+  const SESSION_SQL =
+    'SELECT current_user AS role, current_database() AS database, ' +
+    "current_setting('application_name') AS \"applicationName\", " +
+    '(SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()) AS ssl';
+
+  const originalEnv = process.env;
+  let chunks: string[];
+  let home: string;
+
+  /** The lines written to standard output since the test began, parsed. */
+  function capturedEntries(): Record<string, unknown>[] {
+    return chunks
+      .join('')
+      .split('\n')
+      .filter((line) => line !== '')
+      .map((line): Record<string, unknown> => {
+        const parsed: unknown = JSON.parse(line);
+        if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+          throw new Error('migrate-cli test: a log line is not a JSON object');
+        }
+        return parsed as Record<string, unknown>;
+      });
+  }
+
+  /** The names of the environment's `PG*` variables. */
+  function pgVariableNames(): string[] {
+    return Object.keys(process.env).filter((name) => name.startsWith('PG'));
+  }
+
+  /** The integration database's role and password, decoded as the driver sends them. */
+  function credentials(): { user: string; password: string } {
+    const url = new URL(DATABASE_URL);
+    return { user: decodeURIComponent(url.username), password: decodeURIComponent(url.password) };
+  }
+
+  /**
+   * Writes a password file named `fileName` into the test's home directory, holding one line
+   * that matches every connection, and returns its path. `:` and `\` are escaped as the format
+   * requires, and the file is private, since pg ignores one its group or others can read.
+   */
+  async function writePgpass(fileName: string, password: string): Promise<string> {
+    const file = path.join(home, fileName);
+    await writeFile(file, `*:*:*:*:${password.replace(/[\\:]/g, '\\$&')}\n`, { mode: 0o600 });
+    return file;
+  }
+
+  beforeEach(async () => {
+    // A home directory of the test's own, so a real ~/.pgpass can never take part.
+    home = await mkdtemp(path.join(tmpdir(), 'migrate-cli-home-'));
+    process.env = { ...originalEnv, HOME: home };
+    for (const name of pgVariableNames()) {
+      delete process.env[name];
+    }
+    chunks = [];
+    jest
+      .spyOn(process.stdout, 'write')
+      .mockImplementation((chunk: string | Uint8Array): boolean => {
+        chunks.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8'));
+        return true;
+      });
+  });
+
+  afterEach(async () => {
+    process.env = originalEnv;
+    jest.restoreAllMocks();
+    // main() reports through process.exitCode; left set, it would become Jest's own exit code.
+    process.exitCode = undefined;
+    await rm(home, { recursive: true, force: true });
+  });
+
+  test('connects only as DATABASE_URL says, whatever the PG* variables hold', async () => {
+    const { user } = credentials();
+    const target = new URL(DATABASE_URL);
+    process.env.DATABASE_URL = DATABASE_URL;
+    Object.assign(process.env, {
+      PGHOST: '127.0.0.1',
+      PGPORT: '1',
+      PGUSER: 'pg_variable_role',
+      PGPASSWORD: ['pg', 'variable', randomBytes(6).toString('hex')].join('-'),
+      PGDATABASE: 'pg_variable_db',
+      // With the server's SSL off, a driver that read this would fail to connect at all.
+      PGSSLMODE: 'require',
+      PGAPPNAME: 'pg-variable-app',
+    });
+    let session: SessionRow | undefined;
+    jest
+      .spyOn(migrateModule, 'runMigrations')
+      .mockImplementation(async (pool: Pool, logger: Logger, dir?: string): Promise<string[]> => {
+        session = (await pool.query<SessionRow>(SESSION_SQL)).rows[0];
+        return realRunMigrations(pool, logger, dir);
+      });
+
+    await runMigrateCli();
+
+    expect(capturedEntries().map((entry) => entry.msg)).toEqual(['migrations applied']);
+    expect(process.exitCode).toBe(0);
+    expect(session).toEqual({
+      role: user,
+      database: decodeURIComponent(target.pathname.slice(1)),
+      applicationName: '',
+      ssl: false,
+    });
+    expect(pgVariableNames()).toEqual([]);
+    expect(process.env.DATABASE_URL).toBe(DATABASE_URL);
+    expect(process.env.HOME).toBe(home);
+  });
+
+  test.each<[string, (password: string) => Promise<void>]>([
+    [
+      'PGPASSWORD',
+      async (password) => {
+        process.env.PGPASSWORD = password;
+      },
+    ],
+    [
+      'the password file PGPASSFILE names',
+      async (password) => {
+        process.env.PGPASSFILE = await writePgpass('named-pgpass', password);
+      },
+    ],
+    [
+      'the ~/.pgpass file',
+      async (password) => {
+        await writePgpass('.pgpass', password);
+      },
+    ],
+  ])(
+    'takes no password from %s when DATABASE_URL carries none, and exits 1',
+    async (_source, providePassword): Promise<void> => {
+      const { password } = credentials();
+      const url = new URL(DATABASE_URL);
+      url.password = '';
+      process.env.DATABASE_URL = url.toString();
+      await providePassword(password);
+
+      await runMigrateCli();
+
+      expect(process.exitCode).toBe(1);
+      expect(capturedEntries()).toEqual([
+        expect.objectContaining({
+          level: 'error',
+          msg: 'migration failed',
+          err: expect.objectContaining({ message: NO_PASSWORD_ERROR }),
+        }),
+      ]);
+      expect(chunks.join('')).not.toContain(password);
+      expect(pgVariableNames()).toEqual([]);
+    },
+  );
+
+  test.each<[string, (target: URL) => string]>([
+    ['with no host, user name or database', () => 'postgres://'],
+    [
+      'with a host and a database but no user name',
+      (target) => `postgres://${target.host}${target.pathname}`,
+    ],
+  ])(
+    'refuses a DATABASE_URL %s although PG* variables supply the rest, and exits 1',
+    async (_form, databaseUrl): Promise<void> => {
+      const { user, password } = credentials();
+      const target = new URL(DATABASE_URL);
+      process.env.DATABASE_URL = databaseUrl(target);
+      Object.assign(process.env, {
+        PGHOST: target.hostname,
+        PGPORT: target.port,
+        PGUSER: user,
+        PGPASSWORD: password,
+        PGDATABASE: decodeURIComponent(target.pathname.slice(1)),
+      });
+      const runner = jest.spyOn(migrateModule, 'runMigrations');
+      const createPoolSpy = jest.spyOn(poolModule, 'createPool');
+
+      await runMigrateCli();
+
+      expect(process.exitCode).toBe(1);
+      expect(capturedEntries()).toEqual([
+        {
+          time: expect.any(String),
+          level: 'error',
+          msg: 'DATABASE_URL must be a postgres:// connection string',
+        },
+      ]);
+      expect(runner).not.toHaveBeenCalled();
+      expect(createPoolSpy).not.toHaveBeenCalled();
+      expect(chunks.join('')).not.toContain(password);
+    },
+  );
+});
+
 describe('createPool connection teardown', () => {
   /**
    * How the fake server answers a start-up packet: `scram` asks for SCRAM-SHA-256 and answers the
    * client's first SASL message, so a client without a password fails on its own side; `trust`
-   * accepts the client at once.
+   * accepts the client at once. Neither answers a statement, like a server that stopped
+   * responding without closing its sockets.
    */
   type Handshake = 'scram' | 'trust';
 
@@ -607,6 +827,15 @@ describe('createPool connection teardown', () => {
 
   /** pg's message when SCRAM authentication starts with no password to use. */
   const NO_PASSWORD_ERROR = 'SASL: SCRAM-SERVER-FIRST-MESSAGE: client password must be a string';
+
+  /** The pool's query timeout: how long pg waits for a statement's answer before giving up. */
+  const QUERY_TIMEOUT_MS = 5_000;
+
+  /**
+   * How much later than the query timeout an unanswered statement may reject. A second timeout,
+   * such as one for a `ROLLBACK` queued behind that statement, would exceed it.
+   */
+  const TIMEOUT_MARGIN_MS = 2_000;
 
   /** A big-endian 32-bit integer, the width of every length and code in the protocol. */
   function int32(value: number): Buffer {
@@ -754,6 +983,9 @@ describe('createPool connection teardown', () => {
 
   const originalEnv = process.env;
   let servers: FakePgServer[];
+  let pools: Pool[];
+  /** Clients this test checked out and has not released yet. */
+  let unreleased: Set<PoolClient>;
 
   /** Starts a fake server for this test and returns a password-less URL for it. */
   async function fakeServerUrl(handshake: Handshake): Promise<[FakePgServer, string]> {
@@ -763,11 +995,32 @@ describe('createPool connection teardown', () => {
     return [server, `postgres://alice@127.0.0.1:${port}/db`];
   }
 
+  /** Registers a pool the moment it exists, so teardown ends it unless the test already did. */
+  function registerPool(pool: Pool): Pool {
+    pools.push(pool);
+    return pool;
+  }
+
+  /** Registers a checked-out client, so teardown destroys it unless the test released it. */
+  function registerClient(client: PoolClient): PoolClient {
+    unreleased.add(client);
+    return client;
+  }
+
+  /** Returns a registered client to its pool with a plain `release()`, exactly once. */
+  function releaseClient(client: PoolClient): void {
+    unreleased.delete(client);
+    client.release();
+  }
+
   beforeEach(() => {
     servers = [];
-    // The URL carries no password, so none may come from the environment either: pg falls back
-    // to PGPASSWORD, then to the pgpass file, which here is a path that does not exist. SSL
-    // stays off so the start-up packet is the first thing the fake server reads.
+    pools = [];
+    unreleased = new Set<PoolClient>();
+    // The URL carries no password, so none may come from the environment either. createPool
+    // leaves the environment to the entry points, so pg would still read PGPASSWORD here; the
+    // pool's client never reads a password file, and PGPASSFILE names a missing path in case it
+    // ever did. SSL stays off so the start-up packet is the first thing the fake server reads.
     process.env = {
       ...originalEnv,
       PGPASSFILE: path.join(tmpdir(), `pool-test-no-pgpass-${randomUUID()}`),
@@ -778,15 +1031,42 @@ describe('createPool connection teardown', () => {
 
   afterEach(async () => {
     process.env = originalEnv;
-    await Promise.all(servers.map((server) => server.close()));
+    // Every cleanup is attempted before any failure is reported, so a test that failed part-way
+    // leaves no client, pool or server behind. Clients go first because a pool's `end` waits for
+    // every client it handed out; one the test still holds is destroyed rather than reused.
+    const failures: unknown[] = [];
+    const attempt = async (cleanup: () => Promise<void> | void): Promise<void> => {
+      try {
+        await cleanup();
+      } catch (err) {
+        failures.push(err);
+      }
+    };
+    for (const client of unreleased) {
+      await attempt(() => client.release(true));
+    }
+    unreleased.clear();
+    await Promise.all(
+      pools
+        .filter((pool) => !pool.ending)
+        .map((pool) => attempt(() => within(pool.end(), PROMPT_CLOSE_MS, 'pool end'))),
+    );
+    await Promise.all(servers.map((server) => attempt(() => server.close())));
+    if (failures.length === 1) {
+      throw failures[0];
+    }
+    if (failures.length > 1) {
+      throw new AggregateError(failures, `pool teardown: ${failures.length} cleanups failed`);
+    }
   });
 
   test('a connection pg rejects itself closes its socket at once and logs nothing', async () => {
     const [server, url] = await fakeServerUrl('scram');
     const logger = new CaptureLogger();
-    const pool = createPool(url, logger);
+    const pool = registerPool(createPool(url, logger));
 
-    await expect(pool.connect()).rejects.toThrow(NO_PASSWORD_ERROR);
+    // A connect that wrongly succeeds still hands its client to teardown.
+    await expect(pool.connect().then(registerClient)).rejects.toThrow(NO_PASSWORD_ERROR);
 
     const connection = server.onlyConnection();
     // Without the teardown the socket would stay open until the server's authentication timeout.
@@ -804,19 +1084,23 @@ describe('createPool connection teardown', () => {
   test('a connected client keeps its socket, also after a refused second connect', async () => {
     const [server, url] = await fakeServerUrl('trust');
     const logger = new CaptureLogger();
-    const pool = createPool(url, logger);
+    const pool = registerPool(createPool(url, logger));
 
-    const client = await pool.connect();
-    const connection = server.onlyConnection();
-    await delay(STAYS_OPEN_MS);
-    expect(connection.isClosed()).toBe(false);
+    const client = registerClient(await pool.connect());
+    let connection: FakeConnection;
+    try {
+      connection = server.onlyConnection();
+      await delay(STAYS_OPEN_MS);
+      expect(connection.isClosed()).toBe(false);
 
-    // pg refuses to reuse a client; that refusal must not close the live socket.
-    await expect(client.connect()).rejects.toThrow('Client has already been connected');
-    await delay(STAYS_OPEN_MS);
-    expect(connection.isClosed()).toBe(false);
+      // pg refuses to reuse a client; that refusal must not close the live socket.
+      await expect(client.connect()).rejects.toThrow('Client has already been connected');
+      await delay(STAYS_OPEN_MS);
+      expect(connection.isClosed()).toBe(false);
+    } finally {
+      releaseClient(client);
+    }
 
-    client.release();
     await delay(STAYS_OPEN_MS);
     expect(connection.isClosed()).toBe(false);
 
@@ -827,6 +1111,53 @@ describe('createPool connection teardown', () => {
     expect(connection.received).toEqual(['startup', 'X']);
     expect(logger.entries()).toEqual([]);
   });
+
+  test.each<[string, (pool: Pool) => Promise<unknown>]>([
+    ['a statement on the pool', (pool) => query(pool, 'SELECT 1', [])],
+    [
+      'a statement on a checked-out client',
+      async (pool) => {
+        const client = registerClient(await checkOut(pool));
+        try {
+          return await query(client, 'SELECT 1', []);
+        } finally {
+          // A plain release: the recorded read timeout alone must make it destroy the connection.
+          releaseClient(client);
+        }
+      },
+    ],
+    ['a transaction', (pool) => withTransaction(pool, (client) => query(client, 'SELECT 1', []))],
+  ])(
+    '%s left unanswered rejects as unavailable within one query timeout and destroys its ' +
+      'connection',
+    async (_case, run): Promise<void> => {
+      const [server, url] = await fakeServerUrl('trust');
+      const logger = new CaptureLogger();
+      const pool = registerPool(createPool(url, logger));
+
+      const started = performance.now();
+      const failure: unknown = await run(pool).then(
+        () => undefined,
+        (err: unknown) => err,
+      );
+      const elapsedMs = performance.now() - started;
+
+      expect(failure).toBeInstanceOf(DatabaseUnavailableError);
+      expect(failure instanceof Error ? failure.cause : undefined).toMatchObject({
+        message: 'Query read timeout',
+      });
+      expect(elapsedMs).toBeLessThan(QUERY_TIMEOUT_MS + TIMEOUT_MARGIN_MS);
+      const connection = server.onlyConnection();
+      await expect(within(connection.closed, PROMPT_CLOSE_MS, 'socket close')).resolves.toEqual({
+        hadError: false,
+      });
+      // Only the first statement was sent: no `ROLLBACK` followed it, and no Terminate either,
+      // since the connection was destroyed rather than ended.
+      expect(connection.received).toEqual(['startup', 'Q']);
+      expect(pool.totalCount).toBe(0);
+      expect(logger.entries()).toEqual([]);
+    },
+  );
 });
 
 /** Clock reading during every logger test, so whole lines can be compared byte for byte. */
@@ -1262,44 +1593,66 @@ describe('createLogger redaction', () => {
     };
   }
 
-  test.each<[string, readonly string[], (logger: Logger) => void, Record<string, unknown>]>([
+  test.each<[string, RedactedCredentials, (logger: Logger) => void, Record<string, unknown>]>([
     [
       'the user name, as quoted and as written, and the password in the message and stack',
-      [ROLE, ENCODED_ROLE, PASSWORD],
+      { userNames: [ROLE, ENCODED_ROLE], passwords: [PASSWORD] },
       (logger) =>
         logger.error(
           'migration failed',
-          driverFailure(`authentication failed for user "${ROLE}" (${ENCODED_ROLE}:${PASSWORD})`),
+          driverFailure(
+            `authentication failed for user "${ROLE}" (postgres://${ENCODED_ROLE}:${PASSWORD}@h/d)`,
+          ),
         ),
-      migrationFailedLine(`authentication failed for user "${MARKER}" (${MARKER}:${MARKER})`),
+      migrationFailedLine(
+        `authentication failed for user "${MARKER}" (postgres://${MARKER}:${MARKER}@h/d)`,
+      ),
     ],
     [
-      'a value that contains another whole, whatever order they are given in',
-      ['alice', ROLE],
+      'a user name that contains another whole, whatever order they are given in',
+      { userNames: ['alice', ROLE] },
       (logger) =>
-        logger.error('migration failed', driverFailure(`failed for user "${ROLE}" (alice)`)),
-      migrationFailedLine(`failed for user "${MARKER}" (${MARKER})`),
+        logger.error(
+          'migration failed',
+          driverFailure(`failed for user "${ROLE}" (postgres://alice@h/d)`),
+        ),
+      migrationFailedLine(`failed for user "${MARKER}" (postgres://${MARKER}@h/d)`),
     ],
     [
+      'a password that contains another whole, whatever order they are given in',
+      { passwords: ['pass', 'pass word'] },
+      (logger) =>
+        logger.error('migration failed', driverFailure("password='pass word' password=pass")),
+      migrationFailedLine(`password='${MARKER}' password=${MARKER}`),
+    ],
+    [
+      // A second pass would match the marker and the word after it, which form the longer value.
       'in a single pass, never inside a marker it has just written',
-      ['redacted', 'alice'],
-      (logger) => logger.error('migration failed', driverFailure('alice redacted')),
-      migrationFailedLine(`${MARKER} ${MARKER}`),
+      { passwords: ['secret', `${MARKER} word`] },
+      (logger) => logger.error('migration failed', driverFailure("password='secret word'")),
+      migrationFailedLine(`password='${MARKER} word'`),
     ],
     [
       'values holding regular-expression metacharacters as literal text only',
-      ['.', '(w)+', 'a$&b'],
-      (logger) => logger.error('migration failed', driverFailure('x.y (w)+ ww a$&b')),
-      migrationFailedLine(`x${MARKER}y ${MARKER} ww ${MARKER}`),
+      { passwords: ['.', '(w)+', 'a$&b'] },
+      (logger) =>
+        logger.error(
+          'migration failed',
+          driverFailure("//u:.@h //u:x@h password=(w)+ password=ww password='a$&b'"),
+        ),
+      migrationFailedLine(
+        `//u:${MARKER}@h //u:x@h password=${MARKER} password=ww password='${MARKER}'`,
+      ),
     ],
     [
       'only the error text, so values equal to the time, level, msg, fields, name or code stay',
-      [LOG_NOW, 'error', 'migration failed', '28P01', 'GET', '/tasks'],
+      { passwords: [LOG_NOW, 'error', 'migration failed', '28P01', 'GET', '/tasks'] },
       (logger) =>
-        logger.error('migration failed', driverFailure('failed for user "error"'), {
-          method: 'GET',
-          path: '/tasks',
-        }),
+        logger.error(
+          'migration failed',
+          driverFailure("password=error, password='migration failed'"),
+          { method: 'GET', path: '/tasks' },
+        ),
       {
         time: LOG_NOW,
         level: 'error',
@@ -1308,29 +1661,39 @@ describe('createLogger redaction', () => {
         path: '/tasks',
         err: {
           name: 'error',
-          message: `failed for user "${MARKER}"`,
+          message: `password=${MARKER}, password='${MARKER}'`,
           code: '28P01',
-          // The stack is driver text throughout, its `name: message` head included.
-          stack: `${MARKER}: failed for user "${MARKER}"\n    at connect`,
+          // The stack's `name: message` head is driver text too, but not a credential context.
+          stack: `error: password=${MARKER}, password='${MARKER}'\n    at connect`,
         },
       },
     ],
     [
       'the message of a thrown non-Error value',
-      [PASSWORD],
-      (logger) => logger.error('purge failed', `socket closed for ${PASSWORD}`),
+      { passwords: [PASSWORD] },
+      (logger) => logger.error('purge failed', `socket closed for postgres://u:${PASSWORD}@h`),
       {
         time: LOG_NOW,
         level: 'error',
         msg: 'purge failed',
-        err: { message: `socket closed for ${MARKER}` },
+        err: { message: `socket closed for postgres://u:${MARKER}@h` },
       },
     ],
     [
       'nothing from an info line, whose fields the code produces',
-      [ROLE],
-      (logger) => logger.info('migrations applied', { count: 1, versions: ROLE }),
-      { time: LOG_NOW, level: 'info', msg: 'migrations applied', count: 1, versions: ROLE },
+      { userNames: [ROLE], passwords: [PASSWORD] },
+      (logger) =>
+        logger.info('migrations applied', {
+          count: 1,
+          versions: `user "${ROLE}" password=${PASSWORD}`,
+        }),
+      {
+        time: LOG_NOW,
+        level: 'info',
+        msg: 'migrations applied',
+        count: 1,
+        versions: `user "${ROLE}" password=${PASSWORD}`,
+      },
     ],
   ])('redacts %s', (_label, redact, call, expected) => {
     const { logger, text } = captureLog({ redact });
@@ -1341,11 +1704,105 @@ describe('createLogger redaction', () => {
     expect(text()).toBe(`${JSON.stringify(expected)}\n`);
   });
 
+  // A password is redacted only where it stands as the credential, so a password that is also a
+  // module file name, a directory of every stack path or a word of a driver message leaves them
+  // readable. Each text is the error's message, which the stack repeats, so both are compared.
+  test.each<[string, string]>([
+    ['index', 'at Pool.connect (/app/node_modules/pg-pool/index.js:45:11)'],
+    ['x', 'at Pool.connect (/app/node_modules/pg-pool/index.js:45:11)'],
+    ['app', 'at toDatabaseError (/home/node/app/dist/db/query.js:152:12)'],
+    ['password', 'SASL: SCRAM-SERVER-FIRST-MESSAGE: client password must be a string'],
+  ])('given the password %s, keeps "%s" and redacts it as the credential', (password, kept) => {
+    const contexts = (value: string): string =>
+      `postgres://u:${value}@h/d password=${value} {"password":"${value}"} PASSWORD '${value}'`;
+    const { logger, text } = captureLog({ redact: { passwords: [password] } });
+
+    logger.error('migration failed', driverFailure(`${kept} ${contexts(password)}`));
+
+    expect(text()).toBe(`${JSON.stringify(migrationFailedLine(`${kept} ${contexts(MARKER)}`))}\n`);
+  });
+
+  // Each credential is redacted only where it stands as one: a password in a URL's user-info or
+  // as the whole value of a password setting, a user name in a URL, a quoted role or a `user=`
+  // setting. So a short or common value leaves a stack path, a word or a database name holding
+  // the same characters readable. Each text is the error's message, which the stack repeats, so
+  // both are compared.
+  test.each<[string, RedactedCredentials, string, string]>([
+    [
+      "a password, in a URL's user-info or as the whole value of a setting in any of its forms",
+      { passwords: ['x'] },
+      'Password=x, PASSWORD: x; (password=x) {password=x} "password": "x" password \'x\' ' +
+        '?password=x&a=1 u:x@h password=xy password x PASSWORD "x" password=x',
+      `Password=${MARKER}, PASSWORD: ${MARKER}; (password=${MARKER}) {password=${MARKER}} ` +
+        `"password": "${MARKER}" password '${MARKER}' ?password=${MARKER}&a=1 u:${MARKER}@h ` +
+        `password=xy password x PASSWORD "x" password=${MARKER}`,
+    ],
+    [
+      'a user name, as a directory of every stack path',
+      { userNames: ['app'] },
+      'at toDatabaseError (/home/node/app/dist/db/query.js:152:12)',
+      'at toDatabaseError (/home/node/app/dist/db/query.js:152:12)',
+    ],
+    [
+      'a one-letter user name, inside a word',
+      { userNames: ['u'] },
+      'Database unavailable',
+      'Database unavailable',
+    ],
+    [
+      'a user name, as the quoted database name',
+      { userNames: ['tasktracker'] },
+      'database "tasktracker" does not exist',
+      'database "tasktracker" does not exist',
+    ],
+    [
+      'a user name, as the start of the quoted database name',
+      { userNames: ['tasktracker'] },
+      'database "tasktracker_c9_does_not_exist" does not exist',
+      'database "tasktracker_c9_does_not_exist" does not exist',
+    ],
+    [
+      'an email-shaped user name, as the role PostgreSQL quotes',
+      { userNames: [ROLE] },
+      `password authentication failed for user "${ROLE}"`,
+      `password authentication failed for user "${MARKER}"`,
+    ],
+    [
+      'a user name, as a quoted role but not inside a longer one',
+      { userNames: ['tasktracker'] },
+      'role "tasktracker" does not exist; role "tasktracker2" neither',
+      `role "${MARKER}" does not exist; role "tasktracker2" neither`,
+    ],
+    [
+      'a user name, in the user-info part of a URL but not its path',
+      { userNames: [ENCODED_ROLE, 'u'] },
+      `postgres://${ENCODED_ROLE}@h/d and postgres://u:p@h/u`,
+      `postgres://${MARKER}@h/d and postgres://${MARKER}:p@h/u`,
+    ],
+    [
+      'a user name, as the whole value of a user= setting',
+      { userNames: ['alice'] },
+      "user=alice dbname=alice user='alice' ?user=alice&x=1 user=alice.smith",
+      `user=${MARKER} dbname=alice user='${MARKER}' ?user=${MARKER}&x=1 user=alice.smith`,
+    ],
+  ])('given %s, redacts only the credential', (_label, redact, input, expected) => {
+    const { logger, text } = captureLog({ redact });
+
+    logger.error('migration failed', driverFailure(input));
+
+    expect(text()).toBe(`${JSON.stringify(migrationFailedLine(expected))}\n`);
+  });
+
   test.each<[string, LoggerOptions]>([
     ['an empty options object', {}],
-    ['an empty redact list', { redact: [] }],
-    ['only empty strings to redact', { redact: ['', ''] }],
-    ['a value that never occurs', { redact: ['absent-value'] }],
+    ['no credentials', { redact: {} }],
+    ['empty credential lists', { redact: { userNames: [], passwords: [] } }],
+    ['only empty strings to redact', { redact: { userNames: ['', ''], passwords: [''] } }],
+    ['values that never occur', { redact: { userNames: ['absent'], passwords: ['absent-value'] } }],
+    [
+      'credentials that occur only as words',
+      { redact: { userNames: ['socket', 'failed'], passwords: ['socket', 'error', 'user'] } },
+    ],
   ])('writes exactly the lines of a logger without options given %s', (_label, options) => {
     const calls = (logger: Logger): void => {
       logger.info('server listening', { port: 3000 });
@@ -1364,8 +1821,8 @@ describe('createLogger redaction', () => {
   });
 
   test('writes a fixed message and drops the stack when a replacement fails', () => {
-    const { logger, text } = captureLog({ redact: [PASSWORD] });
-    const err = driverFailure(`failed for ${PASSWORD}`);
+    const { logger, text } = captureLog({ redact: { passwords: [PASSWORD] } });
+    const err = driverFailure(`failed for postgres://u:${PASSWORD}@h`);
     // Stands in for a replacement whose result exceeds the engine's maximum string length. The
     // spy is removed before any assertion runs, since the matchers replace text themselves.
     const replace = jest.spyOn(String.prototype, 'replace').mockImplementation(() => {

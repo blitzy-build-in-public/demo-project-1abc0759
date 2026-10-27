@@ -39,6 +39,15 @@ const CONNECTION_TIMEOUT_MS = 5_000;
 const IDLE_TIMEOUT_MS = 30_000;
 
 /**
+ * How long a statement may wait for the server's answer before pg rejects it with "Query read
+ * timeout", which the query helper reports as database-unavailable. It equals the connection
+ * timeout, so a database that stops answering gives a 503 in about five seconds on a warm pooled
+ * connection as on a new one. Legitimate statements finish far sooner: the slowest is a login
+ * waiting on its email's lock while an earlier attempt runs a cost-12 bcrypt comparison.
+ */
+const QUERY_TIMEOUT_MS = 5_000;
+
+/**
  * Start-up parameter that sets the session time zone on every connection, so server-side casts,
  * `to_char` and `AT TIME ZONE` produce UTC days, which the report ranges and groupings rely on.
  */
@@ -55,7 +64,7 @@ type ConnectCallback = (...outcome: ConnectOutcome) => void;
 
 /**
  * The client class every pool creates: a `pg.Client` that closes its socket when its connection
- * attempt fails.
+ * attempt fails, and that takes its password from the connection string alone.
  *
  * `pg` rejects some connection attempts on the client side, for example when SCRAM
  * authentication asks for a password the connection string does not carry. It reports the error
@@ -75,6 +84,22 @@ type ConnectCallback = (...outcome: ConnectOutcome) => void;
 class TeardownOnFailureClient extends pg.Client {
   /** Set by the first `connect` call, the only one whose failure closes the socket. */
   private connectCalled = false;
+
+  /**
+   * Creates a client for `config` that never reads a password file.
+   *
+   * @param config The pool's client settings, the connection string included.
+   */
+  constructor(config?: string | pg.ClientConfig) {
+    super(config);
+    // pg leaves the password `null` when the connection string carries none, and then looks it
+    // up in the file `PGPASSFILE` or `~/.pgpass` names, a credential source outside
+    // `DATABASE_URL`. `undefined` skips that lookup, and every authentication method treats it
+    // as `null`: a server that asks for a password then fails the connection.
+    if ((this.password as string | null | undefined) === null) {
+      this.password = undefined;
+    }
+  }
 
   /**
    * Connects to the server, destroying the socket when the first attempt fails.
@@ -118,13 +143,21 @@ class TeardownOnFailureClient extends pg.Client {
 /**
  * Creates the process's PostgreSQL pool.
  *
- * Settings: at most 10 connections, a 5-second connection timeout, a 30-second idle timeout,
- * and the session time zone fixed to UTC through the `TimeZone` start-up parameter. Together
- * with the type parsers registered by this module, DATE values arrive as `YYYY-MM-DD` text, INT8
- * values as numbers, and `Date` parameters are sent in UTC.
+ * Settings: at most 10 connections, a 5-second connection timeout, a 30-second idle timeout, a
+ * 5-second query timeout, and the session time zone fixed to UTC through the `TimeZone` start-up
+ * parameter. Together with the type parsers registered by this module, DATE values arrive as
+ * `YYYY-MM-DD` text, INT8 values as numbers, and `Date` parameters are sent in UTC.
  *
  * No connection is opened until the first query or checkout, and the connection string is never
  * logged, because it carries the database password.
+ *
+ * A statement the server leaves unanswered for 5 seconds, for example on a pooled connection to a
+ * database that stopped responding without closing its sockets, is rejected by pg with "Query
+ * read timeout". The query helper reports that as `DatabaseUnavailableError`, and the connection
+ * is destroyed instead of reused, since pg keeps the unanswered statement active on it. The
+ * bound covers every statement, the migration runner's included: a migration statement must
+ * finish within it, and a replica that waits longer for another replica's migration lock fails
+ * its start-up, for its restart policy to retry.
  *
  * A connection attempt that fails closes its socket at once, including one `pg` rejects itself,
  * such as SCRAM authentication with no password. The failure therefore reaches the caller within
@@ -145,6 +178,10 @@ export function createPool(databaseUrl: string, logger: Logger): Pool {
     max: POOL_MAX_CLIENTS,
     connectionTimeoutMillis: CONNECTION_TIMEOUT_MS,
     idleTimeoutMillis: IDLE_TIMEOUT_MS,
+    // A client-side bound, not `statement_timeout` or TCP keep-alive: a server that stopped
+    // answering cannot enforce its own timeout, and its host may still acknowledge keep-alive
+    // probes, which by default start only after hours of idleness anyway.
+    query_timeout: QUERY_TIMEOUT_MS,
     options: SESSION_OPTIONS,
     Client: TeardownOnFailureClient,
   });
