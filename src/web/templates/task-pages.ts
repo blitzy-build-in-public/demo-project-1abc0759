@@ -12,8 +12,15 @@ import type { AuthenticatedUser } from '../../auth/auth-service';
 import { formatUtcDateTime } from '../../shared/dates';
 import { TASK_PRIORITIES, TASK_STATUSES } from '../../shared/task-values';
 import type { Task, TaskFilters, TaskId } from '../../tasks/types';
-import { filtersToQuery } from '../validation/params';
-import type { TaskFormValues } from '../validation/task-form';
+import {
+  DELETE_CONFIRM_FIELD,
+  DELETE_CONFIRMED,
+  FILTER_ECHO_FIELDS,
+  filtersToQuery,
+  LIST_FILTER_KEYS,
+  STATUS_CHANGE_FIELD,
+} from '../validation/params';
+import { TASK_FORM_FIELDS, type TaskFormValues } from '../validation/task-form';
 import { html, type SafeHtml } from './html';
 import {
   csrfField,
@@ -175,8 +182,10 @@ function renderErrorSummary(invalid: readonly InvalidField[]): SafeHtml {
 
 /** Hidden echoes of the active list filters, read back by the status and delete routes. */
 function filterEchoes(filters: TaskFilters): SafeHtml {
-  return html`<input type="hidden" name="filterStatus" value="${filters.status ?? ''}">
-    <input type="hidden" name="filterPriority" value="${filters.priority ?? ''}">`;
+  return html`<input type="hidden" name="${FILTER_ECHO_FIELDS.status}" value="${
+    filters.status ?? ''
+  }">
+    <input type="hidden" name="${FILTER_ECHO_FIELDS.priority}" value="${filters.priority ?? ''}">`;
 }
 
 /**
@@ -190,7 +199,7 @@ function renderTaskRow(t: Task): SafeHtml {
   const marks = OTHER_STATUSES[t.status].map(
     (s) => html`<button type="submit" formaction="/tasks/${
       t.id
-    }/status" name="status" value="${s}">Mark ${s}</button>`,
+    }/status" name="${STATUS_CHANGE_FIELD}" value="${s}">Mark ${s}</button>`,
   );
   const remove = html`<button type="submit" formaction="/tasks/${
     t.id
@@ -223,7 +232,7 @@ function renderTaskListContent(view: TaskListPageView): SafeHtml {
   // formaction, submits it, and confirm-delete.js sets `confirm` to `yes` for a confirmed Delete.
   return html`<form id="task-actions" method="post" action="/tasks">${csrfField(csrfToken)}
     ${filterEchoes(filters)}
-    <input type="hidden" name="confirm" value="">
+    <input type="hidden" name="${DELETE_CONFIRM_FIELD}" value="">
     <table class="task-table">
       <thead>
         <tr><th scope="col">Title</th><th scope="col">Status</th><th scope="col">Priority</th><th
@@ -255,12 +264,12 @@ export function renderTaskListPage(view: TaskListPageView): string {
     <p><a href="/tasks/new">New task</a></p>
     <form method="get" action="/tasks" class="filters">
       <label for="filter-status">Status</label>
-      <select id="filter-status" name="status">${selectOptions(
+      <select id="filter-status" name="${LIST_FILTER_KEYS.status}">${selectOptions(
         STATUS_FILTER_OPTIONS,
         filters.status ?? '',
       )}</select>
       <label for="filter-priority">Priority</label>
-      <select id="filter-priority" name="priority">${selectOptions(
+      <select id="filter-priority" name="${LIST_FILTER_KEYS.priority}">${selectOptions(
         PRIORITY_FILTER_OPTIONS,
         filters.priority ?? '',
       )}</select>
@@ -299,9 +308,13 @@ const LINE_BREAK = /[\r\n]/;
  */
 function renderTitleControl(title: string, attrs: SafeHtml): SafeHtml {
   if (LINE_BREAK.test(title)) {
-    return html`<textarea id="title" name="title" required rows="2"${attrs}>\n${title}</textarea>`;
+    return html`<textarea id="title" name="${
+      TASK_FORM_FIELDS.title
+    }" required rows="2"${attrs}>\n${title}</textarea>`;
   }
-  return html`<input type="text" id="title" name="title" required value="${title}"${attrs}>`;
+  return html`<input type="text" id="title" name="${
+    TASK_FORM_FIELDS.title
+  }" required value="${title}"${attrs}>`;
 }
 
 /**
@@ -333,19 +346,22 @@ function renderTaskFields(view: TaskFormPageView): SafeHtml {
       <p class="hint" id="title-hint">Up to 200 characters</p>
       ${fieldError('title-error', errors.title)}
       <label for="description">Description</label>
-      <textarea id="description" name="description" rows="6"${describedBy(
+      <textarea id="description" name="${TASK_FORM_FIELDS.description}" rows="6"${describedBy(
         'description-hint',
         errors.description && 'description-error',
       )}${invalidAttr(errors.description)}${focus('description')}>\n${values.description}</textarea>
       <p class="hint" id="description-hint">Up to 5,000 characters</p>
       ${fieldError('description-error', errors.description)}
       <label for="status">Status</label>
-      <select id="status" name="status"${describedBy(errors.status && 'status-error')}${invalidAttr(
-        errors.status,
-      )}${focus('status')}>${selectOptions(STATUS_OPTIONS, status)}</select>
+      <select id="status" name="${TASK_FORM_FIELDS.status}"${describedBy(
+        errors.status && 'status-error',
+      )}${invalidAttr(errors.status)}${focus('status')}>${selectOptions(
+        STATUS_OPTIONS,
+        status,
+      )}</select>
       ${fieldError('status-error', errors.status)}
       <label for="priority">Priority</label>
-      <select id="priority" name="priority"${describedBy(
+      <select id="priority" name="${TASK_FORM_FIELDS.priority}"${describedBy(
         errors.priority && 'priority-error',
       )}${invalidAttr(errors.priority)}${focus('priority')}>${selectOptions(
         PRIORITY_OPTIONS,
@@ -355,7 +371,7 @@ function renderTaskFields(view: TaskFormPageView): SafeHtml {
       <label for="dueDate">Due date</label>
       ${dateInput({
         id: 'dueDate',
-        name: 'dueDate',
+        name: TASK_FORM_FIELDS.dueDate,
         value: values.dueDate,
         describedBy: [errors.dueDate && 'dueDate-error'],
         invalid: hasError(errors.dueDate),
@@ -382,7 +398,7 @@ function renderEditExtras(view: TaskFormPageView, id: TaskId): SafeHtml {
     }`;
   return html`${times}
     <form method="post" action="/tasks/${id}/delete">${csrfField(csrfToken)}
-      <input type="hidden" name="confirm" value="">
+      <input type="hidden" name="${DELETE_CONFIRM_FIELD}" value="">
       <button type="submit" data-confirm-delete data-task-title="${task?.title ?? values.title}"
         >Delete</button>
     </form>`;
@@ -447,7 +463,7 @@ export function renderDeleteConfirmPage(view: DeleteConfirmPageView): string {
   const body = html`<h1>Delete this task?</h1>
     <p class="task-title">${task.title}</p>
     <form method="post" action="/tasks/${task.id}/delete">${csrfField(csrfToken)}
-      <input type="hidden" name="confirm" value="yes">
+      <input type="hidden" name="${DELETE_CONFIRM_FIELD}" value="${DELETE_CONFIRMED}">
       ${filterEchoes(filters)}
       <button type="submit">Delete task</button>
       <a href="/tasks${filtersToQuery(filters)}">Cancel</a>

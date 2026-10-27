@@ -36,6 +36,49 @@ export const INVALID_STATUS_MESSAGE = 'Choose a valid status.';
 /** Inline message for a priority that is not one of the task priority labels. */
 export const INVALID_PRIORITY_MESSAGE = 'Choose a valid priority.';
 
+/**
+ * Query keys of the `GET /tasks` filters, one per {@link TaskFilters} field. The filter form's
+ * selects render these names, {@link parseListFilters} reads them, and {@link filtersToQuery}
+ * writes them, so the list, its form and every redirect back to it share one spelling.
+ */
+export const LIST_FILTER_KEYS = {
+  status: 'status',
+  priority: 'priority',
+} as const satisfies Record<keyof TaskFilters, string>;
+
+/**
+ * Body fields that echo the active list filters, one per {@link TaskFilters} field. The task
+ * list's shared actions form and the delete confirmation form render them as hidden inputs, and
+ * `POST /tasks/:id/status` and `POST /tasks/:id/delete` read them back and pass their values to
+ * {@link parseListFilters} under the {@link LIST_FILTER_KEYS} keys, so each redirect returns to
+ * the same filtered list.
+ */
+export const FILTER_ECHO_FIELDS = {
+  status: 'filterStatus',
+  priority: 'filterPriority',
+} as const satisfies Record<keyof TaskFilters, string>;
+
+/**
+ * Body field of `POST /tasks/:id/status` holding the new status label, which
+ * {@link parseStatusValue} validates. Each task row's "Mark <status>" buttons submit it.
+ */
+export const STATUS_CHANGE_FIELD = 'status';
+
+/**
+ * Body field of `POST /tasks/:id/delete` holding the delete confirmation. Every Delete form
+ * renders it as a hidden input, empty except on the confirmation page, where it holds
+ * {@link DELETE_CONFIRMED}. `/static/confirm-delete.js`, a plain browser script that imports
+ * nothing, sets the field by this same name.
+ */
+export const DELETE_CONFIRM_FIELD = 'confirm';
+
+/**
+ * The {@link DELETE_CONFIRM_FIELD} value that confirms a delete. Any other value, or none, gets
+ * the confirmation page and deletes nothing. `/static/confirm-delete.js` writes this same value
+ * once `window.confirm` returns OK.
+ */
+export const DELETE_CONFIRMED = 'yes';
+
 /** A task id: a positive decimal integer of at most 15 digits with no leading zero. */
 const TASK_ID_PATTERN = /^[1-9][0-9]{0,14}$/;
 
@@ -111,14 +154,15 @@ export function parseTaskId(raw: string): TaskId {
 }
 
 /**
- * Parses the `status` and `priority` task-list filters.
+ * Parses the `status` and `priority` task-list filters, read under the {@link LIST_FILTER_KEYS}
+ * keys.
  *
  * An absent or empty value sets no filter, and its key is omitted. An exact label sets that
  * filter. The two filters combine with AND, which `TasksRepo.list` applies. Other keys are
- * ignored. Routes also pass `{ status: body.filterStatus, priority: body.filterPriority }` to
- * validate the filter echoes posted with a status change or delete. An echo that was not posted
- * leaves its key holding `undefined`, which {@link readField} treats as absent, so it sets no
- * filter.
+ * ignored. To validate the filter echoes posted with a status change or delete, routes also pass
+ * an object holding, under the {@link LIST_FILTER_KEYS} keys, the {@link FILTER_ECHO_FIELDS}
+ * values read from the body. An echo that was not posted leaves its key holding `undefined`,
+ * which {@link readField} treats as absent, so it sets no filter.
  *
  * @param query - `req.query`, or an object holding the posted filter echoes.
  * @returns The filters to apply.
@@ -126,14 +170,14 @@ export function parseTaskId(raw: string): TaskId {
  */
 export function parseListFilters(query: unknown): TaskFilters {
   const filters: TaskFilters = {};
-  const status = readField(query, 'status');
+  const status = readField(query, LIST_FILTER_KEYS.status);
   if (status !== undefined && status !== '') {
     if (!isTaskStatus(status)) {
       throw new BadRequestError();
     }
     filters.status = status;
   }
-  const priority = readField(query, 'priority');
+  const priority = readField(query, LIST_FILTER_KEYS.priority);
   if (priority !== undefined && priority !== '') {
     if (!isTaskPriority(priority)) {
       throw new BadRequestError();
@@ -166,16 +210,17 @@ export function parseStatusValue(raw: unknown): TaskStatus {
  * for the filtered Cancel link on the delete confirmation page.
  *
  * @param filters - The active filters.
- * @returns `''` when no filter is set, otherwise `?` followed by `status` then `priority`, each
- *   value URI-encoded, for example `?status=To%20do&priority=High`.
+ * @returns `''` when no filter is set, otherwise `?` followed by `status` then `priority`, the
+ *   {@link LIST_FILTER_KEYS} keys, each value URI-encoded, for example
+ *   `?status=To%20do&priority=High`.
  */
 export function filtersToQuery(filters: TaskFilters): string {
   const parts: string[] = [];
   if (filters.status !== undefined) {
-    parts.push(`status=${encodeURIComponent(filters.status)}`);
+    parts.push(`${LIST_FILTER_KEYS.status}=${encodeURIComponent(filters.status)}`);
   }
   if (filters.priority !== undefined) {
-    parts.push(`priority=${encodeURIComponent(filters.priority)}`);
+    parts.push(`${LIST_FILTER_KEYS.priority}=${encodeURIComponent(filters.priority)}`);
   }
   return parts.length === 0 ? '' : `?${parts.join('&')}`;
 }

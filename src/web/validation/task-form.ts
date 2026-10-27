@@ -70,6 +70,19 @@ export interface TaskFormValues {
 }
 
 /**
+ * Body field names of the task form posted to `POST /tasks/new` and `POST /tasks/:id/edit`, one
+ * per {@link TaskFormValues} field. The task form's controls render these names and
+ * {@link parseTaskForm} reads them, so a control and its parser share one spelling.
+ */
+export const TASK_FORM_FIELDS = {
+  title: 'title',
+  description: 'description',
+  status: 'status',
+  priority: 'priority',
+  dueDate: 'dueDate',
+} as const satisfies Record<keyof TaskFormValues, string>;
+
+/**
  * Counts Unicode code points rather than UTF-16 code units, matching PostgreSQL's `char_length`
  * behind the column checks. A 200-code-point title holding 100 characters outside the Basic
  * Multilingual Plane (300 UTF-16 units) is therefore accepted and 201 code points are rejected.
@@ -143,11 +156,11 @@ export function parseTaskForm(
   // Only a missing status or priority takes the default. A blank one was submitted, so like any
   // other value that is not an exact label it is invalid, and it is kept for the re-render.
   const values: TaskFormValues = {
-    title: submittedTitle(readField(body, 'title') ?? '', storedTitle),
-    description: readField(body, 'description') ?? '',
-    status: readField(body, 'status') ?? DEFAULT_STATUS,
-    priority: readField(body, 'priority') ?? DEFAULT_PRIORITY,
-    dueDate: readField(body, 'dueDate') ?? '',
+    title: submittedTitle(readField(body, TASK_FORM_FIELDS.title) ?? '', storedTitle),
+    description: readField(body, TASK_FORM_FIELDS.description) ?? '',
+    status: readField(body, TASK_FORM_FIELDS.status) ?? DEFAULT_STATUS,
+    priority: readField(body, TASK_FORM_FIELDS.priority) ?? DEFAULT_PRIORITY,
+    dueDate: readField(body, TASK_FORM_FIELDS.dueDate) ?? '',
   };
   // A malformed request returns 400 and changes no data. PostgreSQL text cannot store U+0000, so
   // a title or description holding one is malformed rather than an inline error. The other

@@ -17,10 +17,16 @@
   /** Selector of the buttons that need a confirmation before they submit. */
   const DELETE_BUTTON = '[data-confirm-delete]';
 
-  /** The `confirm` value the server accepts as the user's confirmation. */
+  /**
+   * The `confirm` value the server accepts as the user's confirmation. A browser script imports
+   * nothing, so this mirrors `DELETE_CONFIRMED` in src/web/validation/params.ts.
+   */
   const CONFIRMED = 'yes';
 
-  /** The hidden `confirm` input of a form, or null when the form has none. */
+  /**
+   * The hidden `confirm` input of a form, or null when the form has none. The name mirrors
+   * `DELETE_CONFIRM_FIELD` in src/web/validation/params.ts, which the server renders and reads.
+   */
   function confirmFieldOf(form) {
     const field = form ? form.elements.namedItem('confirm') : null;
     return field instanceof HTMLInputElement ? field : null;

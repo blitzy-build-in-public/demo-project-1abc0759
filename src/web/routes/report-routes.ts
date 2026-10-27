@@ -16,7 +16,7 @@ import type { Request, Response, Router } from 'express';
 import type { AuthenticatedUser } from '../../auth/auth-service';
 import { defaultRange, parseDateRange } from '../../reports/date-range';
 import type { ReportService } from '../../reports/report-service';
-import { asyncHandler } from '../async-handler';
+import { asyncHandler, clientGone } from '../async-handler';
 import { csrfTokenOf } from '../csrf';
 import { requireAuth } from '../middleware/require-auth';
 import '../request-user';
@@ -76,6 +76,9 @@ function readRangeQuery(query: unknown): { from: string | undefined; to: string 
  * Unauthenticated requests are redirected by `requireAuth` (302 to `/login?next=…`). A repeated
  * `from`, `to` or `status` parameter answers 400 "Bad request." through the error handler.
  *
+ * Once the client has disconnected, either route stops before its next report query, render or
+ * file and sends nothing.
+ *
  * @param deps - `reports`, the only service these routes call.
  * @returns The Express router.
  */
@@ -92,7 +95,16 @@ export function createReportRouter(deps: { reports: ReportService }): Router {
       const user = currentUser(req);
       const { from, to } = readRangeQuery(req.query);
       const today = reports.today();
+      // A closed connection cannot receive the page, so a request its client abandoned skips the
+      // remaining report queries and the render. Both routes here are read-only, so stopping
+      // early loses nothing.
+      if (clientGone(req)) {
+        return;
+      }
       const summary = await reports.summary(user.id);
+      if (clientGone(req)) {
+        return;
+      }
       const parsed = parseDateRange({ from, to }, today);
       const completions: ReportsPageView['completions'] = parsed.ok
         ? { ok: true, report: await reports.completions(user.id, parsed.range) }
@@ -105,6 +117,9 @@ export function createReportRouter(deps: { reports: ReportService }): Router {
         completions,
         exportForm: { from: defaults.from, to: defaults.to, status: '' },
       };
+      if (clientGone(req)) {
+        return;
+      }
       sendHtml(res, parsed.ok ? 200 : UNPROCESSABLE, renderReportsPage(view));
     }),
   );
@@ -122,8 +137,17 @@ export function createReportRouter(deps: { reports: ReportService }): Router {
 
       /** Renders the reports page with the failed export form; no file is sent. */
       const rejectExport = async (message: string): Promise<void> => {
+        if (clientGone(req)) {
+          return;
+        }
         const summary = await reports.summary(user.id);
+        if (clientGone(req)) {
+          return;
+        }
         const report = await reports.completions(user.id, defaultRange(today));
+        if (clientGone(req)) {
+          return;
+        }
         const view: ReportsPageView = {
           user,
           csrfToken: csrfTokenOf(res),
@@ -145,7 +169,13 @@ export function createReportRouter(deps: { reports: ReportService }): Router {
         return;
       }
 
+      if (clientGone(req)) {
+        return;
+      }
       const file = await reports.exportCsv(user.id, range.range, statusResult.status);
+      if (clientGone(req)) {
+        return;
+      }
       res.status(200);
       res.set('Content-Type', CSV_CONTENT_TYPE);
       res.set('Content-Disposition', `attachment; filename="${file.filename}"`);

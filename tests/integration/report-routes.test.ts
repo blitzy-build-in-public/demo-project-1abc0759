@@ -24,12 +24,13 @@ import { randomBytes } from 'node:crypto';
 import type { Pool } from 'pg';
 
 import type { Queryable } from '../../src/db/query';
+import type { ReportService } from '../../src/reports/report-service';
 
 import { parseCsv } from '../helpers/csv-parse';
 import { FAKE_CLOCK_START, FakeClock } from '../helpers/fake-clock';
 import type { HttpClient, HttpResult } from '../helpers/http-client';
-import { startTestApp } from '../helpers/test-app';
-import type { TestApp } from '../helpers/test-app';
+import { gateAuthenticate, sendHeldGet, startTestApp } from '../helpers/test-app';
+import type { AuthGate, TestApp } from '../helpers/test-app';
 import {
   FIXTURE_TIME,
   createTestPool,
@@ -402,6 +403,66 @@ function doneTask(
     dueDate,
     createdAt: at(SEED_CREATED_AT),
     completedAt: at(completedAt),
+  };
+}
+
+/** Calls a counting report service has received, by method. */
+interface ReportCalls {
+  summary: number;
+  completions: number;
+  exportCsv: number;
+}
+
+/** A read-only reports request and what its handler does for a client that stays connected. */
+interface HeldReportGet {
+  name: string;
+  path: string;
+  /** The status answered to a connected client. */
+  status: number;
+  /** The report queries made for a connected client. */
+  calls: ReportCalls;
+}
+
+/** The counts of a request that made no report query. */
+const NO_REPORT_CALLS: Readonly<ReportCalls> = { summary: 0, completions: 0, exportCsv: 0 };
+
+const HELD_REPORT_GETS: readonly HeldReportGet[] = [
+  {
+    name: 'GET /reports',
+    path: '/reports',
+    status: 200,
+    calls: { summary: 1, completions: 1, exportCsv: 0 },
+  },
+  {
+    name: 'GET /reports/export',
+    path: '/reports/export?from=2026-10-01&to=2026-10-21&status=',
+    status: 200,
+    calls: { summary: 0, completions: 0, exportCsv: 1 },
+  },
+  {
+    name: 'GET /reports/export with a reversed range',
+    path: '/reports/export?from=2026-10-21&to=2026-10-01&status=',
+    status: 422,
+    calls: { summary: 1, completions: 1, exportCsv: 0 },
+  },
+];
+
+/** Wraps the real report service so that each query method counts its calls before running. */
+function countingReports(real: ReportService, calls: ReportCalls): ReportService {
+  return {
+    ...real,
+    summary(ownerId): ReturnType<ReportService['summary']> {
+      calls.summary += 1;
+      return real.summary(ownerId);
+    },
+    completions(ownerId, range): ReturnType<ReportService['completions']> {
+      calls.completions += 1;
+      return real.completions(ownerId, range);
+    },
+    exportCsv(ownerId, range, status): ReturnType<ReportService['exportCsv']> {
+      calls.exportCsv += 1;
+      return real.exportCsv(ownerId, range, status);
+    },
   };
 }
 
@@ -1134,6 +1195,62 @@ describe('report routes', () => {
         }
       });
     });
+  });
+
+  describe('requests abandoned by the client', () => {
+    /**
+     * Starts a second instance that accepts `app`'s session cookies, holds each request at `gate`
+     * in `loadSession` and counts the queries of `app`'s real report service.
+     */
+    function startHeldApp(gate: AuthGate, calls: ReportCalls): Promise<TestApp> {
+      return startTestApp({
+        clock,
+        sessionSecret: app.config.sessionSecret,
+        overrides: { auth: gate.auth, reports: countingReports(app.reports, calls) },
+      });
+    }
+
+    /** User A's signed session cookie as a `Cookie` request header. */
+    function sessionCookie(): string {
+      const sid = a.client.cookie('sid');
+      if (sid === undefined) {
+        throw new Error('sessionCookie: user A holds no session cookie');
+      }
+      return `sid=${sid}`;
+    }
+
+    it.each(HELD_REPORT_GETS)('$name abandoned while held runs no report query', async (c) => {
+      const gate = gateAuthenticate(app.auth);
+      const calls: ReportCalls = { ...NO_REPORT_CALLS };
+      const held = await startHeldApp(gate, calls);
+      try {
+        const status = await sendHeldGet(held, gate, c.path, sessionCookie(), 'abandon');
+
+        expect(status).toBeNull();
+        // The session was valid, so only the closed connection kept the handler from querying.
+        expect(await gate.answered).toMatchObject({ id: a.userId });
+        expect(calls).toEqual(NO_REPORT_CALLS);
+      } finally {
+        await held.close();
+      }
+    });
+
+    it.each(HELD_REPORT_GETS)(
+      '$name from a client still connected runs its queries and answers $status',
+      async (c) => {
+        const gate = gateAuthenticate(app.auth);
+        const calls: ReportCalls = { ...NO_REPORT_CALLS };
+        const held = await startHeldApp(gate, calls);
+        try {
+          const status = await sendHeldGet(held, gate, c.path, sessionCookie(), 'answer');
+
+          expect(status).toBe(c.status);
+          expect(calls).toEqual(c.calls);
+        } finally {
+          await held.close();
+        }
+      },
+    );
   });
 });
 

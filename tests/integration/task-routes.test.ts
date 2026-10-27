@@ -11,9 +11,12 @@
 
 import { randomBytes, randomUUID } from 'node:crypto';
 
+import type { TaskService } from '../../src/tasks/task-service';
+
 import { FAKE_CLOCK_START, FakeClock } from '../helpers/fake-clock';
 import type { HttpClient, HttpResult } from '../helpers/http-client';
-import { startTestApp } from '../helpers/test-app';
+import { gateAuthenticate, sendHeldGet, startTestApp } from '../helpers/test-app';
+import type { AuthGate } from '../helpers/test-app';
 import {
   countRows,
   createTestPool,
@@ -1521,4 +1524,93 @@ describe('caching of authenticated responses', () => {
     expect(res.status).toBe(status);
     expect(res.headers.get('cache-control')).toBe('no-store');
   });
+});
+
+/** Calls a counting task service has received, by method. */
+interface TaskCalls {
+  list: number;
+  get: number;
+}
+
+/** A read-only task page and the one task query its handler makes for a connected client. */
+interface HeldTaskGet {
+  route: string;
+  path: (id: number) => string;
+  query: keyof TaskCalls;
+}
+
+const HELD_TASK_GETS: readonly HeldTaskGet[] = [
+  { route: '/tasks', path: () => '/tasks', query: 'list' },
+  { route: '/tasks/:id/edit', path: (id) => `/tasks/${id}/edit`, query: 'get' },
+];
+
+/** Wraps the real task service so that `list` and `get` count each call before running it. */
+function countingTasks(real: TaskService, calls: TaskCalls): TaskService {
+  return {
+    ...real,
+    list(ownerId, filters): ReturnType<TaskService['list']> {
+      calls.list += 1;
+      return real.list(ownerId, filters);
+    },
+    get(ownerId, taskId): ReturnType<TaskService['get']> {
+      calls.get += 1;
+      return real.get(ownerId, taskId);
+    },
+  };
+}
+
+describe('requests abandoned by the client', () => {
+  /**
+   * Starts a second instance that accepts `app`'s session cookies, holds each request at `gate`
+   * in `loadSession` and counts the task queries of `app`'s real task service.
+   */
+  function startHeldApp(gate: AuthGate, calls: TaskCalls): Promise<TestApp> {
+    return startTestApp({
+      clock,
+      sessionSecret: app.config.sessionSecret,
+      overrides: { auth: gate.auth, tasks: countingTasks(app.tasks, calls) },
+    });
+  }
+
+  /** User A's signed session cookie as a `Cookie` request header. */
+  function sessionCookie(): string {
+    const sid = userA.client.cookie('sid');
+    if (sid === undefined) {
+      throw new Error('sessionCookie: user A holds no session cookie');
+    }
+    return `sid=${sid}`;
+  }
+
+  test.each(HELD_TASK_GETS)('GET $route abandoned while held runs no task query', async (c) => {
+    const task = await insertTask(pool, userA.userId);
+    const gate = gateAuthenticate(app.auth);
+    const calls: TaskCalls = { list: 0, get: 0 };
+    const held = await startHeldApp(gate, calls);
+    try {
+      const status = await sendHeldGet(held, gate, c.path(task.id), sessionCookie(), 'abandon');
+      expect(status).toBeNull();
+      // The session was valid, so only the closed connection kept the handler from querying.
+      expect(await gate.answered).toMatchObject({ id: userA.userId });
+      expect(calls).toEqual({ list: 0, get: 0 });
+    } finally {
+      await held.close();
+    }
+  });
+
+  test.each(HELD_TASK_GETS)(
+    'GET $route from a client still connected runs its query once and answers 200',
+    async (c) => {
+      const task = await insertTask(pool, userA.userId);
+      const gate = gateAuthenticate(app.auth);
+      const calls: TaskCalls = { list: 0, get: 0 };
+      const held = await startHeldApp(gate, calls);
+      try {
+        const status = await sendHeldGet(held, gate, c.path(task.id), sessionCookie(), 'answer');
+        expect(status).toBe(200);
+        expect(calls).toEqual({ list: 0, get: 0, [c.query]: 1 });
+      } finally {
+        await held.close();
+      }
+    },
+  );
 });

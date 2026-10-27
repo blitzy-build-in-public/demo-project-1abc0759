@@ -18,16 +18,21 @@ import { NotFoundError } from '../../shared/errors';
 import { DEFAULT_PRIORITY, DEFAULT_STATUS } from '../../shared/task-values';
 import type { TaskService } from '../../tasks/task-service';
 import type { Task, TaskFilters, TaskId, UserId } from '../../tasks/types';
-import { asyncHandler } from '../async-handler';
+import { asyncHandler, clientGone } from '../async-handler';
 import { csrfTokenOf, type Csrf } from '../csrf';
 import { requireAuth } from '../middleware/require-auth';
 import '../request-user';
 import {
+  DELETE_CONFIRM_FIELD,
+  DELETE_CONFIRMED,
+  FILTER_ECHO_FIELDS,
   filtersToQuery,
+  LIST_FILTER_KEYS,
   parseListFilters,
   parseStatusValue,
   parseTaskId,
   readField,
+  STATUS_CHANGE_FIELD,
 } from '../validation/params';
 import { parseTaskForm, type TaskFormValues } from '../validation/task-form';
 import {
@@ -95,8 +100,8 @@ async function loadOwnedTask(tasks: TaskService, userId: UserId, id: TaskId): Pr
  */
 function filterEchoes(body: unknown): TaskFilters {
   return parseListFilters({
-    status: readField(body, 'filterStatus'),
-    priority: readField(body, 'filterPriority'),
+    [LIST_FILTER_KEYS.status]: readField(body, FILTER_ECHO_FIELDS.status),
+    [LIST_FILTER_KEYS.priority]: readField(body, FILTER_ECHO_FIELDS.priority),
   });
 }
 
@@ -133,6 +138,9 @@ function toFormValues(task: Task): TaskFormValues {
  * - `POST /tasks/:id/delete`: with `confirm=yes` deletes the task and answers 303 to `/tasks` with
  *   the echoed filters; otherwise 200 confirmation page and nothing changed.
  *
+ * The three `GET` routes stop before their next task query or render once the client has
+ * disconnected, and send nothing; the `POST` routes always run to completion.
+ *
  * @param deps - The task service and the application's CSRF middleware.
  * @returns The router.
  */
@@ -152,7 +160,16 @@ export function createTaskRouter(deps: { tasks: TaskService; csrf: Csrf }): Rout
       const user = currentUser(req);
       const query: unknown = req.query;
       const filters = parseListFilters(query);
+      // A closed connection cannot receive the page, so a request its client abandoned skips the
+      // list query, up to 10,000 rows, and the render. Only read-only GET handlers stop early;
+      // state-changing routes keep running so that their effects are never lost halfway.
+      if (clientGone(req)) {
+        return;
+      }
       const result = await tasks.list(user.id, filters);
+      if (clientGone(req)) {
+        return;
+      }
       sendHtml(
         res,
         200,
@@ -168,6 +185,9 @@ export function createTaskRouter(deps: { tasks: TaskService; csrf: Csrf }): Rout
   );
 
   router.get('/tasks/new', requireAuth, (req, res): void => {
+    if (clientGone(req)) {
+      return;
+    }
     sendHtml(
       res,
       200,
@@ -213,7 +233,13 @@ export function createTaskRouter(deps: { tasks: TaskService; csrf: Csrf }): Rout
     asyncHandler(async (req, res): Promise<void> => {
       const user = currentUser(req);
       const id = taskIdOf(req);
+      if (clientGone(req)) {
+        return;
+      }
       const task = await loadOwnedTask(tasks, user.id, id);
+      if (clientGone(req)) {
+        return;
+      }
       sendHtml(
         res,
         200,
@@ -279,7 +305,7 @@ export function createTaskRouter(deps: { tasks: TaskService; csrf: Csrf }): Rout
       // task is the same 404, not a 400.
       await loadOwnedTask(tasks, user.id, id);
       const body: unknown = req.body;
-      const status = parseStatusValue(readField(body, 'status'));
+      const status = parseStatusValue(readField(body, STATUS_CHANGE_FIELD));
       const filters = filterEchoes(body);
       const changed = await tasks.changeStatus(user.id, id, status);
       if (changed === null) {
@@ -300,8 +326,8 @@ export function createTaskRouter(deps: { tasks: TaskService; csrf: Csrf }): Rout
       const task = await loadOwnedTask(tasks, user.id, id);
       const body: unknown = req.body;
       const filters = filterEchoes(body);
-      const confirm = readField(body, 'confirm');
-      if (confirm === 'yes') {
+      const confirm = readField(body, DELETE_CONFIRM_FIELD);
+      if (confirm === DELETE_CONFIRMED) {
         const deleted = await tasks.delete(user.id, id);
         if (!deleted) {
           throw new NotFoundError('Task not found.');

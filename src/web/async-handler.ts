@@ -6,6 +6,11 @@
  * reaches the error middleware: the request hangs and the rejection goes unhandled. Every async
  * handler in the web layer is wrapped in {@link asyncHandler}, which forwards the failure to
  * `next(err)` so the error handler renders the fixed error page.
+ *
+ * {@link clientGone} tells a handler that its client has disconnected. Read-only `GET` handlers
+ * check it before each query and before rendering, so a request the client abandoned stops
+ * consuming database and render work. The wrapper itself never checks it, because state-changing
+ * routes go through it too and must run to completion.
  */
 
 import type { NextFunction, Request, RequestHandler, Response } from 'express';
@@ -64,4 +69,20 @@ export function asyncHandler(fn: AsyncRequestHandler): RequestHandler {
       next(toForwardedError(err));
     });
   };
+}
+
+/**
+ * Reports whether the client of a request has gone: its connection has closed, so no response
+ * written from now on can reach it.
+ *
+ * It reads `req.socket.destroyed`, which Node sets once the connection is closed from either end,
+ * for example when the client aborts the request. It stays `false` while the request can still be
+ * answered, on a keep-alive connection that has already carried earlier responses too. A handler
+ * that sees `true` returns without responding; there is nobody to respond to.
+ *
+ * @param req - The request being handled.
+ * @returns `true` once the client's connection has closed, otherwise `false`.
+ */
+export function clientGone(req: Request): boolean {
+  return req.socket.destroyed;
 }
