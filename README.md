@@ -9,7 +9,9 @@ optional due date, and the list filters by status and priority. Three reports co
 summary of open and overdue tasks, completions per day, and a CSV export.
 
 Every page works with JavaScript disabled. The completions chart is the only feature that needs
-JavaScript, and without it the completions table, which is always rendered, is the report.
+JavaScript. For a valid date range the completions table is rendered server-side and remains the
+report without JavaScript; an invalid range shows its validation message instead of the table and
+the chart.
 
 ## Prerequisites
 
@@ -31,8 +33,8 @@ listening.
 |----------|----------|---------|--------|---------------------------------|
 | `DATABASE_URL` | Yes | — | PostgreSQL connection string for the application and the migration runner. It must begin with `postgres://` or `postgresql://` and contain no whitespace; percent-encode special characters (a space as `%20`, `%` as `%25`). It must name the host, the user name (each in the URL or a `host` or `user` query parameter) and the database (in the path). It is the only source of connection settings: the driver's `PG*` variables (`PGHOST`, `PGUSER`, `PGPASSWORD`, `PGSSLMODE` and the like) and password files (`~/.pgpass`, `PGPASSFILE`) are ignored. | `DATABASE_URL must be a postgres:// connection string` |
 | `SESSION_SECRET` | Yes | — | At least 32 characters. Keys both the session-cookie signature and the CSRF HMAC, so rotating it logs every user out and expires every open form. | `SESSION_SECRET is required (at least 32 characters)` |
-| `PORT` | No | `3000` | HTTP listen port, an integer from 1 to 65535. | `PORT must be an integer between 1 and 65535` |
-| `NODE_ENV` | No | `development` | `production`, `development` or `test`. `production` adds `Secure` to both cookies (`sid` and `csrf`); the container image sets it. | `NODE_ENV must be production, development or test` |
+| `PORT` | No | `3000` | HTTP listen port. Unset or empty: `3000`; otherwise decimal digits only, from 1 to 65535, so `0x50`, `1e3` and `+80` are refused. | `PORT must be an integer between 1 and 65535` |
+| `NODE_ENV` | No | `development` | Unset or empty: `development`; otherwise exactly `production`, `development` or `test` (case-sensitive). `production` adds `Secure` to both cookies (`sid` and `csrf`); the container image sets it. | `NODE_ENV must be production, development or test` |
 
 - `POSTGRES_PASSWORD` is read only by `docker-compose.yml`, as the `db` service's password and
   inside the `app` service's `DATABASE_URL`. Compose embeds it unencoded in that URL, so use
@@ -119,8 +121,9 @@ docker compose up -d --build
 - Compose reads `POSTGRES_PASSWORD` and `SESSION_SECRET` from `.env` or the shell and refuses to
   start without them. It sets the app's `DATABASE_URL` to point at `db` and fixes
   `NODE_ENV=production`; `.env` is never passed into the container, so it cannot override either.
-- The image holds the compiled `dist/` and the production `node_modules` only: no tests, no
-  TypeScript sources, no `.env` and no secrets.
+- On top of the Node base image, the runtime stage copies only `package.json`, the compiled
+  `dist/` and the production `node_modules`: no project tests, TypeScript sources, `.env` or
+  secrets are copied into it.
 
 For a standalone image, with `DATABASE_URL` naming a database host the container can reach
 (`localhost` inside the container is the container itself):
@@ -154,6 +157,19 @@ To apply migrations without serving, run the migration CLI in the image instead:
 Integration and end-to-end tests read `DATABASE_URL` from the shell, never from `.env`. In the
 commands below, `<password>` is your `POSTGRES_PASSWORD`.
 
+### Test environment variables
+
+The test runners read these variables from the shell; they are separate from the application's
+configuration above. Playwright passes `DATABASE_URL`, and the port resolved from `E2E_PORT` as
+`PORT`, to the end-to-end server it starts.
+
+| Variable | Required | Default | Validation | Effect |
+|----------|----------|---------|------------|--------|
+| `DATABASE_URL` | For integration tests, end-to-end tests, `npm test`, coverage and the performance check | — | Integration and end-to-end runs refuse it, before they connect, unless it is a `postgres://` or `postgresql://` URL whose database name ends in `_test` and which holds no raw space or malformed percent-escape. Unset or empty: `DATABASE_URL is not set; point it at a database whose name ends in _test`; another name: `Refusing to use database "<name>": its name must end in _test`. Only the suffix is checked, not that the database is disposable. The performance check applies no such check. | The database the tests migrate and reset, and the one the end-to-end server uses. For the performance check it names the container's database instead (see Performance check). |
+| `PERF_BASE_URL` | For the performance check only | Unset | None: any nonempty value selects the performance run. | Nonempty: Playwright starts no server, skips the end-to-end global setup and the `_test` guard, runs one worker, and uses the value as the `perf` project's `baseURL`. Unset or empty: the end-to-end set-up below applies, guard included. |
+| `E2E_PORT` | No | `3100` | Unset or empty: `3100`; otherwise decimal digits only, from 1 to 65535. Any other value stops Playwright as the config loads with `E2E_PORT must be an integer between 1 and 65535`. | Port of the server Playwright starts for the end-to-end tests, at `http://127.0.0.1:<port>`. The port must be free. |
+| `CI` | No | Unset | Not validated. | The commands below set `CI=true` to keep the tools non-interactive. In Playwright, any nonempty value, `false` included, turns on `forbidOnly`, so a run that contains a `test.only` fails; unset or empty leaves it off. |
+
 ### Type check
 
 ```bash
@@ -182,6 +198,12 @@ DATABASE_URL=postgres://tasktracker:<password>@localhost:5432/tasktracker_test C
   for the time-dependent rules.
 - The global setup refuses any `DATABASE_URL` whose database name does not end in `_test`, because
   every test truncates the application tables. It then applies the migrations.
+- Use a dedicated, disposable `_test` database. Besides truncating the application tables before
+  each test, the suites include a migration-bootstrap test (`tests/integration/schema.test.ts`)
+  that drops and recreates the entire `public` schema, deleting every other object in it too. The
+  guard checks only the name's `_test` suffix, not that the database is disposable.
+- Never run integration and end-to-end tests, or two runs of either, at the same time against the
+  same database; give parallel runs separate `_test` databases.
 - Suites run serially (`--runInBand`) on the shared database, with a 30-second test timeout: each
   sign-up performs a real cost-12 bcrypt hash.
 - `docker/postgres/init-test-db.sql` creates `tasktracker_test` only when the `db-data` volume is
@@ -206,11 +228,25 @@ npx playwright install --with-deps chromium    # once per host
 DATABASE_URL=postgres://tasktracker:<password>@localhost:5432/tasktracker_test CI=true npm run test:e2e
 ```
 
-- `npm run test:e2e` builds first. Playwright then starts `node dist/server.js` on
-  `http://127.0.0.1:3100` with a random `SESSION_SECRET`, `NODE_ENV=test` and your
-  `DATABASE_URL`; the server applies migrations before it listens. Port 3100 must be free.
-- The global setup applies the same `_test` guard and truncates the application tables once. Each
-  test signs up its own user.
+- `npm run test:e2e` builds first. As the Playwright config loads, it applies the `_test` guard to
+  `DATABASE_URL` and stops with the guard's message before any server starts, so a refused
+  database is never migrated, purged or truncated. Without `PERF_BASE_URL`, every Playwright
+  command that loads the config needs a `_test` `DATABASE_URL`, `--list` included.
+- Playwright then starts `node dist/server.js` with a random `SESSION_SECRET`, `NODE_ENV=test` and
+  your `DATABASE_URL`; the server applies migrations before it listens.
+- The e2e server defaults to `http://127.0.0.1:3100`. Set `E2E_PORT` to another free decimal port
+  from 1 to 65535; unset or empty uses 3100. Invalid values fail as the config loads with
+  `E2E_PORT must be an integer between 1 and 65535`. For example:
+
+  ```bash
+  E2E_PORT=3200 DATABASE_URL=postgres://tasktracker:<password>@localhost:5432/tasktracker_test CI=true npm run test:e2e
+  ```
+
+- Once the server answers, the global setup checks the `_test` guard again, applies any pending
+  migrations and truncates the application tables once. Each test signs up its own user.
+- The run deletes data like the integration tests do: give it a dedicated, disposable `_test`
+  database, and never run it at the same time as an integration run or another end-to-end run on
+  that database.
 - The HTML report is written to `playwright-report/`, and failure traces to `test-results/`.
 
 ### Unit and integration together
@@ -218,6 +254,8 @@ DATABASE_URL=postgres://tasktracker:<password>@localhost:5432/tasktracker_test C
 ```bash
 DATABASE_URL=postgres://tasktracker:<password>@localhost:5432/tasktracker_test CI=true npm test
 ```
+
+This runs the integration suites, so the database rules under Integration tests apply.
 
 ### Coverage (informational)
 
@@ -227,7 +265,8 @@ DATABASE_URL=postgres://tasktracker:<password>@localhost:5432/tasktracker_test n
 
 The report covers `src/**` and is written to `coverage/`. No threshold is enforced. `--runInBand`
 keeps the integration suites serial, as `npm run test:integration` does, because they share one
-database.
+database. The run includes the integration suites, so the database rules under Integration tests
+apply.
 
 ## Performance check (SC12)
 

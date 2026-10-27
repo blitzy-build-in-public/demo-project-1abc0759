@@ -11,7 +11,9 @@ import { assertTestDatabaseUrl, createTestPool, truncateAll } from '../helpers/t
  *
  * In order, it:
  * 1. refuses to continue unless `DATABASE_URL` names a database whose name ends in `_test`,
- *    before any connection is opened, so a development database is never touched;
+ *    before it opens a connection. `playwright.config.ts` applies the same check as it loads,
+ *    before the `webServer` starts, so neither the server nor this setup ever connects to a
+ *    refused database;
  * 2. applies pending migrations with the server's own `runMigrations`, which is idempotent and
  *    serialised by its advisory lock, so the outcome is the same whether the `webServer` has
  *    already migrated the database or starts migrating it at the same moment;

@@ -1,10 +1,11 @@
 /**
  * Playwright configuration: the `e2e` browser flows and the `perf` check (SC12), Chromium only.
  *
- * - `npm run test:e2e` builds, then runs `playwright test --project=e2e`. Playwright starts
- *   `node dist/server.js` on port 3100 (or `E2E_PORT`) against the caller's `DATABASE_URL`,
- *   which must name a `_test` database: the global setup refuses any other, applies migrations
- *   and truncates the application tables once.
+ * - `npm run test:e2e` builds, then runs `playwright test --project=e2e`. The caller's
+ *   `DATABASE_URL` must name a `_test` database: this config refuses any other as it loads,
+ *   before Playwright starts `node dist/server.js` on port 3100 (or `E2E_PORT`) against it, and
+ *   the global setup checks it again, applies migrations and truncates the application tables
+ *   once.
  * - `npm run test:perf` runs `playwright test --project=perf` with `PERF_BASE_URL` pointing at the
  *   production-mode compose container. That run starts no server and skips the e2e global setup,
  *   because it targets the application database, which is not a `_test` database.
@@ -16,9 +17,22 @@ import { randomBytes } from 'node:crypto';
 
 import { defineConfig, devices } from '@playwright/test';
 
+import { assertTestDatabaseUrl } from './tests/helpers/test-db';
+
 const perfBaseUrl = process.env.PERF_BASE_URL;
 /** A non-empty `PERF_BASE_URL` marks the performance run against an already running app. */
 const isPerfRun = perfBaseUrl !== undefined && perfBaseUrl !== '';
+
+/**
+ * The `e2e` run's `DATABASE_URL`, once the `_test` guard has accepted it; `undefined` exactly when
+ * this is the performance run, which targets the application database and never meets the guard.
+ *
+ * Playwright starts the web server before it runs the global setup, and the server applies pending
+ * migrations and purges expired rows in the database it is given. The guard therefore runs here,
+ * as the config loads: an unset or refused URL throws the guard's own message, and Playwright
+ * aborts before it starts the server, so nothing connects to that database.
+ */
+const e2eDatabaseUrl = isPerfRun ? undefined : assertTestDatabaseUrl(process.env.DATABASE_URL);
 
 /**
  * Port of the server Playwright starts for the `e2e` project: 3100 unless `E2E_PORT` names
@@ -64,9 +78,10 @@ export default defineConfig({
     trace: 'retain-on-failure',
   },
   // `globalSetup` is a top-level option and cannot be scoped to a project, so it and the web
-  // server are left out of the performance run as a whole: that run must never meet the `_test`
-  // guard or the truncation, and it measures the container rather than a server started here.
-  ...(isPerfRun
+  // server are left out of the performance run as a whole, the one run without an
+  // `e2eDatabaseUrl`: that run must never meet the `_test` guard or the truncation, and it
+  // measures the container rather than a server started here.
+  ...(e2eDatabaseUrl === undefined
     ? {}
     : {
         globalSetup: './tests/e2e/global-setup.ts',
@@ -80,10 +95,10 @@ export default defineConfig({
           stdout: 'pipe',
           stderr: 'pipe',
           // Merged over the caller's environment. The session secret is generated each time the
-          // config loads, so no secret is committed. An unset `DATABASE_URL` is passed as empty,
-          // which makes the server exit with its configuration error.
+          // config loads, so no secret is committed. `DATABASE_URL` is the caller's URL as the
+          // `_test` guard accepted it above.
           env: {
-            DATABASE_URL: process.env.DATABASE_URL ?? '',
+            DATABASE_URL: e2eDatabaseUrl,
             SESSION_SECRET: randomBytes(32).toString('hex'),
             PORT: String(E2E_PORT),
             NODE_ENV: 'test',
