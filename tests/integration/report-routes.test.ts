@@ -5,6 +5,8 @@
  * Every page and file is compared with "database truth": counts and rows read straight from the
  * `tasks` table with independent SQL, never through the report module. Expected literal values
  * are asserted beside the SQL, so the query and the page cannot both be wrong in the same way.
+ * The completions table is read from the date and count cells it displays, and the `data-day`
+ * and `data-count` attributes the chart reads must equal those cells.
  *
  * The application runs in process on the real stack with a `FakeClock` at
  * `2026-10-21T09:00:00.000Z`, so "today" is `2026-10-21` and the default completions range is
@@ -166,14 +168,35 @@ const COMPLETIONS_TRUTH_SQL = `
    WHERE owner_id = $1 AND completed_at IS NOT NULL
    GROUP BY 1`;
 
-/**
- * A completions-table row: a `<tr>` carrying both `data-day` and `data-count`, in either order.
- * The lookaheads read each attribute independently of its position in the tag.
- */
-const COMPLETION_ROW = /<tr\b(?=[^>]*\sdata-day="([^"]*)")(?=[^>]*\sdata-count="(\d+)")[^>]*>/g;
+/** The opening tag of the completions table, whatever its attribute order. */
+const COMPLETIONS_TABLE_TAG = /<table\b[^>]*\sid="completions-table"[^>]*>/;
+
+/** A table body's content up to its closing tag. */
+const TABLE_BODY = /<tbody\b[^>]*>([\s\S]*?)<\/tbody>/g;
+
+/** A table row: its opening tag's attributes and its content up to the closing tag. */
+const TABLE_ROW = /<tr\b([^>]*)>([\s\S]*?)<\/tr>/g;
+
+/** A header cell: its opening tag's attributes and its content up to the closing tag. */
+const HEADER_CELL = /<th\b([^>]*)>([\s\S]*?)<\/th>/g;
+
+/** A data cell's content up to its closing tag. */
+const DATA_CELL = /<td\b[^>]*>([\s\S]*?)<\/td>/g;
+
+/** A count as the page writes it: decimal digits only, so a blank cell is not read as 0. */
+const COUNT_TEXT = /^\d+$/;
 
 /** The opening tag of the chart figure, whatever its attribute order. */
 const CHART_FIGURE_TAG = /<figure\b[^>]*\sid="completions-chart"[^>]*>/;
+
+/** The export section's message element and its text, whatever its attribute order. */
+const EXPORT_MESSAGE = /<p\b[^>]*\sid="export-message"[^>]*>([^<]*)<\/p>/;
+
+/** The export Status select's content, whatever its opening tag's attribute order. */
+const EXPORT_STATUS_SELECT = /<select\b[^>]*\sid="export-status"[^>]*>([\s\S]*?)<\/select>/;
+
+/** One `<option>` element, from its opening tag to its closing tag. */
+const OPTION = /<option\b[^>]*>[^<]*<\/option>/g;
 
 /** Returns the instant an ISO 8601 timestamp names. */
 function at(iso: string): Date {
@@ -201,18 +224,66 @@ function summaryCounts(body: string): SummaryCounts {
   };
 }
 
-/** Reads every completions-table row in document order. */
+/**
+ * Reads the completions table as the page displays it: for each row of the `tbody` of
+ * `<table id="completions-table">`, in document order, the trimmed text of its one
+ * `<th scope="row">` (the date) and of its one `<td>` (the count). It also asserts that the
+ * `data-day` and `data-count` attributes the chart reads from each row equal those cells.
+ *
+ * @returns The displayed rows, or `[]` when the page renders no completions table.
+ * @throws Error when the table is unclosed or lacks a single `tbody`, or a row lacks either
+ *   attribute, its single row header or its single data cell, or a count is not decimal digits.
+ */
 function completionRows(body: string): DayRow[] {
-  const rows: DayRow[] = [];
-  for (const match of body.matchAll(COMPLETION_ROW)) {
-    const day = match[1];
-    const count = match[2];
-    if (day === undefined || count === undefined) {
-      throw new Error('completion row without data-day or data-count');
-    }
-    rows.push({ day, count: Number(count) });
+  const open = COMPLETIONS_TABLE_TAG.exec(body);
+  if (open === null) {
+    return [];
   }
-  return rows;
+  const start = open.index + open[0].length;
+  const end = body.indexOf('</table>', start);
+  if (end === -1) {
+    throw new Error('completions table has no closing tag');
+  }
+  const bodies = [...body.slice(start, end).matchAll(TABLE_BODY)];
+  const tbody = bodies[0]?.[1];
+  if (bodies.length !== 1 || tbody === undefined) {
+    throw new Error(`completions table has ${bodies.length} tbody elements, not 1`);
+  }
+  const cells: DayRow[] = [];
+  const metadata: DayRow[] = [];
+  for (const [index, row] of [...tbody.matchAll(TABLE_ROW)].entries()) {
+    const where = `completions row ${index + 1}`;
+    const attributes = row[1] ?? '';
+    const dataDay = /\sdata-day="([^"]*)"/.exec(attributes)?.[1];
+    const dataCount = /\sdata-count="([^"]*)"/.exec(attributes)?.[1];
+    if (dataDay === undefined || dataCount === undefined) {
+      throw new Error(`${where} lacks data-day or data-count`);
+    }
+    const content = row[2] ?? '';
+    const headers = [...content.matchAll(HEADER_CELL)];
+    const header = headers[0];
+    if (headers.length !== 1 || header === undefined) {
+      throw new Error(`${where} has ${headers.length} <th> cells, not 1`);
+    }
+    if (!/\sscope="row"/.test(header[1] ?? '')) {
+      throw new Error(`${where} has a <th> without scope="row"`);
+    }
+    const data = [...content.matchAll(DATA_CELL)];
+    const cell = data[0];
+    if (data.length !== 1 || cell === undefined) {
+      throw new Error(`${where} has ${data.length} <td> cells, not 1`);
+    }
+    const day = (header[2] ?? '').trim();
+    const count = (cell[1] ?? '').trim();
+    if (!COUNT_TEXT.test(count) || !COUNT_TEXT.test(dataCount)) {
+      throw new Error(`${where} count "${count}" or data-count "${dataCount}" is not digits`);
+    }
+    cells.push({ day, count: Number(count) });
+    metadata.push({ day: dataDay, count: Number(dataCount) });
+  }
+  // The chart draws its bars from the attributes, so they must equal what the table shows.
+  expect(metadata).toEqual(cells);
+  return cells;
 }
 
 /** Reads the `value` of the `<input>` carrying `id="<id>"`, whatever its attribute order. */
@@ -249,6 +320,19 @@ function expectDateField(body: string, id: string, field: DateField): void {
     expect(tag).not.toMatch(/\sinputmode=/);
     expect(tag).not.toMatch(/\splaceholder=/);
   }
+}
+
+/**
+ * Returns every `<option>` element of the export Status select as written, in document order.
+ *
+ * @throws Error when the page has no select carrying `id="export-status"`.
+ */
+function exportStatusOptions(body: string): string[] {
+  const options = EXPORT_STATUS_SELECT.exec(body)?.[1];
+  if (options === undefined) {
+    throw new Error('export status select not found on the page');
+  }
+  return [...options.matchAll(OPTION)].map((match) => match[0]);
 }
 
 /**
@@ -833,13 +917,71 @@ describe('report routes', () => {
       expectDateField(res.body, 'export-to', 'text');
     });
 
-    it('answers an unknown status with 422 "Choose a valid status." and no file', async () => {
+    it('answers an unknown status with the 422 reports page and no file', async () => {
+      // Open tasks give every summary count a value. The completions fall before the default
+      // range, on its first day, inside it but before the export range, and inside both, so
+      // only the default range's 30 days give the expected rows.
+      await seed(a.userId, [
+        openTask('To do, High, due yesterday', 'To do', 'High', '2026-10-20'),
+        openTask('To do, Low, undated', 'To do', 'Low', null),
+        openTask('In progress, Medium, due today', 'In progress', 'Medium', '2026-10-21'),
+        doneTask('Completed before the default range', 'Low', null, '2026-09-21T23:59:59.999Z'),
+        doneTask('Completed on the first default day', 'Medium', null, '2026-09-22T00:00:00.000Z'),
+        doneTask('Completed before the export range', 'High', null, '2026-09-25T12:00:00.000Z'),
+        doneTask('Completed early on 10-10', 'Low', null, '2026-10-10T08:00:00.000Z'),
+        doneTask('Completed late on 10-10', 'Medium', null, '2026-10-10T20:00:00.000Z'),
+      ]);
+
       const res = await a.client.get('/reports/export?from=2026-10-01&to=2026-10-21&status=Urgent');
 
       expect(res.status).toBe(422);
       expect(res.headers.get('content-type')).toMatch(/^text\/html/);
       expect(res.headers.get('content-disposition')).toBeNull();
       expect(res.body).toContain(INVALID_STATUS);
+      // The message is the export section's, not the completions section's.
+      expect(EXPORT_MESSAGE.exec(res.body)?.[1]).toBe(INVALID_STATUS);
+
+      // The reports page continues: the summary is the owner's whole open workload.
+      const counts = summaryCounts(res.body);
+      expect(counts).toEqual(await summaryTruth(a.userId));
+      expect(counts).toEqual({
+        'open-todo': 2,
+        'open-in-progress': 1,
+        'open-low': 1,
+        'open-medium': 1,
+        'open-high': 1,
+        overdue: 1,
+      });
+
+      // The completions are the default range's, never the requested export range.
+      const rows = completionRows(res.body);
+      expect(rows).toHaveLength(30);
+      expect(rows.map((row) => row.day)).toEqual(expectedDays('2026-09-22', '2026-10-21'));
+      expect(rows).toEqual(await completionsTruth(a.userId, '2026-09-22', '2026-10-21'));
+      expect(rows.filter((row) => row.count > 0)).toEqual([
+        { day: '2026-09-22', count: 1 },
+        { day: '2026-09-25', count: 1 },
+        { day: '2026-10-10', count: 2 },
+      ]);
+      expect(res.body).not.toContain(NO_COMPLETIONS);
+      expect(inputValue(res.body, 'completions-from')).toBe('2026-09-22');
+      expect(inputValue(res.body, 'completions-to')).toBe('2026-10-21');
+      expectDateField(res.body, 'completions-from', 'date');
+      expectDateField(res.body, 'completions-to', 'date');
+
+      // The export form keeps the entered values: the valid dates stay date controls, and the
+      // unknown status is one extra selected option, with no listed status selected.
+      expect(inputValue(res.body, 'export-from')).toBe('2026-10-01');
+      expect(inputValue(res.body, 'export-to')).toBe('2026-10-21');
+      expectDateField(res.body, 'export-from', 'date');
+      expectDateField(res.body, 'export-to', 'date');
+      expect(exportStatusOptions(res.body)).toEqual([
+        '<option value="">All</option>',
+        '<option value="To do">To do</option>',
+        '<option value="In progress">In progress</option>',
+        '<option value="Done">Done</option>',
+        '<option value="Urgent" selected>Urgent (invalid)</option>',
+      ]);
     });
 
     it('answers a repeated parameter with 400 "Bad request."', async () => {

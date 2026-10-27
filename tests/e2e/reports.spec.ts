@@ -4,6 +4,12 @@
  * completions chart drawn from (and identical to) the table, the table-only fallback without
  * JavaScript, range validation, and the downloaded CSV compared field by field with the database.
  *
+ * The completions table is checked as the user reads it, through the visible text of each row's
+ * Date and Completed cells, and through the `data-day` and `data-count` attributes the chart
+ * copies. The chart is checked through its bars' rendered sizes: zero height for a zero count, a
+ * positive one for a positive count, and heights in proportion to the counts. Only ratios are
+ * compared, so the checks hold whatever internal dimensions the chart script draws in.
+ *
  * Each test signs up its own user, so tests share no data and run safely in parallel workers.
  *
  * "Today" is computed here in UTC and cross-checked against the server through the completions
@@ -72,6 +78,27 @@ interface DayCountAttributes {
   count: string | null;
 }
 
+/**
+ * The text one completions-table row shows the user: its Date row header and its Completed cell,
+ * each `null` when the row lacks that cell.
+ */
+interface DayCountCells {
+  day: string | null;
+  count: string | null;
+}
+
+/** A completions row as the page must show it, and as its `data-day` and `data-count` carry it. */
+interface ExpectedRow {
+  day: IsoDate;
+  count: string;
+}
+
+/** A chart bar's `data-day` and `data-count`, with the size of its rendered box in CSS pixels. */
+interface BarGeometry extends DayCountAttributes {
+  width: number;
+  height: number;
+}
+
 /** The completions range form, `GET /reports`. */
 function completionsForm(page: Page): Locator {
   return page.locator('form[action="/reports"]');
@@ -99,7 +126,21 @@ function defaultRangeDays(today: IsoDate): IsoDate[] {
   );
 }
 
-/** Reads `data-day` and `data-count` from every matched element, in document order. */
+/**
+ * The rows a completions range must show: each of `days` in order, with its count from `counts`
+ * and 0 for every day `counts` omits.
+ */
+function expectedRows(
+  days: readonly IsoDate[],
+  counts: ReadonlyMap<IsoDate, number> = new Map(),
+): ExpectedRow[] {
+  return days.map((day) => ({ day, count: String(counts.get(day) ?? 0) }));
+}
+
+/**
+ * Reads `data-day` and `data-count` from every matched element, in document order. These are the
+ * metadata the chart copies, not what the table shows: {@link visibleCompletionCells} reads that.
+ */
 function dayCountAttributes(locator: Locator): Promise<DayCountAttributes[]> {
   return locator.evaluateAll((elements) =>
     elements.map((el) => ({
@@ -107,6 +148,103 @@ function dayCountAttributes(locator: Locator): Promise<DayCountAttributes[]> {
       count: el.getAttribute('data-count'),
     })),
   );
+}
+
+/**
+ * Reads, row by row in document order, the rendered text (`innerText`) of each completions-table
+ * row's `th[scope="row"]` and its `td`, paired within the row. A missing cell reads as `null`, so
+ * a row that lost its day or count fails its comparison, whatever its attributes still say.
+ */
+function visibleCompletionCells(page: Page): Promise<DayCountCells[]> {
+  return completionRows(page).evaluateAll((rows) =>
+    rows.map((row) => {
+      const header = row.querySelector('th[scope="row"]');
+      const cell = row.querySelector('td');
+      return {
+        day: header instanceof HTMLElement ? header.innerText : null,
+        count: cell instanceof HTMLElement ? cell.innerText : null,
+      };
+    }),
+  );
+}
+
+/**
+ * Reads, in document order, each chart bar's `data-day` and `data-count` with the width and height
+ * of its rendered box (`getBoundingClientRect`: CSS pixels, after the SVG's viewBox scaling).
+ */
+function chartBarGeometry(page: Page): Promise<BarGeometry[]> {
+  return chartBars(page).evaluateAll((bars) =>
+    bars.map((bar) => {
+      const { width, height } = bar.getBoundingClientRect();
+      return {
+        day: bar.getAttribute('data-day'),
+        count: bar.getAttribute('data-count'),
+        width,
+        height,
+      };
+    }),
+  );
+}
+
+/**
+ * Requires the chart's bars, in order, to be drawn to scale with `expected`: every bar has a
+ * finite, positive width; a zero count draws a zero-height bar and a positive count a finite,
+ * positive height; each height relative to the tallest bar's equals its count relative to the
+ * largest count, so the largest count draws the tallest bar. Only these ratios are compared, never
+ * the chart script's internal dimensions, so the check holds however CSS scales the chart.
+ */
+async function expectBarsToScale(page: Page, expected: readonly ExpectedRow[]): Promise<void> {
+  const bars = await chartBarGeometry(page);
+  expect(
+    bars.map(({ day, count }) => ({ day, count })),
+    'days and counts of the measured bars',
+  ).toEqual(expected);
+  const maxCount = Math.max(0, ...expected.map((row) => Number(row.count)));
+  const maxHeight = Math.max(0, ...bars.map((bar) => bar.height));
+  for (const bar of bars) {
+    // `bar.count` equals its expected count, as required above.
+    const count = Number(bar.count);
+    const label = `bar of ${bar.day} (count ${count})`;
+    expect(Number.isFinite(bar.width), `${label}: finite width, got ${bar.width}`).toBe(true);
+    expect(bar.width, `${label}: width`).toBeGreaterThan(0);
+    if (count === 0) {
+      expect(bar.height, `${label}: height`).toBe(0);
+      continue;
+    }
+    expect(Number.isFinite(bar.height), `${label}: finite height, got ${bar.height}`).toBe(true);
+    expect(bar.height, `${label}: height`).toBeGreaterThan(0);
+    expect(bar.height / maxHeight, `${label}: height relative to the tallest bar`).toBeCloseTo(
+      count / maxCount,
+      2,
+    );
+  }
+  if (maxCount > 0) {
+    const tallest = bars.find((bar) => bar.height === maxHeight);
+    expect(tallest?.count, 'count of the tallest bar').toBe(String(maxCount));
+  }
+}
+
+/**
+ * Returns the `/reports` page `body` with the zero completions row of `day` set to `count`, in
+ * both its `data-count` and its visible Completed cell, as a server holding that many completions
+ * would render it.
+ *
+ * @throws Error when `body` has no zero row for `day`, so a markup change fails the test rather
+ *   than leaving the page unrewritten.
+ */
+function withRowCount(body: string, day: IsoDate, count: number): string {
+  const zeroRow = new RegExp(
+    `(<tr data-day="${day}" data-count=")0(">\\s*<th scope="row">${day}</th><td>)0(</td>)`,
+  );
+  const rewritten = body.replace(
+    zeroRow,
+    (_row: string, start: string, middle: string, end: string) =>
+      `${start}${count}${middle}${count}${end}`,
+  );
+  if (rewritten === body) {
+    throw new Error(`the reports page lacks a zero completions row for ${day} to rewrite`);
+  }
+  return rewritten;
 }
 
 /** Opens `/reports` with no range, the default 30 days, and requires HTTP 200. */
@@ -229,9 +367,10 @@ test.describe('reports page', () => {
     await expectSummary(page, ZERO_SUMMARY);
     await expect(page.getByText(NO_COMPLETIONS_MESSAGE, { exact: true })).toBeVisible();
     await expect(completionRows(page)).toHaveCount(DEFAULT_RANGE_DAYS);
-    expect(await dayCountAttributes(completionRows(page))).toEqual(
-      defaultRangeDays(today).map((day) => ({ day, count: '0' })),
-    );
+    const allZero = expectedRows(defaultRangeDays(today));
+    await expect(page.locator('#completions-table')).toBeVisible();
+    expect(await visibleCompletionCells(page), 'visible Date and Completed cells').toEqual(allZero);
+    expect(await dayCountAttributes(completionRows(page))).toEqual(allZero);
     await expect(page.getByRole('alert')).toHaveCount(0);
 
     const exportControls = exportForm(page);
@@ -289,17 +428,23 @@ test.describe('reports page', () => {
     await expectServerToday(page, today);
     // The script removes `hidden` only after it has appended every bar.
     await expect(page.locator('#completions-chart')).toBeVisible();
+    // The chart is an addition: the table stays beside it as the report.
+    await expect(page.locator('#completions-table')).toBeVisible();
     await expect(completionRows(page)).toHaveCount(DEFAULT_RANGE_DAYS);
     await expect(chartBars(page)).toHaveCount(await completionRows(page).count());
 
-    const rowData = await dayCountAttributes(completionRows(page));
-    expect(rowData).toEqual(
-      defaultRangeDays(today).map((day) => ({ day, count: day === today ? '1' : '0' })),
+    const expected = expectedRows(defaultRangeDays(today), new Map([[today, 1]]));
+    expect(await visibleCompletionCells(page), 'visible Date and Completed cells').toEqual(
+      expected,
     );
+    const rowData = await dayCountAttributes(completionRows(page));
+    expect(rowData).toEqual(expected);
     expect(await dayCountAttributes(chartBars(page))).toEqual(rowData);
     await expect(
       page.locator(`#completions-table tbody tr[data-day="${today}"]`),
     ).toHaveAttribute('data-count', '1');
+    // Today's completion draws a visible bar; the 29 empty days draw none.
+    await expectBarsToScale(page, expected);
     await expect(page.getByText(NO_COMPLETIONS_MESSAGE, { exact: true })).toHaveCount(0);
 
     // A one-day range draws exactly one row and one bar.
@@ -307,9 +452,64 @@ test.describe('reports page', () => {
     await expect(page.locator('#completions-chart')).toBeVisible();
     await expect(completionRows(page)).toHaveCount(1);
     await expect(chartBars(page)).toHaveCount(1);
+    const oneDayExpected = expectedRows([today], new Map([[today, 1]]));
+    expect(await visibleCompletionCells(page), 'visible Date and Completed cells').toEqual(
+      oneDayExpected,
+    );
     const oneDay = await dayCountAttributes(completionRows(page));
-    expect(oneDay).toEqual([{ day: today, count: '1' }]);
+    expect(oneDay).toEqual(oneDayExpected);
     expect(await dayCountAttributes(chartBars(page))).toEqual(oneDay);
+    await expectBarsToScale(page, oneDayExpected);
+  });
+
+  test('the chart scales its bars to distinct positive counts', async ({ page }) => {
+    await signUpAndLogIn(page);
+    const today = todayUtc(new Date());
+    const days = defaultRangeDays(today);
+    // Distinct counts, the largest in the middle of the range, so neither end bar is the tallest.
+    const counts = new Map([
+      [addDays(today, -24), 2],
+      [addDays(today, -12), 5],
+      [today, 1],
+    ]);
+    const expected = expectedRows(days, counts);
+    // Distinct positive counts need completions on distinct past days, but a task completed
+    // through the browser is completed today, and these specs reach the server only through its
+    // pages: support.ts writes nothing to the database. The server's own page is therefore
+    // rewritten on the way to the browser, giving three zero rows those counts in both their
+    // `data-count` and their visible cell, as a server holding those completions would render
+    // them. Only GET is rewritten, and the chart script then runs on the rewritten table.
+    await page.route('**/reports', async (route) => {
+      if (route.request().method() !== 'GET') {
+        await route.continue();
+        return;
+      }
+      const response = await route.fetch();
+      const body = await response.text();
+      const rewritten = [...counts].reduce(
+        (markup, [day, count]) => withRowCount(markup, day, count),
+        body,
+      );
+      // The fetched Content-Length no longer fits the body; without it the new length is sent.
+      const headers = Object.fromEntries(
+        Object.entries(response.headers()).filter(([name]) => name !== 'content-length'),
+      );
+      await route.fulfill({ response, body: rewritten, headers });
+    });
+
+    await openReports(page);
+    await expectServerToday(page, today);
+    await expect(page.locator('#completions-chart')).toBeVisible();
+    await expect(page.locator('#completions-table')).toBeVisible();
+    await expect(completionRows(page)).toHaveCount(DEFAULT_RANGE_DAYS);
+    await expect(chartBars(page)).toHaveCount(DEFAULT_RANGE_DAYS);
+    expect(await visibleCompletionCells(page), 'visible Date and Completed cells').toEqual(
+      expected,
+    );
+    const rowData = await dayCountAttributes(completionRows(page));
+    expect(rowData).toEqual(expected);
+    expect(await dayCountAttributes(chartBars(page))).toEqual(rowData);
+    await expectBarsToScale(page, expected);
   });
 
   test('a start date after the end date shows the message and no data', async ({ page }) => {
@@ -336,6 +536,9 @@ test.describe('reports page', () => {
       await expect(chartBars(page)).toHaveCount(0);
       await expect(page.locator('#completions-table')).toBeVisible();
       await expect(completionRows(page)).toHaveCount(DEFAULT_RANGE_DAYS);
+      expect(await visibleCompletionCells(page), 'visible Date and Completed cells').toEqual(
+        expectedRows(defaultRangeDays(today), new Map([[today, 1]])),
+      );
       await expect(
         page.locator(`#completions-table tbody tr[data-day="${today}"]`),
       ).toHaveAttribute('data-count', '1');
