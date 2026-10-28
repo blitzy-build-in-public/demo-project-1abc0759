@@ -364,6 +364,14 @@ scripts/                                    build helper (copy-assets.mjs)
   deployment's reverse proxy should rate-limit `POST /signup`. Login has its built-in lockout:
   5 failures within 15 minutes refuse that email for 15 minutes.
 - **No Content-Security-Policy or helmet-style security headers** are set; they are out of scope.
+- **deepmerge 4.3.1 prototype poisoning** (GHSA-gcqx-w48m-w2h4, CVE-2026-93753, CWE-1321, low).
+  It is a development-only dependency of Jest (`jest-config`) and absent from the production
+  dependencies, so `npm audit` reports six low findings from this one advisory while
+  `npm audit --omit=dev` reports none. No patched release exists, and the exact pins are kept
+  rather than forcing a downgrade with `npm audit fix --force`. Keep the Jest configuration static
+  and trusted: never merge external or user-supplied objects into it, and reject prototype-bearing
+  keys (`__proto__`, `constructor`, `prototype`) before adding any external merge source. Upgrade
+  once a compatible patched Jest or deepmerge release is published.
 
 ## Out of scope for v1
 

@@ -99,12 +99,10 @@ interface BarGeometry extends DayCountAttributes {
   height: number;
 }
 
-/** The completions range form, `GET /reports`. */
 function completionsForm(page: Page): Locator {
   return page.locator('form[action="/reports"]');
 }
 
-/** The CSV export form, `GET /reports/export`. */
 function exportForm(page: Page): Locator {
   return page.locator('form[action="/reports/export"]');
 }

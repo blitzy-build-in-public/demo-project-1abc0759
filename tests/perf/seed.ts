@@ -142,8 +142,9 @@ function singleCount(rows: readonly { n: number }[], what: string): number {
  * Signs a new perf user up through the running application and seeds it with
  * {@link PERF_TASK_COUNT} tasks.
  *
- * A failure at any step deletes the user (if the sign-up created it) and ends the pool before the
- * error is rethrown, so a failed seed leaves no perf user behind.
+ * On failure, cleanup attempts to delete the user (if the sign-up created it) and to end the pool
+ * before the original error is rethrown. Cleanup failures are logged, not thrown, so deletion is
+ * best effort.
  *
  * @param baseUrl - Origin of the running application, for example `http://localhost:3000`.
  * @param databaseUrl - Connection string of the database that application uses.

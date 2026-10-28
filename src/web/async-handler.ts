@@ -29,8 +29,8 @@ export type AsyncRequestHandler = (
  * Express treats a falsy argument to `next` as "no error" and the strings `'route'` and `'router'`
  * as instructions to skip handlers, so a promise rejected with one of these would silently
  * continue to the next route or the 404 page instead of reaching the error handler. Such reasons
- * are wrapped in an `Error` (the original kept as `cause`), as Express 5 does for rejected
- * promises; every other reason is forwarded unchanged.
+ * are wrapped in an `Error` (the original kept as `cause`) to keep Express control-flow sentinel
+ * values on the error path; every other reason is forwarded unchanged.
  */
 function toForwardedError(reason: unknown): unknown {
   if (!reason || reason === 'route' || reason === 'router') {

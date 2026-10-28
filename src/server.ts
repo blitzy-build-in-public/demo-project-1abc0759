@@ -9,11 +9,12 @@
  * and is the only file that handles signals. Importing it starts nothing: the thread-pool size is
  * set, and {@link main} runs, only when this file is the process entry.
  *
- * The configuration is never logged, whole or in part: `DATABASE_URL` carries the database
- * password and `SESSION_SECRET` is a secret. Once it is read, every component logs through one
- * logger that also redacts the database user name and password, where each stands as the
- * credential, from driver error text, and the driver's `PG*` variables are deleted, so that
- * `DATABASE_URL` alone decides how the pool connects.
+ * Never log the configuration object, `DATABASE_URL` or `SESSION_SECRET`; logging the public
+ * listening port is allowed. `DATABASE_URL` carries the database password and `SESSION_SECRET`
+ * is a secret. Once the configuration is read, every component logs through one logger that also
+ * redacts the database user name and password, where each stands as the credential, from driver
+ * error text, and the driver's `PG*` variables are deleted, so that `DATABASE_URL` alone decides
+ * how the pool connects.
  */
 
 import http from 'node:http';
@@ -38,7 +39,6 @@ import { createTaskService } from './tasks/task-service';
 /** Interval between purges of expired sessions and old failed-login rows: 15 minutes. */
 const PURGE_INTERVAL_MS = 15 * 60 * 1000;
 
-/** Signals that start a graceful shutdown. */
 const SHUTDOWN_SIGNALS: readonly NodeJS.Signals[] = ['SIGTERM', 'SIGINT'];
 
 /**
@@ -67,7 +67,6 @@ interface TrackedServer {
   closing: boolean;
 }
 
-/** What a graceful shutdown stops, in the order it stops them. */
 interface RunningServer {
   logger: Logger;
   purgeJob: PurgeJob;
@@ -160,12 +159,11 @@ function closeServer(tracked: TrackedServer): Promise<void> {
   const { server, owed } = tracked;
   return new Promise<void>((resolve, reject): void => {
     tracked.closing = true;
-    // `net.Server#close` only stops listening. `http.Server#close` would first destroy every
-    // connection Node counts as idle, which it does once a whole request has arrived, so it would
-    // cut short a response that has ended but is still queued for a slow reader. The loop below
-    // and the tracking close each connection instead. The HTTP server's header and request timeout
-    // checker, which only `http.Server#close` stops, keeps running on its unref'd timer until the
-    // process exits; it holds nothing open, so that is harmless.
+    // Use `net.Server#close` because `http.Server#close`'s idle cleanup may destroy a response
+    // after `end()` was called but before its bytes finish flushing. Drain tracked responses
+    // through their close events instead (the loop below and the tracking). The HTTP header and
+    // request timeout checker, which only `http.Server#close` stops, remains on its unref'd timer
+    // until the process exits; it holds nothing open.
     net.Server.prototype.close.call(server, (err?: Error): void => {
       if (err === undefined) {
         resolve();
@@ -199,9 +197,8 @@ function logBestEffort(write: () => void): void {
 }
 
 /**
- * Ends the pool on a start-up failure path. A failure to end it is logged as `pool end failed`,
- * best effort, and never rethrown: the start-up failure is already logged and has set exit code
- * 1, and it stays the outcome the process reports.
+ * Ends the pool after a start-up failure; logs a pool-end error as `pool end failed`, best effort,
+ * without rethrowing. {@link main} retains the start-up failure and sets exit code 1 after cleanup.
  */
 async function endPoolAfterFailure(pool: Pool, logger: Logger): Promise<void> {
   try {
@@ -332,7 +329,7 @@ function handleShutdownSignals(running: RunningServer): void {
  * configuration variables. libuv reads the setting once, when its thread pool is first used, so
  * this runs before {@link main}; loading this file's modules does not use the thread pool.
  *
- * @param env The process environment, which libuv reads the setting from.
+ * @param env - The process environment, which libuv reads the setting from.
  */
 function fixThreadPoolSize(env: NodeJS.ProcessEnv): void {
   // One thread per pooled connection: each login holds its connection for the length of the

@@ -15,8 +15,8 @@ import { assertStorableText, readField } from './params';
 import type { FormResult } from './params';
 
 /**
- * Message for every failed login: an unknown email, a wrong password and a blank field all get
- * exactly this text, so the response never reveals whether an account exists.
+ * Message for invalid credentials and blank credential submissions; unknown emails and wrong
+ * passwords use the same text, so the response never reveals whether an account exists.
  */
 export const INVALID_CREDENTIALS_MESSAGE = 'Email or password is incorrect.';
 

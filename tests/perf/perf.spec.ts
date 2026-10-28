@@ -13,7 +13,8 @@
  * this spec never touches the test-database helpers: it targets the application database, so it
  * never truncates and touches only the rows of the user it creates and then deletes.
  *
- * Nothing sensitive is printed or written: no email, password, session token or database URL.
+ * The printed timing summary and `perf.json` omit the perf user's email, password and session
+ * token, and the database URL.
  */
 
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -318,8 +319,9 @@ test.describe('SC12 performance with 10,000 tasks', () => {
         await context.close();
       }
     } finally {
-      // Always runs, so no perf user is left behind; the cascades and the login-attempts trigger
-      // remove its sessions, tasks and failed attempts.
+      // Attempts the user cleanup even if closing the browser context fails. Deleting the user
+      // removes its sessions and tasks by cascade, and its failed attempts through the
+      // login-attempts trigger.
       if (user !== undefined) {
         await deletePerfUser(user);
       }

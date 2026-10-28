@@ -361,8 +361,14 @@ export type HeldGetOutcome = 'abandon' | 'answer';
  * @param cookie - The `Cookie` request header, for example `sid=<signed value>`.
  * @param outcome - Whether the client waits for the response or abandons the request.
  * @returns The response status, or `null` for an abandoned request.
- * @throws Error when the response arrives before the request reaches the gate, or when the
- *   connection or the real `authenticate` fails.
+ * @throws Error, for either outcome, when the response arrives before the request reaches the
+ *   gate, or when the connection or the response stream fails, or the response has no status,
+ *   before the gate is reached.
+ * @throws For `'answer'`, the same connection, stream and missing-status errors once the gate
+ *   opens. HTTP error responses resolve with their status instead, such as the 503 or 500 page
+ *   for a rejection from the real `authenticate`.
+ * @throws For `'abandon'`, a rejection from the real `authenticate` call, and an Error when the
+ *   server-side socket of the held request closes without being destroyed.
  */
 export async function sendHeldGet(
   app: TestApp,

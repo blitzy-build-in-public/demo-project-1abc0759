@@ -266,9 +266,8 @@ export function createTaskRouter(deps: { tasks: TaskService; csrf: Csrf }): Rout
     asyncHandler(async (req, res): Promise<void> => {
       const user = currentUser(req);
       const id = taskIdOf(req);
-      // The owner-scoped lookup runs before the body is parsed, so an invalid payload sent to a
-      // missing or foreign task gets the same 404 as a valid one, never a 422 or 400 that would
-      // reveal the task exists.
+      // After body parsing and CSRF checks, resolve ownership before task-field validation so
+      // missing and foreign tasks receive the same 404 even when the task fields are invalid.
       const task = await loadOwnedTask(tasks, user.id, id);
       const body: unknown = req.body;
       // A browser submits every line break as CRLF, so the stored title and description let the
