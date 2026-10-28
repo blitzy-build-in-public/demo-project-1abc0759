@@ -13,17 +13,9 @@
  * reads `DATABASE_URL` nor connects. The connection string is never logged, because it carries
  * the database password, and neither is a rejected argument, which can hold one.
  *
- * Every line written once `DATABASE_URL` is accepted, the runner's and the pool's included, has
- * the database user name and password of that URL replaced by `[redacted]` in the error's
- * message and stack, the only parts of a line that carry driver text, where each stands as the
- * credential. The user name can be an email address, and PostgreSQL quotes it in its own
- * messages, for example `password authentication failed for user "…"` (SQLSTATE 28P01); the
- * same characters in a file path or a database name, such as
- * `database "<user>_missing" does not exist` or `pg-pool/index.js` for a password `index`, are
- * kept. The envelope (`time`, `level`, `msg`), the fields and the error's name and code are kept
- * as written. The redaction is the shared logger's own, the boundary `src/server.ts` uses as well:
- * `databaseCredentials` in `src/config.ts` lists the values, and `createLogger` replaces them
- * before a line is serialized.
+ * Errors logged once `DATABASE_URL` is accepted, the runner's and the pool's included, go through
+ * the shared logger's credential redaction for that URL's user name and password; see
+ * `databaseCredentials` in `src/config.ts` and `LoggerOptions` in `src/shared/logger.ts`.
  */
 
 import { parseArgs } from 'node:util';
@@ -120,11 +112,18 @@ function createCliLogger(databaseUrl: string | undefined): Logger {
  * The result is reported through `process.exitCode` rather than `process.exit()`, so the log
  * lines written to stdout are flushed before the process ends.
  *
- * @param args The command-line arguments after the script path, `process.argv.slice(2)` for the
+ * @param args - The command-line arguments after the script path, `process.argv.slice(2)` for the
  *   process entry. Defaults to none, which runs the migrations.
- * @returns A promise that resolves once the run has finished and the pool is ended. Every
- *   expected failure is logged and resolved; only an error that is not a {@link ConfigError}
- *   while reading the configuration rejects.
+ * @returns A promise that resolves after the usage text, a rejected command line, an invalid
+ *   `DATABASE_URL`, or a migration run whose outcome was handled (success, or a failure logged
+ *   as `migration failed`), a log write that fails inside the run included. Once the pool is
+ *   created, its end is awaited before the promise settles, whatever the outcome, and a failed
+ *   end is logged as `pool end failed`. It may reject when a failure escapes that handling:
+ *   writing the usage text or the invalid-arguments or configuration log line fails; building
+ *   the redacting logger, clearing the `PG*` variables or creating the pool throws; reading the
+ *   configuration throws an error that is not a {@link ConfigError}; or the `migration failed`
+ *   or `pool end failed` line cannot be written. The process entry's catch chain then sets exit
+ *   code 1 and attempts to log the escaped failure as `migration failed`.
  */
 export async function main(args: readonly string[] = []): Promise<void> {
   const request = parseCliArgs(args);

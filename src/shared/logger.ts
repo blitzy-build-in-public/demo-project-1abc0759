@@ -13,9 +13,11 @@
  * reach the output.
  *
  * Neither method throws because of its arguments, since both are called from error paths:
- * every read of an error or field is guarded against throwing getters and proxies, values are
- * reduced to strings and finite numbers, and a line that cannot be serialized is replaced by a
- * reduced one.
+ * every read of an error or field is guarded against throwing getters and proxies, an error's
+ * name, message and stack are reduced to strings and its code to a string or finite number,
+ * structured fields keep primitive values only (strings, numbers and booleans, a non-finite
+ * number being written as `null`, as JSON prints it), and a line that cannot be serialized is
+ * replaced by a reduced one.
  *
  * A logger can also be given credentials to redact ({@link LoggerOptions}): the process entry
  * points pass the database user name and password, because PostgreSQL quotes the user name,
@@ -35,7 +37,11 @@
  */
 export type LogFields = Record<string, string | number | boolean>;
 
-/** Logger with the two levels the application uses. Both methods write synchronously. */
+/**
+ * Logger with the two levels the application uses. Both methods are synchronous: each call
+ * hands its one line to the output in a single write before it returns, and the output's own
+ * contract then governs buffering and delivery.
+ */
 export interface Logger {
   /**
    * Records a routine event: `server listening` (`port`), `migrations applied` (`count`,
@@ -73,7 +79,6 @@ const UNREADABLE_MESSAGE = '[unreadable message]';
 /** `msg` of a line whose `msg` could not be serialized. */
 const UNSERIALIZABLE_MSG = '[unserializable msg]';
 
-/** Text that stands in for each occurrence of a redacted value. */
 const REDACTED = '[redacted]';
 
 /** `err.message` when redacting it failed, so that the unredacted text is never written. */
@@ -191,11 +196,14 @@ function isError(value: unknown): value is Error {
 }
 
 /**
- * Reduces a thrown value to the fields a log may hold. The error's own keys are never
- * enumerated: only `code` is read, falling back to `cause.code` so that a wrapping error such
- * as `DatabaseUnavailableError` reports the driver code (`ECONNREFUSED`, `57P01`). The cause
- * itself is never traversed or serialized. A property that is unreadable or of the wrong type
- * is omitted, except `message`, which {@link describeMessage} always makes a string.
+ * Reduces a thrown value to the fields a log may hold. An `Error` is reduced to its `name`,
+ * `message`, `code` and `stack`, each read by name, so its own keys are never enumerated.
+ * `code` falls back to `cause.code`, so that a wrapping error such as `DatabaseUnavailableError`
+ * reports the driver code (`ECONNREFUSED`, `57P01`); no other property of the cause is read, and
+ * the cause itself is never traversed or serialized. A property that is unreadable or of the
+ * wrong type (a `code` that is neither a string nor a finite number) is omitted, except
+ * `message`, which {@link describeMessage} always makes a string. A value that is not an `Error`
+ * becomes `{ message }`, with the text {@link describeNonError} gives it.
  */
 function serializeError(err: unknown): SerializedError {
   if (!isError(err)) {
@@ -288,9 +296,10 @@ function redactionPattern(credentials: RedactedCredentials): RegExp | null {
 
 /**
  * Replaces every match of `pattern` in the error's `message` and `stack`, the only values of a
- * line that carry driver text, in place. A replacement that fails, which only a text near the
- * engine's maximum string length can cause, gives a fixed `message` and drops the `stack`, so an
- * unredacted value is never written and this function never throws.
+ * line that carry driver text, in place. The two are redacted independently: a `message` whose
+ * replacement throws becomes the fixed {@link UNREDACTABLE_MESSAGE}, and a `stack` whose
+ * replacement throws is dropped, each leaving the other field's outcome unchanged. Neither field
+ * is ever written unredacted, and this function never throws.
  */
 function redactError(serialized: SerializedError, pattern: RegExp): void {
   try {
@@ -371,9 +380,10 @@ function serializeEntry(entry: Record<string, unknown>): string {
 /**
  * Creates a logger that writes one JSON line per call to `out`.
  *
- * @param out Destination stream; defaults to the process's standard output.
- * @param options Credentials to redact from logged errors' message and stack; none by default.
- * @returns A {@link Logger} whose methods write synchronously and never buffer or filter.
+ * @param out - Destination stream; defaults to the process's standard output.
+ * @param options - Credentials to redact from logged errors' message and stack; none by default.
+ * @returns A {@link Logger} that submits one serialized line to `out.write` per call,
+ *   synchronously; buffering, delivery and stream failures follow the stream's own contract.
  */
 export function createLogger(
   out: NodeJS.WritableStream = process.stdout,

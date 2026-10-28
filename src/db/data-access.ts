@@ -35,7 +35,7 @@ import type { UsersRepo } from './users-repo';
  * keeps that key space apart from the two-int4 form the migration runner locks with `(7253, 1)`,
  * so the two can never block each other. The `login:` prefix keeps the key specific to this use.
  */
-const LOGIN_LOCK_SQL = "SELECT pg_advisory_xact_lock(hashtextextended('login:' || $1::text, 0))";
+const LOGIN_LOCK_SQL = `SELECT pg_advisory_xact_lock(hashtextextended('login:' || $1::text, 0))`;
 
 /**
  * How a `withLoginLock` call ended, as the next call queued for the same email reads it. Only a

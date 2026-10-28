@@ -78,8 +78,9 @@ const NOT_QUERYABLE_MESSAGES: readonly string[] = [
 /**
  * Key under which a client from {@link checkOut} carries the first connection error it met while
  * checked out: one it emitted, or one a statement through {@link query} failed with. The key is
- * present, with no value, from checkout to release, which tells such a client apart from the
- * pool. The error lives on the client itself, so this module keeps no state of its own.
+ * present from checkout to release, holding `undefined` until the first connection error is
+ * recorded and that error afterwards; its presence tells such a client apart from the pool. The
+ * error lives on the client itself, so this module keeps no state of its own.
  */
 const RECORDED_CONNECTION_ERROR: unique symbol = Symbol('recordedConnectionError');
 
@@ -94,12 +95,10 @@ type TrackedClient = PoolClient & { [RECORDED_CONNECTION_ERROR]?: Error };
  */
 const MAX_NESTING_DEPTH = 3;
 
-/** Returns `source.code` when it is a string. */
 function readCode(source: object): string | undefined {
   return 'code' in source && typeof source.code === 'string' ? source.code : undefined;
 }
 
-/** Returns `source.message` when it is a string. */
 function readMessage(source: object): string | undefined {
   return 'message' in source && typeof source.message === 'string' ? source.message : undefined;
 }
@@ -296,7 +295,6 @@ function trackConnectionErrors(client: PoolClient): PoolClient {
     client.removeListener('error', recordError);
     delete tracked[RECORDED_CONNECTION_ERROR];
     if (failed && !args[0]) {
-      // A connection that failed must not go back to the pool, so it is destroyed.
       poolRelease.call(client, true);
     } else {
       poolRelease.call(client, ...args);

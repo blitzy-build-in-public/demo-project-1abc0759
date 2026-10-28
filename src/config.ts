@@ -221,7 +221,6 @@ function percentDecode(value: string): string {
   }
 }
 
-/** Returns the distinct non-empty `values`, longest first. */
 function distinctLongestFirst(values: readonly string[]): string[] {
   const distinct = new Set(values.filter((value) => value !== ''));
   return [...distinct].sort((a, b) => b.length - a.length);

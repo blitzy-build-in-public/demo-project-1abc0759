@@ -13,8 +13,9 @@ import type { Pool } from 'pg';
 import type { Logger } from '../shared/logger';
 
 // DATE (OID 1082) stays the `YYYY-MM-DD` text PostgreSQL sends. The default parser builds a
-// JavaScript `Date` at local midnight, which lands on another UTC day on any host outside UTC;
-// due dates and report days are `IsoDate` strings throughout the application.
+// JavaScript `Date` at the host's local midnight, which makes a date-only value depend on the
+// process time zone and can shift its UTC calendar day (east of UTC, to the previous day); due
+// dates and report days are `IsoDate` strings throughout the application.
 pg.types.setTypeParser(pg.types.builtins.DATE, (value: string): string => value);
 
 // INT8 (OID 20) becomes a `number` instead of the default string. Identity ids and `count(*)`
@@ -101,7 +102,7 @@ class TeardownOnFailureClient extends pg.Client {
   /**
    * Creates a client for `config` that never reads a password file.
    *
-   * @param config The pool's client settings, the connection string included.
+   * @param config - The pool's client settings, the connection string included.
    */
   constructor(config?: string | pg.ClientConfig) {
     super(config);
@@ -124,7 +125,7 @@ class TeardownOnFailureClient extends pg.Client {
   /**
    * Connects to the server, destroying the socket when the first attempt fails.
    *
-   * @param callback Receives pg's original error, or `null` and this client once it is ready.
+   * @param callback - Receives pg's original error, or `null` and this client once it is ready.
    */
   override connect(callback: ConnectCallback): void;
 
@@ -186,8 +187,8 @@ class TeardownOnFailureClient extends pg.Client {
  * example when the database restarts, is logged as `idle client error` rather than raised as an
  * unhandled `error` event that would end the process. The pool replaces that client on demand.
  *
- * @param databaseUrl `postgres://` or `postgresql://` connection string, validated by the caller.
- * @param logger Receives idle-client failures.
+ * @param databaseUrl - `postgres://` or `postgresql://` connection string, validated by the caller.
+ * @param logger - Receives idle-client failures.
  * @returns A new pool; the caller owns it and ends it at shutdown.
  */
 export function createPool(databaseUrl: string, logger: Logger): Pool {

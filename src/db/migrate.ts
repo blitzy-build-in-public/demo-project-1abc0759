@@ -17,7 +17,11 @@ import type { Logger } from '../shared/logger';
 import { checkOut, query } from './query';
 
 /**
- * Takes the runner's session-level advisory lock, blocking until any other runner releases it.
+ * Takes the runner's session-level advisory lock, waiting while another runner holds it only as
+ * long as the pool's statement and query timeouts allow: PostgreSQL cancels the wait at the
+ * 4.5-second `statement_timeout` (SQLSTATE `57014`), and pg's 5-second `query_timeout` backs that
+ * up. The query helper reports either as `DatabaseUnavailableError`, which fails this run for its
+ * caller to retry: at start-up through the container's restart policy, from the CLI by a rerun.
  * The two-`int4` key form lives in a key space PostgreSQL keeps apart from the single 64-bit
  * keys of the per-email login locks, so the two can never collide.
  */
@@ -87,9 +91,10 @@ async function rollBack(client: PoolClient): Promise<boolean> {
  * Every statement runs on one client checked out of `pool`, because a session-level advisory
  * lock belongs to one database session. The lock is taken before the bookkeeping table is
  * created, so concurrent runners are serialised from their first statement: one applies the
- * pending files and the others then find nothing left to do. Each file is applied with its
- * version record in one transaction, so it is all-or-nothing, and a failure stops the run with
- * the files before it committed.
+ * pending files and the others then find nothing left to do. A runner whose wait for the lock
+ * outlasts the pool's 4.5-second statement timeout fails as database-unavailable instead, having
+ * applied nothing. Each file is applied with its version record in one transaction, so it is
+ * all-or-nothing, and a failure stops the run with the files before it committed.
  *
  * On success the runner logs `migrations applied` with `count` and the comma-joined `versions`,
  * also when nothing was pending. A failure is not logged here; it is rethrown for the caller to
