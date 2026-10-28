@@ -1,0 +1,42 @@
+{
+  "name": "task-tracker",
+  "version": "1.0.0",
+  "description": "Personal task tracker, server-rendered with Express 4 and PostgreSQL 16.",
+  "private": true,
+  "type": "commonjs",
+  "main": "dist/server.js",
+  "engines": {
+    "node": ">=20.19.0 <21"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "tsc -p tsconfig.build.json && node scripts/copy-assets.mjs",
+    "migrate": "node dist/db/migrate-cli.js",
+    "migrate:local": "node --env-file=.env dist/db/migrate-cli.js",
+    "start": "node dist/server.js",
+    "start:local": "node --env-file=.env dist/server.js",
+    "test": "npm run test:unit && npm run test:integration",
+    "test:unit": "jest --selectProjects unit",
+    "test:integration": "jest --selectProjects integration --runInBand",
+    "test:e2e": "npm run build && playwright test --project=e2e",
+    "test:perf": "playwright test --project=perf"
+  },
+  "dependencies": {
+    "bcrypt": "6.0.0",
+    "cookie-parser": "1.4.7",
+    "express": "4.22.3",
+    "pg": "8.23.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.64.1",
+    "@types/bcrypt": "6.0.0",
+    "@types/cookie-parser": "1.4.10",
+    "@types/express": "4.17.25",
+    "@types/jest": "30.0.0",
+    "@types/node": "20.19.43",
+    "@types/pg": "8.23.1",
+    "jest": "30.5.2",
+    "ts-jest": "29.4.14",
+    "typescript": "6.0.3"
+  }
+}

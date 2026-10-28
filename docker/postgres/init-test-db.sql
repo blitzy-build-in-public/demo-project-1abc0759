@@ -1,0 +1,22 @@
+-- Creates the tasktracker_test database for the Jest integration tests and the
+-- Playwright end-to-end tests, beside the development database tasktracker that
+-- the image creates from POSTGRES_DB.
+--
+-- The postgres entrypoint runs this file's SQL as the database role POSTGRES_USER
+-- (tasktracker), so the new database is owned by tasktracker and needs no grants.
+-- It runs only when the db volume is first initialised. To add the test database
+-- to an older volume, or to recreate it, run `docker compose down -v` and then
+-- `docker compose up -d db`.
+--
+-- psql reads this file as the container's operating-system user postgres, not as
+-- root, so the checked-out file must be world-readable (mode 644); a 600 file
+-- fails with "Permission denied" and the container exits.
+--
+-- No schema is created here. Schema changes are made only through the versioned
+-- migrations in src/db/migrations/, which runMigrations applies from the test
+-- global setups and from src/server.ts.
+--
+-- CREATE DATABASE cannot run inside a transaction block, so the statement stands
+-- alone; psql runs this file in autocommit mode.
+
+CREATE DATABASE tasktracker_test;

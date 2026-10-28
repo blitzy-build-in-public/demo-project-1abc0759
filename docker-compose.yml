@@ -1,0 +1,56 @@
+# Local stack: the PostgreSQL 16 database (`docker compose up -d db`) for development and for the
+# integration and end-to-end tests, and the production-mode application image
+# (`docker compose up -d --build`) for full-stack and performance runs.
+#
+# POSTGRES_PASSWORD and SESSION_SECRET come from the shell or from .env by required interpolation:
+# compose refuses to start when either is unset or empty, and no secret is written here.
+# POSTGRES_PASSWORD is placed unencoded inside the app's DATABASE_URL, so it must contain only
+# URL-safe characters (letters, digits, - . _ ~).
+
+services:
+  db:
+    image: postgres:16.15-bookworm
+    environment:
+      POSTGRES_USER: tasktracker
+      POSTGRES_DB: tasktracker
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    ports:
+      - "5432:5432"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+      # Creates tasktracker_test the first time the db-data volume is initialised, and never again.
+      - ./docker/postgres/init-test-db.sql:/docker-entrypoint-initdb.d/init-test-db.sql:ro
+    healthcheck:
+      # Checked over TCP, not the Unix socket: during first initialisation the entrypoint runs a
+      # temporary socket-only server, so a socket check would pass before the init script has
+      # finished and before the app can reach db:5432.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U tasktracker -d tasktracker"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    # An init process runs as PID 1 and forwards SIGTERM and SIGINT to node. A signal that arrives
+    # during start-up, before the server registers its handlers, then gets its default action
+    # instead of being ignored, as the kernel ignores such signals sent to PID 1.
+    init: true
+    ports:
+      - "3000:3000"
+    # Set with `environment:` only, never `env_file: .env`: the host-run DATABASE_URL (localhost)
+    # and NODE_ENV in .env must not reach the container.
+    environment:
+      DATABASE_URL: postgres://tasktracker:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/tasktracker
+      SESSION_SECRET: ${SESSION_SECRET:?Set SESSION_SECRET in .env}
+      PORT: "3000"
+      # A literal, not interpolated, so no .env value can drop the cookies' Secure attribute.
+      NODE_ENV: production
+    depends_on:
+      db:
+        condition: service_healthy
+    # The server applies migrations before it listens and exits with code 1 if they or the
+    # configuration fail; this policy retries the start-up.
+    restart: unless-stopped
+
+volumes:
+  db-data:

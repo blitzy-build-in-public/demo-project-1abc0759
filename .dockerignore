@@ -1,0 +1,10 @@
+# The build stage runs npm ci itself, so host-built native binaries (bcrypt) never enter the image.
+node_modules
+dist
+# Local env files hold secrets. The negation must follow .env*: the last matching rule wins.
+.env*
+!.env.example
+.git
+coverage
+test-results
+playwright-report
