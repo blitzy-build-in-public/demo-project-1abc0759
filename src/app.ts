@@ -9,7 +9,7 @@
 
 import path from 'node:path';
 
-import express, { type Express } from 'express';
+import express, { type Express, type Request } from 'express';
 import cookieParser from 'cookie-parser';
 
 import type { AuthService } from './auth/auth-service';
@@ -73,21 +73,25 @@ export interface AppDeps {
  * 2. `cookieParser(SESSION_SECRET)`: verifies the signed `sid` cookie and exposes the `csrf`
  *    nonce cookie.
  * 3. `express.urlencoded` (flat parsing, 100 kb limit, {@link assertFormBodyEncoding} on the
- *    raw bytes): a malformed body, including one whose bytes or percent-escapes are not valid
- *    UTF-8, becomes 400 and an oversized one 413 through the error handler, before any route
- *    runs, so it writes nothing.
+ *    raw bytes), whose error is held for the request instead of raised: a malformed body,
+ *    including one whose bytes or percent-escapes are not valid UTF-8, and an oversized one
+ *    continue unparsed to step 7.
  * 4. `loadSession`: resolves `sid` to `req.user`, recording the request as session activity.
  * 5. `csrf.prepare`: issues the nonce cookie and the page token, which binds to the session when
  *    `req.user` is set and to `anon` otherwise, so it must follow `loadSession`.
  * 6. `noStore`: `Cache-Control: no-store` on every signed-in response, set before any route,
  *    404 or error page responds.
- * 7. The 404 handler for every `OPTIONS` request, ahead of every route: no route accepts the
+ * 7. The body error held at step 3, passed unchanged to the error handler: 400 for a malformed
+ *    body and 413 for an oversized one, before any route runs, so it writes nothing. Because it
+ *    is raised after steps 4 to 6, a signed-in request's page has the signed-in header and
+ *    `Cache-Control: no-store`, as every other failure page does.
+ * 8. The 404 handler for every `OPTIONS` request, ahead of every route: no route accepts the
  *    method, and Express's automatic `OPTIONS` answer (200 with an `Allow` list) never runs.
- * 8. `GET /`: 302 to `/tasks`.
- * 9. The auth, task and report routers, mounted at the root; each declares its full paths and
- *    applies its own session guard.
- * 10. The 404 handler for any other path or method.
- * 11. The error handler, last: the only place errors become responses, always with fixed
+ * 9. `GET /`: 302 to `/tasks`.
+ * 10. The auth, task and report routers, mounted at the root; each declares its full paths and
+ *     applies its own session guard.
+ * 11. The 404 handler for any other path or method.
+ * 12. The error handler, last: the only place errors become responses, always with fixed
  *     messages, so Express's default handler and its stack traces are never reached.
  *
  * @param deps - Configuration, clock, logger and the three services.
@@ -118,23 +122,47 @@ export function createApp(deps: AppDeps): Express {
 
   app.use(cookieParser(config.sessionSecret));
   // A body whose bytes or percent-escapes are not valid UTF-8 is malformed. `verify` checks the
-  // raw bytes before `querystring` could store U+FFFD in their place, and body-parser passes its
-  // BadRequestError, status 400 kept, to the error handler before any route runs, so nothing is
-  // written.
-  app.use(
-    express.urlencoded({
-      extended: false,
-      limit: FORM_BODY_LIMIT,
-      verify: (_req, _res, body): void => {
-        assertFormBodyEncoding(body);
-      },
-    }),
-  );
+  // raw bytes before `querystring` could store U+FFFD in their place, and body-parser reports its
+  // BadRequestError with status 400 kept.
+  const parseFormBody = express.urlencoded({
+    extended: false,
+    limit: FORM_BODY_LIMIT,
+    verify: (_req, _res, body): void => {
+      assertFormBodyEncoding(body);
+    },
+  });
+  // body-parser reports a malformed, aborted or oversized body with `next(err)`, which would skip
+  // session loading, the CSRF token and `noStore`, so a signed-in user's 400 or 413 page would
+  // get the anonymous header and no `Cache-Control: no-store`. The parser still runs here, but
+  // its error is held for the request and raised once `noStore` has run, before any route. The
+  // map belongs to this app, and its weak keys let a request's entry go with the request.
+  const heldBodyErrors = new WeakMap<Request, unknown>();
+  app.use((req, res, next): void => {
+    parseFormBody(req, res, (err?: unknown): void => {
+      if (err !== undefined) {
+        heldBodyErrors.set(req, err);
+      }
+      next();
+    });
+  });
   app.use(loadSession(auth, config));
 
   const csrf = createCsrf(config.sessionSecret, config);
   app.use(csrf.prepare);
   app.use(noStore);
+
+  // The held body-parser error goes to the error handler unchanged (400, or 413 for an oversized
+  // body), now with the request's user, token and caching header in place. No route runs for the
+  // request, so nothing is written.
+  app.use((req, _res, next): void => {
+    const err = heldBodyErrors.get(req);
+    if (err === undefined) {
+      next();
+      return;
+    }
+    heldBodyErrors.delete(req);
+    next(err);
+  });
 
   // No route accepts OPTIONS, yet Express 4 answers it itself once a router holds a route for the
   // path: 200 with an `Allow` header listing that route's methods. Ending every OPTIONS request at

@@ -44,12 +44,12 @@ interface ErrorOutcome {
  * by `loadSession`, and the CSRF token `csrf.prepare` set on `res.locals`. Neither read touches
  * the database, so the 503 page renders while it is down.
  *
- * Both must be present. A `/static` 404 and a body-parser 400 or 413 arrive before session
- * loading, and a 503 raised by `loadSession` itself leaves `req.user` unset; a request that failed
- * before `csrf.prepare` ran has no token, and a Log out form without one could only be refused.
- * `noStore` runs right after `csrf.prepare` and before any route, so every failure that reaches
- * this point with a user and a token is already marked `Cache-Control: no-store`, and a page
- * showing the email is never cached.
+ * Both must be present. A `/static` 404 arrives before session loading, and a 503 raised by
+ * `loadSession` itself leaves `req.user` unset; a request that failed before `csrf.prepare` ran
+ * has no token, and a Log out form without one could only be refused. A body-parser 400 or 413
+ * is not such a failure: `createApp` holds it until `noStore` has run. `noStore` runs right after
+ * `csrf.prepare` and before any route, so every failure that reaches this point with a user and a
+ * token is already marked `Cache-Control: no-store`, and a page showing the email is never cached.
  *
  * @returns The user and token, or `undefined` for the anonymous page.
  */

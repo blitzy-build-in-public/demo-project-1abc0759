@@ -12,10 +12,11 @@
  *   them carrying a stack frame, SQL text or driver detail, and no malformed request changing data.
  *   A logger that throws changes no response: the 500 and 503 pages are still sent, a response
  *   whose headers were already sent is still cut off, and nothing is printed to the console.
- * - The failure page's header: a signed-in 400, 403, 404 (page or task) and 500 show the
- *   navigation, "Signed in as <email>" and a Log out form whose token ends the session, while an
- *   anonymous 404, a signed-in `/static` 404 and a 503 raised by session loading show the
- *   anonymous header.
+ * - The failure page's header: a signed-in 400 (a bad filter, or body-parser's answer to a body
+ *   with an invalid percent-escape), 403, 404 (page or task), 413 (body-parser's answer to a body
+ *   over 100 kb) and 500 show the navigation, "Signed in as <email>" and a Log out form whose
+ *   token ends the session, with `Cache-Control: no-store`, while an anonymous 404 or 413, a
+ *   signed-in `/static` 404 and a 503 raised by session loading show the anonymous header.
  * - The purge job: a failed run resolves and logs `purge failed`, the same job's next run against
  *   a reachable database purges and logs its counts, and a run never overlaps another.
  * - The server's start-up and shutdown, running `main()` from `src/server.ts` in this process:
@@ -862,6 +863,19 @@ describe('failure responses and the purge failure policy', () => {
         send: (client) => client.get('/tasks?status=Bogus'),
       },
       {
+        // body-parser's error is held until the session, the token and `noStore` are in place.
+        name: 'a 400 for a POST /tasks/new body with an invalid percent-escape',
+        status: 400,
+        message: 'Bad request.',
+        instance: 'healthy',
+        send: (client) =>
+          client.postRaw(
+            '/tasks/new',
+            'title=%E0%A4%A&status=To+do&priority=Low',
+            'application/x-www-form-urlencoded',
+          ),
+      },
+      {
         name: 'a 403 for POST /logout with a wrong token',
         status: 403,
         message: 'The form has expired. Reload the page and try again.',
@@ -881,6 +895,18 @@ describe('failure responses and the purge failure policy', () => {
         message: 'Task not found.',
         instance: 'healthy',
         send: (client) => client.get('/tasks/999999/edit'),
+      },
+      {
+        name: 'a 413 for a POST /tasks/new body over the 100 kb limit',
+        status: 413,
+        message: 'Bad request.',
+        instance: 'healthy',
+        send: (client) =>
+          client.postRaw(
+            '/tasks/new',
+            formBody({ title: 'a'.repeat(110_000) }),
+            'application/x-www-form-urlencoded',
+          ),
       },
       {
         name: 'a 500 from a failing report service',
@@ -936,6 +962,18 @@ describe('failure responses and the purge failure policy', () => {
         status: 404,
         message: 'Page not found.',
         send: () => healthy.client().get('/no-such-page'),
+      },
+      {
+        // Without a `sid` cookie session loading sets no user, so the held 413 stays anonymous.
+        name: 'an anonymous POST /tasks/new body over the 100 kb limit',
+        status: 413,
+        message: 'Bad request.',
+        send: () =>
+          healthy.client().postRaw(
+            '/tasks/new',
+            formBody({ title: 'a'.repeat(110_000) }),
+            'application/x-www-form-urlencoded',
+          ),
       },
       {
         // The /static 404 answers before the cookie and session middleware run.
