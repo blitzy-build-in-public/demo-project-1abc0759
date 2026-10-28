@@ -26,8 +26,13 @@ import { parseIsoDate } from '../../shared/dates';
 import { DESCRIPTION_MAX_CHARS, TITLE_MAX_CHARS } from '../../tasks/task-rules';
 import type { TaskInput } from '../../tasks/types';
 
-// The status and priority messages are defined beside the other status parsers in `./params`;
-// re-exporting them makes this module the single import point for every task-form message.
+/**
+ * The inline status and priority messages, re-exported unchanged from `./params`.
+ *
+ * `INVALID_STATUS_MESSAGE` and `INVALID_PRIORITY_MESSAGE` are defined beside the other status
+ * parsers in `./params`. Re-exporting them makes this module the single import point for every
+ * task-form message.
+ */
 export { INVALID_PRIORITY_MESSAGE, INVALID_STATUS_MESSAGE } from './params';
 
 /** Inline message for a title that is empty or only whitespace. */
