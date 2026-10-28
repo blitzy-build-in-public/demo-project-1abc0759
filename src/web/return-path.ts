@@ -16,6 +16,13 @@ export const DEFAULT_RETURN_PATH = '/tasks';
 export const MAX_RETURN_PATH_LENGTH = 2048;
 
 /**
+ * Wire name of the return path: the `next` query parameter of `GET /login` and `GET /signup`,
+ * and the `next` field of the sign-up and login forms. The login redirects in this module and
+ * `AUTH_FIELDS.next` both take it, so the name has one spelling.
+ */
+export const RETURN_PATH_PARAM = 'next';
+
+/**
  * Fixed base that candidate paths are resolved against. It is never fetched: it only lets the
  * WHATWG URL parser tell a same-origin path from one that escapes to another host. The `.invalid`
  * top-level domain is reserved and never resolves.
@@ -37,8 +44,13 @@ const EXCLUDED_PATHS: ReadonlySet<string> = new Set(['/login', '/signup', '/logo
  */
 const CONTROL_CHAR = /\p{Cc}/u;
 
+/** `/login` carrying `returnPath`, URL-encoded, in its {@link RETURN_PATH_PARAM} parameter. */
+function loginLocation(returnPath: string): string {
+  return `/login?${RETURN_PATH_PARAM}=${encodeURIComponent(returnPath)}`;
+}
+
 /** Login location for requests that are not `GET` or `HEAD`: `/login?next=%2Ftasks`. */
-const NON_REPLAYABLE_LOGIN_REDIRECT = `/login?next=${encodeURIComponent(DEFAULT_RETURN_PATH)}`;
+const NON_REPLAYABLE_LOGIN_REDIRECT = loginLocation(DEFAULT_RETURN_PATH);
 
 /**
  * Whether `value` begins with exactly one `/`. A leading `//` or `/\` is read by browsers as a
@@ -128,7 +140,7 @@ export function sanitizeReturnPath(raw: unknown): string {
  */
 export function loginRedirectFor(req: Request): string {
   if (req.method === 'GET' || req.method === 'HEAD') {
-    return `/login?next=${encodeURIComponent(sanitizeReturnPath(req.originalUrl))}`;
+    return loginLocation(sanitizeReturnPath(req.originalUrl));
   }
   return NON_REPLAYABLE_LOGIN_REDIRECT;
 }

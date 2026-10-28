@@ -119,14 +119,16 @@ function parsePort(raw: string | undefined): number {
 }
 
 function parseNodeEnv(raw: string | undefined): AppConfig['nodeEnv'] {
-  if (raw === undefined || raw === '') {
+  if (raw === undefined) {
     return DEFAULT_NODE_ENV;
   }
   if (raw === 'production' || raw === 'development' || raw === 'test') {
     return raw;
   }
   // Unknown values such as `staging` are refused rather than treated as non-production, so a
-  // deployment typo cannot silently drop the `Secure` cookie attribute.
+  // deployment typo cannot silently drop the `Secure` cookie attribute. An empty value is
+  // refused too: `docker run -e NODE_ENV=` or a bare `NODE_ENV=` line read by `node --env-file`
+  // overrides the image's `production`, so treating it as unset would drop `Secure` silently.
   throw new ConfigError(NODE_ENV_MESSAGE);
 }
 
@@ -144,8 +146,9 @@ function parseNodeEnv(raw: string | undefined): AppConfig['nodeEnv'] {
  *   Otherwise: `SESSION_SECRET is required (at least 32 characters)`.
  * - `PORT`: optional, default `3000` when unset or empty; decimal digits only, 1 to 65535.
  *   Otherwise: `PORT must be an integer between 1 and 65535`.
- * - `NODE_ENV`: optional, default `development` when unset or empty; exactly `production`,
- *   `development` or `test`. Otherwise: `NODE_ENV must be production, development or test`.
+ * - `NODE_ENV`: optional, default `development` only when unset; exactly `production`,
+ *   `development` or `test`, so an empty value is refused as well.
+ *   Otherwise: `NODE_ENV must be production, development or test`.
  *
  * @param env - The process environment, passed in by the entry point; never read globally.
  * @returns The validated configuration, with `isProduction` true only for `production`.

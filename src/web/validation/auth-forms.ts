@@ -10,7 +10,7 @@
 
 import { normalizeEmail, validateEmail, validatePassword } from '../../auth/password-policy';
 import { BadRequestError } from '../../shared/errors';
-import { sanitizeReturnPath } from '../return-path';
+import { RETURN_PATH_PARAM, sanitizeReturnPath } from '../return-path';
 import { assertStorableText, readField } from './params';
 import type { FormResult } from './params';
 
@@ -28,7 +28,8 @@ export const LOCKOUT_MESSAGE = 'Too many failed attempts. Try again later.';
 
 /**
  * Wire names of the sign-up and login forms: the body keys of `POST /signup` and `POST /login`.
- * `next` is also the return-path query parameter of `GET /signup` and `GET /login`.
+ * `next` is also the return-path query parameter of `GET /signup` and `GET /login`; it is
+ * {@link RETURN_PATH_PARAM} from `return-path.ts`, which that module's login redirects use too.
  *
  * The parsers in this module read exactly these keys, and the pages' `name` attributes and links
  * and the routes' query reads and redirects use them, so each wire name has one spelling.
@@ -36,7 +37,7 @@ export const LOCKOUT_MESSAGE = 'Too many failed attempts. Try again later.';
 export const AUTH_FIELDS = Object.freeze({
   email: 'email',
   password: 'password',
-  next: 'next',
+  next: RETURN_PATH_PARAM,
 } as const);
 
 /**

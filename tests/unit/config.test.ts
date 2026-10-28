@@ -90,10 +90,11 @@ function expectConfigError(fn: () => unknown, message: string): void {
 }
 
 describe('loadConfig defaults and accepted values', () => {
+  // An empty PORT counts as unset; an empty NODE_ENV is refused (see the refusals below).
   test.each<[string, NodeJS.ProcessEnv]>([
-    ['unset', {}],
-    ['empty', { PORT: '', NODE_ENV: '' }],
-  ])('defaults PORT to 3000 and NODE_ENV to development when they are %s', (_case, extra) => {
+    ['both unset', {}],
+    ['PORT empty, NODE_ENV unset', { PORT: '' }],
+  ])('defaults PORT to 3000 and NODE_ENV to development when %s', (_case, extra) => {
     expect(loadConfig(env(extra))).toEqual(DEFAULTS);
   });
 
@@ -121,8 +122,9 @@ describe('loadConfig refusals', () => {
     ['SESSION_SECRET', SESSION_SECRET_MESSAGE, [undefined, '', 's'.repeat(31)]],
     // Decimal digits only: `Number()` would read the last four as 1000, 80, 80 and 80.
     ['PORT', PORT_MESSAGE, ['0', '65536', 'abc', '3.5', '-1', '1e3', '0x50', '+80', ' 80']],
-    // Exact values only, so a typo cannot silently drop the `Secure` cookie attribute.
-    ['NODE_ENV', NODE_ENV_MESSAGE, ['staging', 'Production', 'production ']],
+    // Exact values only, so a typo cannot silently drop the `Secure` cookie attribute. An empty
+    // value is refused too, because it overrides the image's `production` instead of unsetting it.
+    ['NODE_ENV', NODE_ENV_MESSAGE, ['', 'staging', 'Production', 'production ']],
   ])('%s', (name, message, values) => {
     test.each(values)('refuses %p with the fixed message', (value) => {
       expectConfigError(() => loadConfig(envWith(name, value)), message);
