@@ -83,13 +83,10 @@ export interface DeleteConfirmPageView {
   filters: TaskFilters;
 }
 
-/** A task status label. */
 type Status = Task['status'];
 
-/** Status options of the task form, in display order. */
 const STATUS_OPTIONS: readonly SelectOption[] = TASK_STATUSES.map((s) => ({ value: s, label: s }));
 
-/** Priority options of the task form, in display order. */
 const PRIORITY_OPTIONS: readonly SelectOption[] = TASK_PRIORITIES.map((p) => ({
   value: p,
   label: p,
@@ -98,10 +95,8 @@ const PRIORITY_OPTIONS: readonly SelectOption[] = TASK_PRIORITIES.map((p) => ({
 /** The "All" option of a list filter; its empty value sets no filter. */
 const ALL_OPTION: SelectOption = { value: '', label: 'All' };
 
-/** Status filter options of the task list. */
 const STATUS_FILTER_OPTIONS: readonly SelectOption[] = [ALL_OPTION, ...STATUS_OPTIONS];
 
-/** Priority filter options of the task list. */
 const PRIORITY_FILTER_OPTIONS: readonly SelectOption[] = [ALL_OPTION, ...PRIORITY_OPTIONS];
 
 /** The statuses other than one, in display order: the two "Mark <status>" buttons of a row. */
@@ -124,7 +119,6 @@ function hasError(message: string | undefined): message is string {
   return message !== undefined && message !== '';
 }
 
-/** ` aria-invalid="true"` for a field with an inline message, otherwise nothing. */
 function invalidAttr(message: string | undefined): SafeHtml | false {
   return hasError(message) && html` aria-invalid="true"`;
 }
@@ -135,10 +129,8 @@ type FormField = keyof TaskFormValues;
 /** The task form's fields in page order, which is also the order of the error summary. */
 const FORM_FIELDS: readonly FormField[] = ['title', 'description', 'status', 'priority', 'dueDate'];
 
-/** Id of the error summary's heading, which names the summary. */
 const ERROR_SUMMARY_HEADING_ID = 'error-summary-heading';
 
-/** A field of a re-rendered task form that failed validation, with its inline message. */
 interface InvalidField {
   field: FormField;
   message: string;
@@ -162,8 +154,8 @@ function invalidFields(errors: TaskFormPageView['errors']): readonly InvalidFiel
  * the form. The links are plain fragment links, which need no script. Nothing is rendered when no
  * field is invalid.
  *
- * It is a labelled section, not a live region: each inline message already carries
- * `role="alert"`, so announcing the summary as well would read every message twice.
+ * It is a labelled section kept outside a live region, to avoid duplicate announcements in
+ * clients that announce the individual alerts.
  */
 function renderErrorSummary(invalid: readonly InvalidField[]): SafeHtml {
   if (invalid.length === 0) {
@@ -507,4 +499,3 @@ export function renderDeleteConfirmPage(view: DeleteConfirmPageView): string {
     </form>`;
   return renderLayout({ title: 'Delete task', user, csrfToken, body });
 }
-

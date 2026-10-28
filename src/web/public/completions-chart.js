@@ -57,7 +57,8 @@
   /**
    * Reads one bar per table row. `day` and `countText` are the attribute strings exactly as
    * rendered, copied verbatim onto the bars so each bar's data-day and data-count equal its
-   * row's. `count` is used only for geometry, so a malformed value draws as 0.
+   * row's. `count` uses the positive finite result of base-10 integer parsing for geometry;
+   * non-finite or non-positive results draw as 0.
    */
   function readBars(rows) {
     const bars = [];
@@ -142,8 +143,8 @@
       }),
     );
 
-    // The labels repeat what the image's aria-label and the table already convey, so assistive
-    // technology skips them, as it skipped them as presentational children of the role=img SVG.
+    // The table and image label already convey these labels, so hide the duplicate HTML labels
+    // from assistive technology.
     const yLabels = document.createElement('div');
     yLabels.className = 'chart-y-labels';
     yLabels.setAttribute('aria-hidden', 'true');

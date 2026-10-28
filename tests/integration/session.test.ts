@@ -834,7 +834,7 @@ describe('HttpClient, the cookie-jar client every session case relies on', () =>
       expect(client.cookie(name)).toBeUndefined();
     });
 
-    it.each(['sid', 'csrf', "a!#$%&'*+-.^_`|~09AZaz"])(
+    it.each(['sid', 'csrf', 'a!#$%&\'*+-.^_`|~09AZaz'])(
       'accepts the token %p and sends it',
       async (name) => {
         const client = new HttpClient(jarBase);

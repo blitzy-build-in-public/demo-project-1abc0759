@@ -50,8 +50,10 @@ interface User {
   userId: number;
   /**
    * The session-bound CSRF token from the user's task list. It stays valid for the whole test,
-   * because neither the session nor the nonce cookie changes. It is passed explicitly, since an
-   * error page carries no token for the client to pick up.
+   * because neither the session nor the nonce cookie changes. It is passed explicitly so requests
+   * never depend on which response the client last remembered: a signed-in error page carries the
+   * same token in its Log out form, but an error raised before the session loads renders the
+   * anonymous page with none.
    */
   csrf: string;
 }
@@ -721,7 +723,7 @@ const HTML_ENTITIES: Readonly<Record<string, string>> = {
   '&lt;': '<',
   '&gt;': '>',
   '&quot;': '"',
-  '&#39;': "'",
+  '&#39;': '\'',
   '&#96;': '`',
 };
 
@@ -836,7 +838,7 @@ const PREFILL_CASES: readonly { name: string; task: TaskFixture }[] = [
     name: 'an In progress, High task with a multi-line description',
     task: {
       title: 'Review <draft> & "notes" `v1`',
-      description: "First line & <b>bold</b>\nSecond line's end\n",
+      description: 'First line & <b>bold</b>\nSecond line\'s end\n',
       status: 'In progress',
       priority: 'High',
       dueDate: '2026-11-15',
@@ -845,7 +847,7 @@ const PREFILL_CASES: readonly { name: string; task: TaskFixture }[] = [
   {
     name: 'a Done, Low task whose description starts with a line break',
     task: {
-      title: "Ship the team's release",
+      title: 'Ship the team\'s release',
       description: '\nShipped "v2" & tagged it `v2.0`',
       status: 'Done',
       priority: 'Low',
@@ -903,7 +905,7 @@ describe('the edit form shows the stored task', () => {
       name: 'a task with a multi-line title',
       task: {
         title: 'Plan\r\nreview',
-        description: "Agenda: \"scope\" & 'risks'",
+        description: 'Agenda: "scope" & \'risks\'',
         status: 'In progress',
         priority: 'High',
         dueDate: '2026-12-01',
@@ -1309,7 +1311,6 @@ const FOREIGN_TASKS: readonly TaskFixture[] = [
   { status: 'In progress', priority: 'Medium', dueDate: '2026-11-01' },
 ];
 
-/** A row holding only an id. */
 interface IdRow {
   id: number;
 }
@@ -1725,7 +1726,7 @@ const CROSS_USER_REQUESTS: readonly TaskRequest[] = [
   },
 ];
 
-describe("another user's task (SC7)", () => {
+describe('another user\'s task (SC7)', () => {
   test.each(CROSS_USER_REQUESTS)(
     '$name gives the same 404 as a missing task and changes nothing',
     async ({ send }) => {
@@ -1809,6 +1810,60 @@ describe('malformed requests (400, nothing changed)', () => {
     expectErrorPage(await postAs(userA, path(own.id), fields), 400, BAD_REQUEST);
     expect(await tasksForOwner(pool, userA.userId)).toEqual(before);
   });
+
+  /**
+   * Hostile values for each filter. A marker holds no character the `html` tag escapes, so it
+   * occurs in the raw and the escaped echo alike. The CRLF value starts with a real label of its
+   * filter, so only the injected header lines make it unknown.
+   */
+  const HOSTILE_FILTERS = [
+    { param: 'status', label: 'Done' },
+    { param: 'priority', label: 'High' },
+  ].flatMap(({ param, label }) =>
+    [
+      { kind: 'script markup', value: '<script>alert(1)</script>', marker: 'alert(1)' },
+      { kind: 'an attribute breakout', value: '"><img src=x onerror=alert(2)>', marker: 'onerror' },
+      { kind: 'a quote breakout', value: '\' onmouseover=\'alert(3)', marker: 'onmouseover' },
+      {
+        kind: 'CRLF-injected headers',
+        value: `${label}\r\nSet-Cookie: injected=1\r\nX-Injected: 1`,
+        marker: 'injected',
+      },
+    ].map((hostile) => ({ param, ...hostile })),
+  );
+
+  /** Every response header as a `name: value` line. */
+  function headerText(res: HttpResult): string {
+    const lines: string[] = [];
+    res.headers.forEach((value, name) => {
+      lines.push(`${name}: ${value}`);
+    });
+    return lines.join('\n');
+  }
+
+  test.each(HOSTILE_FILTERS)(
+    'GET /tasks with $kind as $param answers the fixed 400 and echoes it nowhere',
+    async ({ param, value, marker }) => {
+      const before = await seedOwnTasks();
+      // A plainly unknown label gives the fixed 400 page for this user and token.
+      const reference = await userA.client.get('/tasks?status=Blocked');
+      expectErrorPage(reference, 400, BAD_REQUEST);
+      const logStart = app.logger.text().length;
+
+      const query = new URLSearchParams({ [param]: value }).toString();
+      const res = await userA.client.get(`/tasks?${query}`);
+
+      expectErrorPage(res, 400, BAD_REQUEST);
+      expect(res.body).toBe(reference.body);
+      expect(res.body).not.toContain(marker);
+      expect(res.headers.get('x-injected')).toBeNull();
+      expect(res.setCookies.join('\n')).not.toContain('injected');
+      expect(headerText(res)).not.toContain(marker);
+      expect(await tasksForOwner(pool, userA.userId)).toEqual(before);
+      // A client error is not logged, so the request wrote nothing at all to the log.
+      expect(app.logger.text().slice(logStart)).toBe('');
+    },
+  );
 });
 
 describe('unauthenticated requests', () => {

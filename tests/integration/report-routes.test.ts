@@ -115,7 +115,6 @@ interface Account {
   client: HttpClient;
 }
 
-/** A row holding only an identity value. */
 interface IdRow {
   id: number;
 }
@@ -372,6 +371,86 @@ function exportStatusOptions(body: string): string[] {
     throw new Error('export status select not found on the page');
   }
   return [...options.matchAll(OPTION)].map((match) => match[0]);
+}
+
+/** A hostile query value and a marker that finds every echo of it on a page. */
+interface HostileValue {
+  name: string;
+  value: string;
+  /** Holds no character the `html` tag escapes, so it occurs in the raw and the escaped echo. */
+  marker: string;
+}
+
+const SCRIPT_MARKUP: HostileValue = {
+  name: 'script markup',
+  value: '<script>alert(1)</script>',
+  marker: 'alert(1)',
+};
+
+const ATTRIBUTE_BREAKOUT: HostileValue = {
+  name: 'an attribute breakout',
+  value: '"><img src=x onerror=alert(2)>',
+  marker: 'onerror',
+};
+
+const QUOTE_BREAKOUT: HostileValue = {
+  name: 'a quote breakout',
+  value: '\' onmouseover=\'alert(3)',
+  marker: 'onmouseover',
+};
+
+/** A real date followed by header lines, which must stay text inside the page. */
+const CRLF_HEADERS: HostileValue = {
+  name: 'CRLF-injected headers',
+  value: '2026-10-01\r\nSet-Cookie: injected=1\r\nX-Injected: 1',
+  marker: 'injected',
+};
+
+const HOSTILE_VALUES: readonly HostileValue[] = [
+  SCRIPT_MARKUP,
+  ATTRIBUTE_BREAKOUT,
+  QUOTE_BREAKOUT,
+  CRLF_HEADERS,
+];
+
+/** The character reference the page must write for each character the `html` tag escapes. */
+const HTML_ESCAPES: Readonly<Record<string, string>> = {
+  '&': '&amp;',
+  '<': '&lt;',
+  '>': '&gt;',
+  '"': '&quot;',
+  '\'': '&#39;',
+  '`': '&#96;',
+};
+
+/**
+ * HTML-escapes `text` independently of the application, in one pass so that an `&` it writes is
+ * never escaped again. CR and LF stay as they are: inside a quoted attribute value they are text.
+ */
+function escapedHtml(text: string): string {
+  return text.replace(/[&<>"'`]/g, (ch) => HTML_ESCAPES[ch] ?? ch);
+}
+
+/** Every response header as a `name: value` line. */
+function headerText(res: HttpResult): string {
+  const lines: string[] = [];
+  res.headers.forEach((value, name) => {
+    lines.push(`${name}: ${value}`);
+  });
+  return lines.join('\n');
+}
+
+/**
+ * Asserts that a request carrying `hostile` was answered with the HTML reports page and no file,
+ * and that no header line was injected: no `X-Injected` header, no cookie it names, and no header
+ * holding its marker.
+ */
+function expectHtmlWithoutInjectedHeaders(res: HttpResult, hostile: HostileValue): void {
+  expect(res.headers.get('content-type')).toMatch(/^text\/html/);
+  expect(res.headers.get('content-disposition')).toBeNull();
+  expect(res.headers.get('x-injected')).toBeNull();
+  expect(res.setCookies.join('\n')).not.toContain('injected');
+  expect(headerText(res)).not.toContain(hostile.marker);
 }
 
 /**
@@ -884,6 +963,36 @@ describe('report routes', () => {
         }
       },
     );
+
+    it.each(HOSTILE_VALUES)(
+      'GET /reports with $name as both dates answers 422 and shows them only escaped',
+      async (hostile) => {
+        await seed(a.userId, [openTask('Still counted', 'To do', 'High', null)]);
+        const before = await tasksForOwner(pool, a.userId);
+        const query = new URLSearchParams({ from: hostile.value, to: hostile.value }).toString();
+        const logStart = app.logger.text().length;
+
+        const res = await a.client.get(`/reports?${query}`);
+
+        expect(res.status).toBe(422);
+        expectHtmlWithoutInjectedHeaders(res, hostile);
+        const body = res.body;
+        expect(body).toContain(INVALID_DATES);
+        expect(EXPORT_MESSAGE.exec(body)).toBeNull();
+        for (const id of ['completions-from', 'completions-to']) {
+          expect(inputValue(body, id)).toBe(escapedHtml(hostile.value));
+          expectDateField(body, id, 'text');
+        }
+        // The marker occurs only in those two escaped values, so no other echo, raw or not.
+        expect(body.split(hostile.marker)).toHaveLength(3);
+        expect(summaryCounts(body)).toEqual({ ...ZERO_SUMMARY, 'open-todo': 1, 'open-high': 1 });
+        expect(body).not.toContain('id="completions-table"');
+        expect(body).not.toContain('id="completions-chart"');
+        expect(completionRows(body)).toEqual([]);
+        expect(await tasksForOwner(pool, a.userId)).toEqual(before);
+        expect(app.logger.text().slice(logStart)).toBe('');
+      },
+    );
   });
 
   describe('CSV export (SC10, FR-13)', () => {
@@ -1169,6 +1278,64 @@ describe('report routes', () => {
       expect(res.headers.get('content-disposition')).toBeNull();
       expect(res.body).toContain(BAD_REQUEST);
     });
+
+    it.each(HOSTILE_VALUES)(
+      'GET /reports/export with $name as both dates answers 422, shows them escaped, sends no file',
+      async (hostile) => {
+        await seed(a.userId, [openTask('Open and undated', 'In progress', 'Low', null)]);
+        const before = await tasksForOwner(pool, a.userId);
+        const query = new URLSearchParams({ from: hostile.value, to: hostile.value, status: '' });
+        const logStart = app.logger.text().length;
+
+        const res = await a.client.get(`/reports/export?${query.toString()}`);
+
+        expect(res.status).toBe(422);
+        expectHtmlWithoutInjectedHeaders(res, hostile);
+        expect(EXPORT_MESSAGE.exec(res.body)?.[1]).toBe(INVALID_DATES);
+        for (const id of ['export-from', 'export-to']) {
+          expect(inputValue(res.body, id)).toBe(escapedHtml(hostile.value));
+          expectDateField(res.body, id, 'text');
+        }
+        // The marker occurs only in those two escaped values, so no other echo, raw or not.
+        expect(res.body.split(hostile.marker)).toHaveLength(3);
+        expect(await tasksForOwner(pool, a.userId)).toEqual(before);
+        expect(app.logger.text().slice(logStart)).toBe('');
+      },
+    );
+
+    it.each([SCRIPT_MARKUP, ATTRIBUTE_BREAKOUT, CRLF_HEADERS])(
+      'GET /reports/export with $name as the status answers 422, shows it escaped, sends no file',
+      async (hostile) => {
+        await seed(a.userId, [openTask('Open and undated', 'In progress', 'Low', null)]);
+        const before = await tasksForOwner(pool, a.userId);
+        const query = new URLSearchParams({
+          from: '2026-10-01',
+          to: '2026-10-21',
+          status: hostile.value,
+        });
+        const logStart = app.logger.text().length;
+
+        const res = await a.client.get(`/reports/export?${query.toString()}`);
+
+        expect(res.status).toBe(422);
+        expectHtmlWithoutInjectedHeaders(res, hostile);
+        expect(EXPORT_MESSAGE.exec(res.body)?.[1]).toBe(INVALID_STATUS);
+        const shown = escapedHtml(hostile.value);
+        expect(exportStatusOptions(res.body)).toEqual([
+          '<option value="">All</option>',
+          '<option value="To do">To do</option>',
+          '<option value="In progress">In progress</option>',
+          '<option value="Done">Done</option>',
+          `<option value="${shown}" selected>${shown} (invalid)</option>`,
+        ]);
+        // The extra option's value and label are the only echoes, raw or not.
+        expect(res.body.split(hostile.marker)).toHaveLength(3);
+        expect(inputValue(res.body, 'export-from')).toBe('2026-10-01');
+        expect(inputValue(res.body, 'export-to')).toBe('2026-10-21');
+        expect(await tasksForOwner(pool, a.userId)).toEqual(before);
+        expect(app.logger.text().slice(logStart)).toBe('');
+      },
+    );
   });
 
   describe('year 0001 and year 9999 endpoints (plan 0.5.3)', () => {
@@ -1270,7 +1437,7 @@ describe('report routes', () => {
         b = await signUpAndLogIn('owner-b@example.com');
       });
 
-      it("shows B none of A's tasks in the summary, completions or export", async () => {
+      it('shows B none of A\'s tasks in the summary, completions or export', async () => {
         // A's own reports include the tasks, so B's zeros are isolation, not an empty seed.
         const aBody = await getPage(a.client, '/reports', 200);
         expect(summaryCounts(aBody)).toEqual({

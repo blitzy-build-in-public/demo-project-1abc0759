@@ -17,7 +17,7 @@ const ESCAPE_ENTITIES: Readonly<Record<string, string>> = {
   '<': '&lt;',
   '>': '&gt;',
   '"': '&quot;',
-  "'": '&#39;',
+  '\'': '&#39;',
   // Backtick is escaped too: legacy browsers accepted it as an attribute-value quote.
   '`': '&#96;',
 };

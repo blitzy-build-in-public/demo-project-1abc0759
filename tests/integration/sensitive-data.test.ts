@@ -108,7 +108,6 @@ interface SessionHexRow {
   hex: string;
 }
 
-/** A row holding a task id. */
 interface TaskIdRow {
   id: number;
 }
@@ -251,7 +250,7 @@ describe('sensitive data', () => {
       const hash = defined(hashRows[0], 'a password hash').passwordHash;
       const sessionRows = await sql<SessionHexRow>(
         pool,
-        "SELECT encode(id, 'hex') AS hex FROM sessions WHERE user_id = $1",
+        `SELECT encode(id, 'hex') AS hex FROM sessions WHERE user_id = $1`,
         [userId],
       );
       expect(sessionRows).toHaveLength(1);

@@ -256,7 +256,7 @@ async function insertLongTitledTasks(email: string, count: number): Promise<void
     await sql(
       pool,
       'INSERT INTO tasks (owner_id, title, created_at, updated_at) ' +
-        "SELECT $1, left(lpad(g.i::text, 5, '0') || repeat($4, 8), 200), $2, $2 " +
+        `SELECT $1, left(lpad(g.i::text, 5, '0') || repeat($4, 8), 200), $2, $2 ` +
         'FROM generate_series(1, $3::int) AS g(i)',
       [ownerId, FIXTURE_TIME, count, ' lorem ipsum dolor sit amet'],
     );
@@ -281,8 +281,8 @@ async function insertLayoutTasks(email: string): Promise<void> {
       pool,
       'INSERT INTO tasks (owner_id, title, status, priority, due_date, created_at, updated_at, ' +
         'completed_at) ' +
-        "SELECT $1, 'Review the onboarding description (' || s || ', ' || p || ')', s, p, " +
-        "$3::date, $2, $2, CASE WHEN s = 'Done' THEN $2::timestamptz END " +
+        `SELECT $1, 'Review the onboarding description (' || s || ', ' || p || ')', s, p, ` +
+        `$3::date, $2, $2, CASE WHEN s = 'Done' THEN $2::timestamptz END ` +
         'FROM unnest($4::text[]) AS s CROSS JOIN unnest($5::text[]) AS p',
       [ownerId, FIXTURE_TIME, LAYOUT_DUE_DATE, TASK_STATUSES, TASK_PRIORITIES],
     );

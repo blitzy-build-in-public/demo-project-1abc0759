@@ -218,7 +218,7 @@ describe('validateEmail', () => {
   it.each<InputCase>([
     { name: 'a plain address', input: 'user@example.com' },
     { name: 'dots, a plus tag and four labels', input: 'first.last+tag@sub.example.co.uk' },
-    { name: 'an apostrophe in the local part', input: "o'brien@example.ie" },
+    { name: 'an apostrophe in the local part', input: 'o\'brien@example.ie' },
     { name: 'mixed case, kept as entered', input: 'User@Example.COM' },
     { name: 'surrounding whitespace, trimmed before matching', input: '  user@example.com  ' },
     { name: 'a 64-character local part', input: 'a'.repeat(64) + '@example.com' },

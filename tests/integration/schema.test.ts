@@ -610,7 +610,7 @@ describe('migrate CLI main and the driver PG* variables', () => {
 
   const SESSION_SQL =
     'SELECT current_user AS role, current_database() AS database, ' +
-    "current_setting('application_name') AS \"applicationName\", " +
+    `current_setting('application_name') AS "applicationName", ` +
     '(SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()) AS ssl';
 
   const originalEnv = process.env;
@@ -1622,14 +1622,14 @@ describe('createLogger redaction', () => {
       'a password that contains another whole, whatever order they are given in',
       { passwords: ['pass', 'pass word'] },
       (logger) =>
-        logger.error('migration failed', driverFailure("password='pass word' password=pass")),
+        logger.error('migration failed', driverFailure('password=\'pass word\' password=pass')),
       migrationFailedLine(`password='${MARKER}' password=${MARKER}`),
     ],
     [
       // A second pass would match the marker and the word after it, which form the longer value.
       'in a single pass, never inside a marker it has just written',
       { passwords: ['secret', `${MARKER} word`] },
-      (logger) => logger.error('migration failed', driverFailure("password='secret word'")),
+      (logger) => logger.error('migration failed', driverFailure('password=\'secret word\'')),
       migrationFailedLine(`password='${MARKER} word'`),
     ],
     [
@@ -1638,7 +1638,7 @@ describe('createLogger redaction', () => {
       (logger) =>
         logger.error(
           'migration failed',
-          driverFailure("//u:.@h //u:x@h password=(w)+ password=ww password='a$&b'"),
+          driverFailure('//u:.@h //u:x@h password=(w)+ password=ww password=\'a$&b\''),
         ),
       migrationFailedLine(
         `//u:${MARKER}@h //u:x@h password=${MARKER} password=ww password='${MARKER}'`,
@@ -1650,7 +1650,7 @@ describe('createLogger redaction', () => {
       (logger) =>
         logger.error(
           'migration failed',
-          driverFailure("password=error, password='migration failed'"),
+          driverFailure('password=error, password=\'migration failed\''),
           { method: 'GET', path: '/tasks' },
         ),
       {
@@ -1729,7 +1729,7 @@ describe('createLogger redaction', () => {
   // both are compared.
   test.each<[string, RedactedCredentials, string, string]>([
     [
-      "a password, in a URL's user-info or as the whole value of a setting in any of its forms",
+      'a password, in a URL\'s user-info or as the whole value of a setting in any of its forms',
       { passwords: ['x'] },
       'Password=x, PASSWORD: x; (password=x) {password=x} "password": "x" password \'x\' ' +
         '?password=x&a=1 u:x@h password=xy password x PASSWORD "x" password=x',
@@ -1782,7 +1782,7 @@ describe('createLogger redaction', () => {
     [
       'a user name, as the whole value of a user= setting',
       { userNames: ['alice'] },
-      "user=alice dbname=alice user='alice' ?user=alice&x=1 user=alice.smith",
+      'user=alice dbname=alice user=\'alice\' ?user=alice&x=1 user=alice.smith',
       `user=${MARKER} dbname=alice user='${MARKER}' ?user=${MARKER}&x=1 user=alice.smith`,
     ],
   ])('given %s, redacts only the credential', (_label, redact, input, expected) => {
@@ -1911,7 +1911,6 @@ interface IndexRow {
   indexdef: string;
 }
 
-/** A row holding one migration version. */
 interface VersionRow {
   version: string;
 }
@@ -1927,12 +1926,10 @@ interface CountRow {
   n: number;
 }
 
-/** A row holding one stored email. */
 interface EmailRow {
   email: string;
 }
 
-/** A row holding an identity value. */
 interface IdRow {
   id: number;
 }
@@ -1987,7 +1984,7 @@ interface AcceptedCase<F> {
 async function publicIndexNames(db: Pool): Promise<string[]> {
   const rows = await sql<Pick<IndexRow, 'indexname'>>(
     db,
-    "SELECT indexname FROM pg_indexes WHERE schemaname = 'public'",
+    `SELECT indexname FROM pg_indexes WHERE schemaname = 'public'`,
   );
   return rows.map((row) => row.indexname);
 }
@@ -2000,7 +1997,7 @@ async function publicIndexNames(db: Pool): Promise<string[]> {
 async function indexDefinition(db: Pool, name: string): Promise<string> {
   const rows = await sql<IndexRow>(
     db,
-    "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = 'public' AND indexname = $1",
+    `SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = 'public' AND indexname = $1`,
     [name],
   );
   const row = rows[0];
@@ -2137,8 +2134,8 @@ describe('database schema', () => {
       // The catalogue answers what `indexdef` leaves implicit for the second column, due_date.
       const rows = await sql<ColumnOrderRow>(
         pool,
-        "SELECT pg_index_column_has_property('tasks_owner_due_idx'::regclass, 2, 'asc') AS asc, " +
-          "pg_index_column_has_property('tasks_owner_due_idx'::regclass, 2, 'nulls_last') " +
+        `SELECT pg_index_column_has_property('tasks_owner_due_idx'::regclass, 2, 'asc') AS asc, ` +
+          `pg_index_column_has_property('tasks_owner_due_idx'::regclass, 2, 'nulls_last') ` +
           'AS "nullsLast"',
       );
 
@@ -2321,7 +2318,7 @@ describe('database schema', () => {
         pool,
         'SELECT tgname, tgrelid::regclass::text AS tablename, ' +
           'pg_get_triggerdef(oid) AS definition ' +
-          "FROM pg_trigger WHERE tgname = 'users_delete_login_attempts'",
+          `FROM pg_trigger WHERE tgname = 'users_delete_login_attempts'`,
       );
 
       expect(rows).toEqual([
@@ -2338,7 +2335,7 @@ describe('database schema', () => {
       ]);
     });
 
-    it("removes the user's sessions, tasks and login attempts and nobody else's", async () => {
+    it('removes the user\'s sessions, tasks and login attempts and nobody else\'s', async () => {
       const aliceId = await insertUser(pool, { email: 'Alice@Example.com', createdAt: at() });
       const bobId = await insertUser(pool, { email: 'bob@example.com', createdAt: at() });
       await insertSessionRow(pool, aliceId, {});
@@ -2425,7 +2422,7 @@ describe('database schema', () => {
       expect(
         await sql<CountRow>(
           pool,
-          "SELECT count(*)::int AS n FROM pg_locks WHERE locktype = 'advisory' AND database = " +
+          `SELECT count(*)::int AS n FROM pg_locks WHERE locktype = 'advisory' AND database = ` +
             '(SELECT oid FROM pg_database WHERE datname = current_database())',
         ),
       ).toEqual([{ n: 0 }]);
@@ -2449,4 +2446,3 @@ describe('database schema', () => {
     });
   });
 });
-

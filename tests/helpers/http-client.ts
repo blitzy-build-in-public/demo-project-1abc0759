@@ -23,7 +23,6 @@ export const CSRF_FIELD_NAME = '_csrf';
 export interface HttpResult {
   /** HTTP status code. Redirects are returned as they are, never followed. */
   status: number;
-  /** Response headers. */
   headers: Headers;
   /**
    * The body decoded as UTF-8 from {@link HttpResult.bytes}. A leading byte-order mark, as the
@@ -44,9 +43,7 @@ export interface ParsedSetCookie {
   name: string;
   /** Cookie value exactly as sent (still URL-encoded), trimmed of surrounding whitespace. */
   value: string;
-  /** Whether the `HttpOnly` attribute is present. */
   httpOnly: boolean;
-  /** Whether the `Secure` attribute is present. */
   secure: boolean;
   /** The `SameSite` value as written, for example `'Lax'`, or `null` when absent. */
   sameSite: string | null;
@@ -108,7 +105,7 @@ const ENTITY_TEXT: Readonly<Record<string, string>> = {
   lt: '<',
   gt: '>',
   quot: '"',
-  '#39': "'",
+  '#39': '\'',
   '#96': '`',
 };
 

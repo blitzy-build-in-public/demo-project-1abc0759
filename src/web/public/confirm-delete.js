@@ -14,7 +14,6 @@
 (function () {
   'use strict';
 
-  /** Selector of the buttons that need a confirmation before they submit. */
   const DELETE_BUTTON = '[data-confirm-delete]';
 
   /**

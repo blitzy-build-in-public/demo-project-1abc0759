@@ -105,9 +105,9 @@ export function csrfField(token: string): SafeHtml {
  * An inline validation message for one field, linked from the field through
  * {@link describedBy}. The message is rendered exactly as given (escaped, never reworded).
  *
- * The paragraph carries `role="alert"`, like the login and report messages, so assistive
- * technology announces the message when the re-rendered form loads, not only when its field is
- * reached; the link from the field keeps it in the field's description as well.
+ * The paragraph uses `role="alert"` to identify an urgent validation message; `aria-describedby`
+ * also exposes it when the field receives focus. Initial-page announcements depend on assistive
+ * technology.
  *
  * @param id - Element id the field's `aria-describedby` refers to.
  * @param message - The validation message, or `undefined` (or `''`) when the field is valid.

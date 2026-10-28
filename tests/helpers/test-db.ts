@@ -185,7 +185,6 @@ const FIXTURE_TIME_MS = Date.parse('2026-10-21T09:00:00.000Z');
  */
 export const FIXTURE_TIME = new Date(FIXTURE_TIME_MS);
 
-/** A row holding only an identity value. */
 interface IdRow {
   id: number;
 }

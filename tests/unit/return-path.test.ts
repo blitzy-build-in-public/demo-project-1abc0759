@@ -228,8 +228,8 @@ describe('parseListFilters', () => {
   });
 
   test.each<{ name: string; query: unknown }>([
-    { name: "an unknown status echo 'done'", query: echo({ filterStatus: 'done' }) },
-    { name: "an unknown priority echo 'Urgent'", query: echo({ filterPriority: 'Urgent' }) },
+    { name: 'an unknown status echo \'done\'', query: echo({ filterStatus: 'done' }) },
+    { name: 'an unknown priority echo \'Urgent\'', query: echo({ filterPriority: 'Urgent' }) },
     { name: 'a repeated status echo', query: echo({ filterStatus: ['Done', 'To do'] }) },
     { name: 'a null status', query: { status: null } },
     { name: 'a number priority', query: { priority: 3 } },

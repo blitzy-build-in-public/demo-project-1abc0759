@@ -40,7 +40,7 @@ body {
   margin: 0;
   background: var(--color-bg);
   color: var(--color-text);
-  font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
   font-size: 1rem;
   line-height: 1.5;
 }
@@ -59,7 +59,7 @@ p { margin-block: 0 1rem; }
 a { color: var(--color-accent); text-decoration: underline; text-underline-offset: 0.15em; }
 :focus-visible { outline: 3px solid var(--color-focus); outline-offset: 2px; }
 /* At its calendar-button Tab stop a date input matches :focus-within but not :focus-visible. */
-input[type="date"]:focus-within { outline: 3px solid var(--color-focus); outline-offset: 2px; }
+input[type='date']:focus-within { outline: 3px solid var(--color-focus); outline-offset: 2px; }
 
 /* Header */
 
@@ -150,10 +150,10 @@ textarea {
   color: var(--color-text);
 }
 
-input[type="text"],
-input[type="email"],
-input[type="password"],
-input[type="date"],
+input[type='text'],
+input[type='email'],
+input[type='password'],
+input[type='date'],
 textarea {
   /* Block, so a following submit button never shares the field's line. */
   display: block;
@@ -165,7 +165,7 @@ textarea { min-height: 8rem; resize: vertical; }
 /* A title holding a line break is edited in a textarea; its two rows set its height. */
 textarea#title { min-height: 0; }
 /* The thicker border is a non-colour cue beside the inline message. */
-[aria-invalid="true"] { border-width: 2px; border-color: var(--color-error); }
+[aria-invalid='true'] { border-width: 2px; border-color: var(--color-error); }
 
 button {
   padding-block: 0.4rem;
@@ -197,7 +197,7 @@ td button {
 /* Every "Mark <status>" button is as wide as "Mark In progress", the longest label (14.03ch in
    Noto Sans; ch follows the font), so every row's buttons have the same sizes and wrap into the
    same lines. In the row's own 16px ch this is 12.6ch + 1rem + 2px, which the tracks below use. */
-td button[name="status"] { min-inline-size: calc(14.4ch + 1rem + 2px); }
+td button[name='status'] { min-inline-size: calc(14.4ch + 1rem + 2px); }
 
 /* Delete buttons; the label already says Delete, so colour is not the only cue. The confirmation
    page's "Delete task" takes .danger, since data-confirm-delete would ask a second time. */
@@ -239,11 +239,11 @@ button:disabled, input:disabled, select:disabled,
 textarea:disabled { border-color: var(--color-border); cursor: not-allowed; opacity: 1; }
 button:disabled, input:disabled, select:disabled,
 textarea:disabled { background: var(--color-surface); color: var(--color-muted); }
-[aria-invalid="true"]:hover, [aria-invalid="true"]:active,
-[aria-invalid="true"]:disabled { border-color: var(--color-error); }
+[aria-invalid='true']:hover, [aria-invalid='true']:active,
+[aria-invalid='true']:disabled { border-color: var(--color-error); }
 /* POST forms without wrappers: space the submit button and the Cancel link that follows it. */
-main form[method="post"] > button { margin-block-start: 1rem; }
-main form[method="post"] > button + a { margin-inline-start: 1rem; }
+main form[method='post'] > button { margin-block-start: 1rem; }
+main form[method='post'] > button + a { margin-inline-start: 1rem; }
 .field { margin-block-end: 1rem; }
 .field label { margin-block-start: 0; }
 .form-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 1rem; }
@@ -253,21 +253,21 @@ main form[method="post"] > button + a { margin-inline-start: 1rem; }
    Each label and its control share a .control-pair, which never wraps inside, so the row breaks
    only between pairs and buttons, and a label always stays beside its control. */
 .filters,
-form[method="get"] {
+form[method='get'] {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 0.5rem;
 }
 
-.filters label, form[method="get"] label { margin: 0; }
+.filters label, form[method='get'] label { margin: 0; }
 /* One width for a date field and for the text field that re-renders an invalid date, so neither
    shifts what follows it; 11rem holds Chrome's date control. */
-.filters input, form[method="get"] input { width: 11rem; }
+.filters input, form[method='get'] input { width: 11rem; }
 /* A hint takes its own line. The row's 0.5rem gap less 0.25rem puts it 0.25rem below the
    controls, the .hint spacing of POST forms, in the row and in the stacked column alike. */
 .filters p,
-form[method="get"] p {
+form[method='get'] p {
   flex-basis: 100%;
   margin-block: calc(0.25rem - 0.5rem) 0;
   margin-inline: 0;
@@ -281,7 +281,7 @@ form[method="get"] p {
 /* Messages */
 
 /* Every message band takes one shape: field width, rounded corners, a bar at the start. */
-[role="alert"],
+[role='alert'],
 .form-error,
 .field-error {
   max-width: var(--field-width);
@@ -298,10 +298,11 @@ form[method="get"] p {
 /* The focusable range message takes focus on load. Focus scrolling brings only its box into view,
    but the :focus-visible outline and offset reach 5px past it. A margin of the skip link's inset
    brings them in too, with room for the scroll position rounding to whole pixels. */
-[role="alert"][tabindex] { scroll-margin: 0.5rem; }
+[role='alert'][tabindex] { scroll-margin: 0.5rem; }
 
 /* The error summary opening a re-rendered task form. It is not an alert (its field messages are),
-   so it takes the bands' error shape by class; its links keep the error colour in every state. */
+   so it takes the bands' error shape by class; its links use the error colour and invert to white
+   on red while active. */
 .error-summary {
   max-width: var(--field-width);
   margin-block: 0 1rem;
@@ -316,7 +317,7 @@ form[method="get"] p {
 .error-summary ul { margin: 0; padding-inline-start: 1.25rem; }
 .error-summary a { color: var(--color-error); font-weight: 600; }
 
-[role="status"],
+[role='status'],
 .notice {
   max-width: var(--field-width);
   padding-block: 0.5rem;
@@ -402,7 +403,7 @@ dd { margin: 0; font-weight: 600; }
 .chart-area {
   display: grid;
   grid-template-columns: max-content minmax(0, 54rem);
-  grid-template-areas: "y plot" ". x";
+  grid-template-areas: 'y plot' '. x';
   column-gap: 0.375rem;
   padding-block-start: 0.625em;
   font-size: 0.875rem;
@@ -449,11 +450,11 @@ dd { margin: 0; font-weight: 600; }
   main { padding-block-start: 1rem; padding-inline: 0.75rem; }
   .account { margin-inline-start: 0; }
   /* GET-form pairs, fields and buttons stack at full width, each label above its control. */
-  .filters, form[method="get"], .control-pair { flex-direction: column; align-items: stretch; }
-  .filters input, form[method="get"] input { width: auto; }
+  .filters, form[method='get'], .control-pair { flex-direction: column; align-items: stretch; }
+  .filters input, form[method='get'] input { width: auto; }
   .control-pair + .control-pair { margin-block-start: 0.5rem; margin-inline-start: 0; }
   /* A link (Clear filters) keeps its text's width, so its click area and focus ring hug it. */
-  .filters > a, form[method="get"] > a { align-self: flex-start; }
+  .filters > a, form[method='get'] > a { align-self: flex-start; }
   /* Only the completions table tightens its text and cells here. */
   #completions-table { font-size: 0.8125rem; }
   #completions-table th, #completions-table td { padding-inline: 0.25rem; }

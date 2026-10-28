@@ -207,7 +207,7 @@ function completionsData(report: CompletionsReport): SafeHtml {
   );
   const { from, to } = report.range;
   // A browser may break a line after a hyphen, splitting a date. Each date is therefore a
-  // `<time>` element, which app.css keeps on one line; the caption text itself is unchanged.
+  // `<time>` element, which app.css keeps on one line.
   const fromTime = html`<time datetime="${from}">${from}</time>`;
   const toTime = html`<time datetime="${to}">${to}</time>`;
 
