@@ -58,6 +58,8 @@ h2 { margin-block-start: 2rem; font-size: 1.25rem; }
 p { margin-block: 0 1rem; }
 a { color: var(--color-accent); text-decoration: underline; text-underline-offset: 0.15em; }
 :focus-visible { outline: 3px solid var(--color-focus); outline-offset: 2px; }
+/* At its calendar-button Tab stop a date input matches :focus-within but not :focus-visible. */
+input[type="date"]:focus-within { outline: 3px solid var(--color-focus); outline-offset: 2px; }
 
 /* Header */
 
@@ -77,17 +79,47 @@ header,
 .site-title { font-size: 1.25rem; font-weight: 700; text-decoration: none; }
 nav, .site-nav { display: flex; flex-wrap: wrap; gap: 1rem; }
 nav a { font-weight: 600; }
-.signed-in { margin-inline-start: auto; color: var(--color-muted); overflow-wrap: anywhere; }
+/* "Signed in as" and its Log out button form one header item, so when the bar wraps they move to
+   the next row together rather than splitting across rows. */
+.account {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 1.5rem;
+  margin-inline-start: auto;
+}
+
+.signed-in { color: var(--color-muted); overflow-wrap: anywhere; }
 header form, .logout-form { display: inline; margin: 0; }
 
+/* Links that stand apart from running text (the header's, a paragraph's links, links beside a
+   form's buttons and each task row's title link) get a 44px touch target; the row buttons stay
+   compact. Inline flex lets the minimums apply and centres the label vertically, while the link
+   stays inline within a sentence and keeps its underline. */
+.site-title,
+nav a,
+main p > a,
+main form > a,
+.task-table td > a {
+  display: inline-flex;
+  align-items: center;
+  min-block-size: 2.75rem;
+  min-inline-size: 2.75rem;
+}
+
+/* A title link's label keeps to its row's top line, level with the other cells' top-aligned
+   text, so the target's extra height falls below the label. */
+.task-table td > a { align-items: flex-start; }
+
 /* Skip link, the first element of every page: moved above the viewport until it receives
-   keyboard focus, so it takes no space and is invisible at rest. */
+   keyboard focus, so it takes no space and is invisible at rest. Its padding makes the 24px line
+   a 44px target. */
 .skip-link {
   position: absolute;
   inset-block-start: 0;
   inset-inline-start: 0;
   z-index: 1;
-  padding-block: 0.5rem;
+  padding-block: 0.625rem;
   padding-inline: 1rem;
   background: var(--color-bg);
   font-weight: 600;
@@ -102,6 +134,9 @@ header form, .logout-form { display: inline; margin: 0; }
 form { margin-block: 0 1.5rem; }
 label { display: block; margin-block: 1rem 0.25rem; font-weight: 600; }
 input, select, textarea, button { font: inherit; }
+/* A 44px minimum touch target, which also evens out date inputs: Chrome's date-edit box makes
+   them 2px taller than text inputs and selects. Textareas are taller than this already. */
+input, select, button { min-block-size: 2.75rem; }
 
 input,
 select,
@@ -147,9 +182,11 @@ header button, td button { background: var(--color-bg); color: var(--color-accen
 
 /* BLITZY [A11Y]: per-row buttons are compact by specification (about 28px tall): above the
    WCAG 2.2 AA 24px target minimum, below the 44px touch guideline. Flagged for design review.
-   The actions cell's 0.5rem gap keeps them farther apart than the 5px a focus ring reaches (3px
-   outline, 2px offset), so no neighbour paints over a focused button's ring. */
+   They therefore drop the 44px minimum every other button takes. The actions cell's 0.5rem gap
+   keeps them farther apart than the 5px a focus ring reaches (3px outline, 2px offset), so no
+   neighbour paints over a focused button's ring. */
 td button {
+  min-block-size: 0;
   margin: 0;
   padding-block: 0.15rem;
   padding-inline: 0.5rem;
@@ -410,7 +447,7 @@ dd { margin: 0; font-weight: 600; }
 @media (max-width: 40rem) {
   header, .site-header { padding-inline: 0.75rem; }
   main { padding-block-start: 1rem; padding-inline: 0.75rem; }
-  .signed-in { margin-inline-start: 0; }
+  .account { margin-inline-start: 0; }
   /* GET-form pairs, fields and buttons stack at full width, each label above its control. */
   .filters, form[method="get"], .control-pair { flex-direction: column; align-items: stretch; }
   .filters input, form[method="get"] input { width: auto; }
@@ -429,4 +466,7 @@ dd { margin: 0; font-weight: 600; }
     grid-template-columns: calc(9.5ch + 1rem) calc(7ch + 1rem) minmax(calc(9.5ch + 1rem), 1fr);
   }
   .task-table .title, .task-table .actions { grid-column: 1 / -1; }
+  /* The title has a line of its own here, so its label centres in its 44px target rather than
+     leaving all the extra height between it and the values below. */
+  .task-table td > a { align-items: center; }
 }

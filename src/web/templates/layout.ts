@@ -2,11 +2,11 @@
  * Document shell shared by every page, plus the form-control helpers every template uses.
  *
  * {@link renderLayout} wraps a page body in the HTML document, the stylesheet link, the page's
- * deferred scripts and the site header (navigation, "Signed in as" and the Log out form for a
- * signed-in user). The helpers below give the task form and the reports page one implementation
- * of the CSRF field, inline errors, `aria-describedby` links, and the entered-value fallbacks for
- * selects and date fields after a failed submission, so sibling templates import them from here
- * and never re-implement them.
+ * deferred scripts and the site header (navigation, plus "Signed in as" grouped with the Log out
+ * form, for a signed-in user). The helpers below give the task form and the reports page one
+ * implementation of the CSRF field, inline errors, `aria-describedby` links, and the entered-value
+ * fallbacks for selects and date fields after a failed submission, so sibling templates import
+ * them from here and never re-implement them.
  *
  * Everything is pure: output depends only on the arguments, so identical inputs give
  * byte-identical pages.
@@ -48,8 +48,9 @@ const MAIN_ID = 'main';
  * `<page title> – Task Tracker`, the `/static/app.css` link and one deferred
  * `<script src="/static/<name>.js">` per distinct entry in `page.scripts` (none when absent or
  * empty). The body starts with a skip link to `<main>`, then the header with the "Task Tracker"
- * link. Only for a signed-in user does the header add the Tasks and Reports navigation,
- * "Signed in as <email>" and a `POST /logout` form carrying the CSRF field. The user's id and
+ * link. Only for a signed-in user does the header add the Tasks and Reports navigation, then
+ * "Signed in as <email>" and a `POST /logout` form carrying the CSRF field, grouped in one
+ * `<div class="account">` so the label and its Log out button wrap as a unit. The user's id and
  * `sessionId` are never rendered.
  *
  * @param page - The page title, user, CSRF token, body and scripts.
@@ -65,10 +66,12 @@ export function renderLayout(page: LayoutPage): string {
     user !== null &&
     html`
       <nav aria-label="Main"><a href="/tasks">Tasks</a> <a href="/reports">Reports</a></nav>
-      <span class="signed-in">Signed in as ${user.email}</span>
-      <form method="post" action="/logout" class="logout-form">
-        ${csrfField(csrfToken)}<button type="submit">Log out</button>
-      </form>`;
+      <div class="account">
+        <span class="signed-in">Signed in as ${user.email}</span>
+        <form method="post" action="/logout" class="logout-form">
+          ${csrfField(csrfToken)}<button type="submit">Log out</button>
+        </form>
+      </div>`;
   const markup = html`<html lang="en">
   <head>
     <meta charset="utf-8">
