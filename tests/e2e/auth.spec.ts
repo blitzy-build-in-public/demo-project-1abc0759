@@ -1,7 +1,8 @@
 /**
  * Account flows in the browser: sign-up and the first login (SC1), the generic invalid-credential
  * message and the login lockout (SC2), the duplicate-email, invalid-credential and lockout states
- * (SC11), and logout with the preserved return path.
+ * (SC11), logout with the preserved return path, and Back after logout, which must not restore a
+ * signed-in page from the back/forward cache.
  *
  * Every test signs up its own user with a fresh email, so tests share no data and can run in
  * parallel workers. Only rules that need no waiting are exercised: the 15-minute refusal expiry
@@ -40,7 +41,6 @@ function responseTo(page: Page, method: string, pathname: string): Promise<Respo
   );
 }
 
-/** The login page's form, which posts to `/login`. */
 function logInForm(page: Page): Locator {
   return page.locator('form[action="/login"]');
 }
@@ -141,7 +141,8 @@ test.describe('accounts in the browser', () => {
   });
 
   test('refuses the correct password after five failures', async ({ page }) => {
-    // The sign-up and each of the six logins run one cost-12 bcrypt operation on the server.
+    // Sign-up and the five failed credential checks use cost-12 bcrypt; the locked attempt
+    // skips it.
     test.setTimeout(60_000);
     const email = uniqueEmail();
     const password = newPassword();
@@ -179,5 +180,43 @@ test.describe('accounts in the browser', () => {
 
     await logIn(page, user.email, user.password, requested);
     await expect(page.getByText(`Signed in as ${user.email}`, { exact: true })).toBeVisible();
+  });
+
+  test('Back after logout requests the task list again instead of restoring it', async ({
+    playwright,
+    baseURL,
+  }) => {
+    // Playwright starts Chromium with `--disable-back-forward-cache`, and its default headless
+    // shell has no back/forward cache at all. Launch options cannot change for a single test, so
+    // this test launches its own full Chromium (the `chromium` channel, new headless mode) with
+    // the cache on, as a user's Chrome has it. `launch` keeps the other configured options.
+    const browser = await playwright.chromium.launch({
+      channel: 'chromium',
+      ignoreDefaultArgs: ['--disable-back-forward-cache'],
+    });
+    try {
+      const page = await (await browser.newContext({ baseURL })).newPage();
+      await signUpAndLogIn(page);
+
+      const logout = responseTo(page, 'POST', '/logout');
+      await page.getByRole('button', { name: 'Log out', exact: true }).click();
+      const logoutResponse = await logout;
+      expect(logoutResponse.status()).toBe(303);
+      await expect(page).toHaveURL((u) => u.pathname === '/login' && u.search === '');
+
+      // A page restored from the back/forward cache fires no load event and sends no request, so
+      // the navigation is awaited only until it commits, and a restore yields no response.
+      const back = await page.goBack({ waitUntil: 'commit' });
+      await expect(page.getByText('Signed in as')).toBeHidden();
+      expect(back, 'Back must reach the server, not the back/forward cache').not.toBeNull();
+      const redirected = back?.request().redirectedFrom() ?? null;
+      expect(redirected && new URL(redirected.url()).pathname).toBe('/tasks');
+      expect((await redirected?.response())?.status()).toBe(302);
+      await expect(page).toHaveURL((u) => u.pathname + u.search === '/login?next=%2Ftasks');
+      await expect(logInForm(page)).toBeVisible();
+      expect(await logoutResponse.headerValue('clear-site-data')).toBe('"cache"');
+    } finally {
+      await browser.close();
+    }
   });
 });

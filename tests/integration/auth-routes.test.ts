@@ -12,8 +12,8 @@
  * CSRF on every form, the return path, logout, and signed-in users kept away from the anonymous
  * pages.
  *
- * Every sign-up is a real cost-12 bcrypt hash and every login a compare, so each test signs up
- * at most two users. Messages are asserted verbatim against local constants, not the
+ * Accepted sign-ups hash at cost 12; eligible credential checks use bcrypt.compare. Each test
+ * signs up at most two users. Messages are asserted verbatim against local constants, not the
  * application's own, so a reworded message fails here.
  */
 
@@ -26,7 +26,7 @@ import { createDataAccess } from '../../src/db/data-access';
 import type { TxRepos } from '../../src/db/data-access';
 import { DatabaseUnavailableError } from '../../src/shared/errors';
 import { FAKE_CLOCK_START, FakeClock } from '../helpers/fake-clock';
-import { parseSetCookie, rawSessionToken } from '../helpers/http-client';
+import { parseSetCookie, rawSessionToken, signCookieValue } from '../helpers/http-client';
 import type { HttpClient, HttpResult, ParsedSetCookie } from '../helpers/http-client';
 import { startTestApp } from '../helpers/test-app';
 import type { TestApp } from '../helpers/test-app';
@@ -502,10 +502,9 @@ describe('lockout timeline (SC2, plan 0.3.4)', () => {
 });
 
 describe('lockout key across email spellings (plan 0.3.4)', () => {
-  // JavaScript lower-cases 'İ' (U+0130) to 'i' plus U+0307, while PostgreSQL's lower() gives a
-  // plain 'i'. A login that locked on the first and looked the account up with the second let
-  // spellings such as 'vİctim@example.com' reach victim@example.com under a fresh lockout key,
-  // and log in while that email was locked.
+  // JavaScript lower-cases U+0130 to i plus U+0307; PostgreSQL may fold it to plain i.
+  // Credential lookup and lockout must share the normalized key, so these spellings cannot
+  // authenticate a canonical account through a separate failure history.
 
   /** The registered account's email, which is also its lockout key. */
   const CANONICAL_EMAIL = 'victim@example.com';
@@ -974,6 +973,52 @@ describe('CSRF protection (plan 0.3.4)', () => {
     expect(await sessionsForUser(pool, await userIdOf(pool, email))).toHaveLength(1);
     expect((await client.get('/tasks')).status).toBe(200);
   });
+
+  test(
+    'POST /logout refuses a token rendered for another session of the same user and nonce',
+    async () => {
+      const { client: a, email, password, userId } = await signedInUser();
+      const nonce = a.cookie('csrf');
+      if (nonce === undefined) {
+        throw new Error('client A holds no csrf cookie');
+      }
+      // B logs in holding A's nonce, so only the session binding can tell their tokens apart.
+      const b = newClient(app);
+      b.setCookie('csrf', nonce);
+      expect((await logIn(b, email, password)).status).toBe(303);
+      expect((await b.get('/tasks')).status).toBe(200);
+      expect(b.cookie('csrf')).toBe(nonce);
+      const sidA = requireSid(a);
+      const sidB = requireSid(b);
+      expect(sidB).not.toBe(sidA);
+      const keyOf = (sid: string): string => sessionIdHash(sid).toString('hex');
+      const bothKeys = [keyOf(sidA), keyOf(sidB)].sort();
+      const sessionKeys = async (): Promise<string[]> =>
+        (await sessionsForUser(pool, userId)).map((row) => row.idHash.toString('hex')).sort();
+      expect(await sessionKeys()).toEqual(bothKeys);
+      const aToken = a.csrfToken();
+      const bToken = b.csrfToken();
+      if (aToken === null || bToken === null) {
+        throw new Error('a signed-in page carries no CSRF token');
+      }
+
+      const res = await b.post('/logout', {}, { csrf: aToken });
+
+      expect(res.status).toBe(403);
+      expect(res.body).toContain(CSRF_EXPIRED);
+      expect(cookieNamed(res, 'sid')).toBeUndefined();
+      expect(await sessionKeys()).toEqual(bothKeys);
+      expect((await a.get('/tasks')).status).toBe(200);
+      expect((await b.get('/tasks')).status).toBe(200);
+
+      // Control: B's own token logs B out and leaves A's session signed in.
+      const own = await b.post('/logout', {}, { csrf: bToken });
+      expect(own.status).toBe(303);
+      expect(own.location).toBe('/login');
+      expect(await sessionKeys()).toEqual([keyOf(sidA)]);
+      expect((await a.get('/tasks')).status).toBe(200);
+    },
+  );
 });
 
 describe('return path (plan 0.3.4)', () => {
@@ -1019,33 +1064,109 @@ describe('return path (plan 0.3.4)', () => {
 });
 
 describe('logout and cross-user cases', () => {
+  /**
+   * Asserts what a logout that presented a `sid` clears, which is what keeps Chrome from showing
+   * a signed-in page on Back: every `sid` it sets expires (and it sets one), the client is left
+   * with neither `sid` nor the `csrf` nonce, and the response sends `Clear-Site-Data: "cache"`.
+   */
+  function expectLogoutClears(client: HttpClient, res: HttpResult): void {
+    const sids = res.setCookies.map(parseSetCookie).filter((cookie) => cookie.name === 'sid');
+    expect(sids.length).toBeGreaterThan(0);
+    for (const cleared of sids) {
+      // Express computes the clearing Expires from real time, not from the fake clock.
+      const expiredByMaxAge = cleared.maxAge !== null && cleared.maxAge <= 0;
+      const expiredByDate = cleared.expires !== null && cleared.expires.getTime() < Date.now();
+      expect(expiredByMaxAge || expiredByDate).toBe(true);
+    }
+    // The client reports a cleared cookie as `undefined`; it has no `null` state.
+    expect(client.cookie('sid')).toBeUndefined();
+    expect(client.cookie('csrf')).toBeUndefined();
+    expect(res.headers.get('clear-site-data')).toBe('"cache"');
+  }
+
+  /** A `sid` cookie that a request presents while no session is active. */
+  interface StaleSid {
+    label: string;
+    /** Returns the cookie value, URL-encoded as the server would send it. */
+    make(): Promise<string>;
+  }
+
+  const newToken = (): string => randomBytes(32).toString('base64url');
+
+  const STALE_SIDS: readonly StaleSid[] = [
+    {
+      label: 'an idle-expired session',
+      make: async () => {
+        const { client } = await signedInUser();
+        clock.advance(IDLE_MS);
+        return requireSid(client);
+      },
+    },
+    {
+      label: 'a validly signed unknown token',
+      make: async () => encodeURIComponent(signCookieValue(newToken(), app.config.sessionSecret)),
+    },
+    {
+      label: 'a bad signature',
+      make: async () => encodeURIComponent(signCookieValue(newToken(), 'x'.repeat(32))),
+    },
+    { label: 'an unsigned value', make: async () => newToken() },
+  ];
+
   test('logout deletes the session, clears sid and sends the user to /login', async () => {
     const { client, userId } = await signedInUser();
+    const nonce = client.cookie('csrf');
+    expect(nonce).toBeDefined();
 
     const res = await client.post('/logout', {});
 
     expect(res.status).toBe(303);
     expect(res.location).toBe('/login');
     expect(await sessionsForUser(pool, userId)).toHaveLength(0);
-    const cleared = requireSetCookie(res, 'sid');
-    // Express computes the clearing Expires from real time, not from the fake clock.
-    const expiredByMaxAge = cleared.maxAge !== null && cleared.maxAge <= 0;
-    const expiredByDate = cleared.expires !== null && cleared.expires.getTime() < Date.now();
-    expect(expiredByMaxAge || expiredByDate).toBe(true);
-    // The client reports a cleared cookie as `undefined`; it has no `null` state.
-    expect(client.cookie('sid')).toBeUndefined();
+    expectLogoutClears(client, res);
 
     const after = await client.get('/tasks');
     expect(after.status).toBe(302);
     expect(after.location).toBe('/login?next=%2Ftasks');
+    // The next response issues a fresh nonce, the cookie change Chrome needs to drop the pages.
+    expect(client.cookie('csrf')).toEqual(expect.any(String));
+    expect(client.cookie('csrf')).not.toBe(nonce);
   });
 
-  test('logout without a session redirects to /login without an error page', async () => {
+  test.each(STALE_SIDS)(
+    'logout presenting $label clears sid, csrf and the cache and redirects to /login',
+    async ({ make }) => {
+      const client = newClient(app);
+      client.setCookie('sid', await make());
+      client.setCookie('csrf', newToken());
+
+      const res = await client.post('/logout', {}, { csrf: false });
+
+      expect(res.status).toBe(303);
+      expect(res.location).toBe('/login');
+      expect(res.body).not.toContain(CSRF_EXPIRED);
+      expectLogoutClears(client, res);
+      expect(await countRows(pool, 'sessions')).toBe(0);
+    },
+  );
+
+  test('logout without a sid cookie redirects to /login and changes nothing', async () => {
+    const { client, userId } = await signedInUser();
+    const before = await sessionsForUser(pool, userId);
+    expect(before).toHaveLength(1);
+
+    // `SameSite=Lax` keeps the user's cookies off a cross-site form post, so the server gets a
+    // request with no cookie at all, as from this other client with an empty jar. Its response
+    // must not clear `sid`, or the browser would apply that to the user's own cookie.
     const res = await newClient(app).post('/logout', {}, { csrf: false });
 
     expect(res.status).toBe(303);
     expect(res.location).toBe('/login');
     expect(res.body).not.toContain(CSRF_EXPIRED);
+    expect(cookieNamed(res, 'sid')).toBeUndefined();
+    expect(res.headers.get('clear-site-data')).toBeNull();
+    expect(await sessionsForUser(pool, userId)).toEqual(before);
+    expect((await client.get('/tasks')).status).toBe(200);
   });
 
   test('a signed-in user is redirected away from the sign-up and login pages', async () => {
@@ -1083,7 +1204,7 @@ describe('logout and cross-user cases', () => {
     expect(await countRows(pool, 'sessions')).toBe(1);
   });
 
-  test("each login issues a fresh token, and logging in as B never reuses A's", async () => {
+  test('each login issues a fresh token, and logging in as B never reuses A\'s', async () => {
     const a = { email: uniqueEmail(), password: newPassword() };
     const b = { email: uniqueEmail(), password: newPassword() };
     const setup = newClient(app);

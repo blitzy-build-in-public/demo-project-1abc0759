@@ -2,9 +2,11 @@
  * `Cache-Control: no-store` for every response to a signed-in request.
  *
  * Private pages, redirects, error pages and the CSV export must not be kept in the browser's or
- * any intermediary's cache, so that after logout a shared browser's back button or history
- * cannot bring them back. Anonymous responses (the sign-up and login pages, `/static` assets)
- * hold nothing private and keep their default caching.
+ * any intermediary's HTTP cache, so that after logout a shared browser's history cannot bring
+ * them back from it. Chrome still keeps `no-store` pages in its back/forward cache; the
+ * `POST /logout` response is what makes it discard them, so Back after logout asks the server.
+ * Anonymous responses (the sign-up and login pages, `/static` assets) hold nothing private and
+ * keep their default caching.
  */
 
 import type { RequestHandler } from 'express';

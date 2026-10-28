@@ -27,9 +27,9 @@ module.exports = {
   coverageDirectory: '<rootDir>/coverage',
   // The integration project's 30-second limit, set here because jest-circus 30 reads
   // `testTimeout` from the top-level configuration only and ignores it inside a project entry,
-  // where it would leave the 5-second default in force. Every integration sign-up and login
-  // performs a real cost-12 bcrypt operation. Unit tests finish in milliseconds, so the shared
-  // limit changes nothing for them.
+  // where it would leave the 5-second default in force. Integration cases that hash or check
+  // credentials use real cost-12 bcrypt. Unit tests finish in milliseconds, so the shared limit
+  // changes nothing for them.
   testTimeout: 30000,
   projects: [
     {

@@ -13,7 +13,7 @@ import type { Request, RequestHandler, Response, Router } from 'express';
 import type { AuthService, LogInResult, SignUpResult } from '../../auth/auth-service';
 import type { AppConfig } from '../../config';
 import { asyncHandler } from '../async-handler';
-import { SESSION_COOKIE, clearCookieOptions, sessionCookieOptions } from '../cookies';
+import { CSRF_COOKIE, SESSION_COOKIE, clearCookieOptions, sessionCookieOptions } from '../cookies';
 import { csrfTokenOf, type Csrf } from '../csrf';
 import { requireAnonymous } from '../middleware/require-auth';
 import '../request-user';
@@ -59,6 +59,19 @@ function readSessionToken(req: Request): string | null {
   }
   const value: unknown = Reflect.get(signed, SESSION_COOKIE);
   return typeof value === 'string' && value !== '' ? value : null;
+}
+
+/**
+ * Whether the request presented a `sid` cookie of any kind: validly or badly signed, unsigned or
+ * empty. cookie-parser moves a validly signed value to `req.signedCookies`, records a bad
+ * signature there as `false` and leaves an unsigned value in `req.cookies`, so both jars are
+ * read. Express types them as `any`, so each is narrowed first, and only own properties count.
+ */
+function presentsSessionCookie(req: Request): boolean {
+  const jars: readonly unknown[] = [req.signedCookies, req.cookies];
+  return jars.some(
+    (jar) => typeof jar === 'object' && jar !== null && Object.hasOwn(jar, SESSION_COOKIE),
+  );
 }
 
 /**
@@ -118,8 +131,9 @@ function logInRejection(
  *   `/tasks`), setting the signed `sid` cookie; 422 "Email or password is incorrect."; 429 "Too
  *   many failed attempts. Try again later."
  * - `POST /logout` (CSRF bound to the session when one is active): deletes the session row,
- *   clears `sid` and answers 303 to `/login`; without a session it only clears the cookie and
- *   redirects.
+ *   clears `sid` and the `csrf` nonce, sends `Clear-Site-Data: "cache"` and answers 303 to
+ *   `/login`. Without a session it skips the CSRF check and clears the same way when the request
+ *   presented a `sid`; a request that presented none gets the bare 303 and changes nothing.
  *
  * "Anonymous only" means a signed-in request is redirected to `/tasks` by `requireAnonymous`
  * before its CSRF token is checked. A CSRF failure reaches the error handler as `CsrfError`
@@ -234,7 +248,7 @@ export function createAuthRouter(deps: {
   const verifySessionCsrf = csrf.verify('session');
   // Logout from an active session is a state change and needs the session-bound token. Without
   // a session there is nothing to delete, so the token is not required and the request only
-  // clears the cookie: a stale tab's Log out button then still signs the browser out.
+  // clears cookies when it presented a `sid`: a stale tab's Log out button still signs it out.
   const verifyLogoutCsrf: RequestHandler = (req, res, next): void => {
     if (req.user === undefined) {
       next();
@@ -251,7 +265,20 @@ export function createAuthRouter(deps: {
       if (token !== null) {
         await auth.logOut(token);
       }
-      res.clearCookie(SESSION_COOKIE, clearCookieOptions(config));
+      // Only a `sid` the request presented is cleared. A request without one, such as a
+      // cross-site form that `SameSite=Lax` sends without cookies, must change nothing, so its
+      // response never expires the session cookie the browser still holds.
+      if (presentsSessionCookie(req)) {
+        const clearOptions = clearCookieOptions(config);
+        res.clearCookie(SESSION_COOKIE, clearOptions);
+        // Chrome keeps `no-store` pages in its back/forward cache and restores them even after
+        // `sid` is deleted, though not once a cookie has been set. Clearing `csrf` makes the
+        // login page this redirects to set a fresh nonce, so Back after logout asks the server
+        // again. `Clear-Site-Data: "cache"` evicts the pages cached before this one; it also
+        // empties the origin's HTTP cache, which holds only static assets.
+        res.clearCookie(CSRF_COOKIE, clearOptions);
+        res.set('Clear-Site-Data', '"cache"');
+      }
       res.redirect(303, '/login');
     }),
   );
