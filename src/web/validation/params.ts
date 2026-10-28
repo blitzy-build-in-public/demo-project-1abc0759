@@ -1,11 +1,14 @@
 /**
  * Base module of the web validation layer: the shared form-result type, the request field reader,
- * and the parsers for task path parameters, list filters and status values.
+ * the storable-text and form-body encoding checks, and the parsers for task path parameters, list
+ * filters and status values.
  *
  * Every function is pure. Malformed input throws {@link BadRequestError}, which the error handler
  * renders as 400 "Bad request." before any write runs, so no data changes. Inputs come from
- * `express.urlencoded({ extended: false })` bodies and the `'simple'` query parser, both of which
- * yield null-prototype objects whose values are `string`, or `string[]` for a repeated key.
+ * `express.urlencoded({ extended: false })` bodies, whose raw bytes
+ * {@link assertFormBodyEncoding} has checked before parsing, and the `'simple'` query parser.
+ * Flat parsers supply string values or arrays for repeated keys; parsed objects may have an
+ * ordinary or null prototype.
  */
 
 import { BadRequestError } from '../../shared/errors';
@@ -100,8 +103,8 @@ export function readField(source: unknown, name: string): string | undefined {
   if (typeof source !== 'object' || source === null) {
     return undefined;
   }
-  // Parsed bodies and queries have a null prototype, so `source.hasOwnProperty` does not exist and
-  // `in` would also see inherited keys; `Object.hasOwn` is safe on both shapes.
+  // `Object.hasOwn` accepts ordinary and null-prototype objects and ignores inherited keys. Do not
+  // rely on a prototype method supplied by the request object: a null-prototype object has none.
   if (!Object.hasOwn(source, name)) {
     return undefined;
   }
@@ -131,6 +134,51 @@ export function readField(source: unknown, name: string): string | undefined {
 export function assertStorableText(text: string): void {
   if (text.includes('\u0000')) {
     throw new BadRequestError();
+  }
+}
+
+/**
+ * Rejects a raw `application/x-www-form-urlencoded` body that does not decode exactly.
+ *
+ * Node's `querystring`, which parses the flat bodies, never fails: it turns bytes and
+ * percent-escapes that are not valid UTF-8 into U+FFFD and keeps a malformed escape such as `%`
+ * or `%zz` as literal text, so the stored value would differ from the one submitted. Requiring
+ * the raw bytes to be valid UTF-8 and the whole body to pass `decodeURIComponent` (every `%`
+ * followed by two hex digits, the escaped bytes valid UTF-8 with no surrogate or overlong form)
+ * holds every key and value to the rule Express already applies to path parameters. A browser
+ * always submits a body that passes.
+ *
+ * @param body - The raw request body, before any decoding.
+ * @throws {@link BadRequestError} when the bytes are not valid UTF-8 or a percent-escape is
+ *   malformed or does not decode to valid UTF-8.
+ */
+export function assertFormBodyEncoding(body: Uint8Array): void {
+  // A decoder per call, never a module-level instance. `fatal` makes it throw on invalid bytes
+  // instead of inserting U+FFFD.
+  const decoder = new TextDecoder('utf-8', { fatal: true });
+  let text: string;
+  try {
+    text = decoder.decode(body);
+  } catch (err) {
+    // Node creates this TypeError in its own realm, so `instanceof TypeError` is false in another
+    // context (a `vm` sandbox, as Jest uses); it is matched by its documented code instead.
+    if (
+      typeof err === 'object' &&
+      err !== null &&
+      'code' in err &&
+      err.code === 'ERR_ENCODING_INVALID_ENCODED_DATA'
+    ) {
+      throw new BadRequestError();
+    }
+    throw err;
+  }
+  try {
+    decodeURIComponent(text);
+  } catch (err) {
+    if (err instanceof URIError) {
+      throw new BadRequestError();
+    }
+    throw err;
   }
 }
 

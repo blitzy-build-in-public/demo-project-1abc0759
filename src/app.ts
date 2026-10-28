@@ -25,6 +25,7 @@ import { noStore } from './web/middleware/no-store';
 import { createAuthRouter } from './web/routes/auth-routes';
 import { createReportRouter } from './web/routes/report-routes';
 import { createTaskRouter } from './web/routes/task-routes';
+import { assertFormBodyEncoding } from './web/validation/params';
 
 /**
  * Body size limit for `application/x-www-form-urlencoded` forms; larger bodies are answered 413.
@@ -67,11 +68,14 @@ export interface AppDeps {
  * Middleware runs in this order, and the order is binding:
  * 1. `/static` assets, followed by the 404 handler at the same mount, ahead of every cookie and
  *    session middleware: asset requests never read the session or count as session activity, and
- *    a missing asset or a non-`GET` request there is answered 404 "Page not found." at once.
+ *    a missing asset or a request there with a method other than `GET` or `HEAD` is answered 404
+ *    "Page not found." at once.
  * 2. `cookieParser(SESSION_SECRET)`: verifies the signed `sid` cookie and exposes the `csrf`
  *    nonce cookie.
- * 3. `express.urlencoded` (flat parsing, 100 kb limit): a malformed body becomes 400 and an
- *    oversized one 413 through the error handler.
+ * 3. `express.urlencoded` (flat parsing, 100 kb limit, {@link assertFormBodyEncoding} on the
+ *    raw bytes): a malformed body, including one whose bytes or percent-escapes are not valid
+ *    UTF-8, becomes 400 and an oversized one 413 through the error handler, before any route
+ *    runs, so it writes nothing.
  * 4. `loadSession`: resolves `sid` to `req.user`, recording the request as session activity.
  * 5. `csrf.prepare`: issues the nonce cookie and the page token, which binds to the session when
  *    `req.user` is set and to `anon` otherwise, so it must follow `loadSession`.
@@ -102,10 +106,10 @@ export function createApp(deps: AppDeps): Express {
 
   // Static assets are served before cookie parsing and session loading, so they never touch the
   // session. The 404 handler mounted with them ends every request under /static that
-  // express.static does not answer (a missing file, a directory, a non-GET method) instead of
-  // letting it fall through to loadSession and the routers. `redirect: false` keeps a directory
-  // request such as `/static` on that 404: with no index files, the default trailing-slash
-  // redirect would only lead to the same 404.
+  // express.static does not answer (a missing file, a directory, a method other than GET or HEAD)
+  // instead of letting it fall through to loadSession and the routers. `redirect: false` keeps a
+  // directory request such as `/static` on that 404: with no index files, the default
+  // trailing-slash redirect would only lead to the same 404.
   app.use(
     '/static',
     express.static(path.join(__dirname, 'web', 'public'), { index: false, redirect: false }),
@@ -113,7 +117,19 @@ export function createApp(deps: AppDeps): Express {
   );
 
   app.use(cookieParser(config.sessionSecret));
-  app.use(express.urlencoded({ extended: false, limit: FORM_BODY_LIMIT }));
+  // A body whose bytes or percent-escapes are not valid UTF-8 is malformed. `verify` checks the
+  // raw bytes before `querystring` could store U+FFFD in their place, and body-parser passes its
+  // BadRequestError, status 400 kept, to the error handler before any route runs, so nothing is
+  // written.
+  app.use(
+    express.urlencoded({
+      extended: false,
+      limit: FORM_BODY_LIMIT,
+      verify: (_req, _res, body): void => {
+        assertFormBodyEncoding(body);
+      },
+    }),
+  );
   app.use(loadSession(auth, config));
 
   const csrf = createCsrf(config.sessionSecret, config);

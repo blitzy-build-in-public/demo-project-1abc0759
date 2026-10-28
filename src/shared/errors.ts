@@ -28,8 +28,8 @@ export class HttpError extends Error {
 
 /**
  * Malformed request input: a non-numeric or over-long task id, an unknown filter or status value,
- * or a repeated parameter. It is thrown before any write, so no data changes. Renders 400
- * "Bad request."
+ * a repeated parameter, or a form body whose bytes or percent-escapes are not valid UTF-8. It is
+ * thrown before any write, so no data changes. Renders 400 "Bad request."
  */
 export class BadRequestError extends HttpError {
   constructor() {

@@ -76,6 +76,7 @@ import {
   loginAttemptRows,
   sessionsForUser,
   sql,
+  tasksForOwner,
   truncateAll,
   userIdByEmail,
 } from '../helpers/test-db';
@@ -390,8 +391,8 @@ describe('failure responses and the purge failure policy', () => {
         const [row] = await sql<{ active: number }>(
           pool,
           'SELECT count(*)::int AS active FROM pg_stat_activity ' +
-            "WHERE datname = current_database() AND backend_type = 'client backend' " +
-            "AND state = 'active' AND pid <> pg_backend_pid()",
+            `WHERE datname = current_database() AND backend_type = 'client backend' ` +
+            `AND state = 'active' AND pid <> pg_backend_pid()`,
         );
         if (row?.active === 0) {
           return;
@@ -612,6 +613,47 @@ describe('failure responses and the purge failure policy', () => {
       send(client: HttpClient, csrf: string): Promise<HttpResult>;
     }
 
+    /**
+     * Posts `rawPairs`, each `name=value` sent exactly as given and still percent-encoded, then
+     * the token and every {@link VALID_TASK_FIELDS} entry they do not name, URL-encoded. No key
+     * repeats, so the raw pairs are the only thing that can make the body malformed.
+     */
+    function postRawPairs(
+      client: HttpClient,
+      path: string,
+      csrf: string,
+      rawPairs: readonly string[],
+    ): Promise<HttpResult> {
+      const named = new Set(rawPairs.map((pair) => pair.split('=')[0]));
+      const rest = Object.entries(VALID_TASK_FIELDS).filter(([name]) => !named.has(name));
+      const encoded = formBody({ ...Object.fromEntries(rest), _csrf: csrf });
+      return client.postRaw(
+        path,
+        [...rawPairs, encoded].join('&'),
+        'application/x-www-form-urlencoded',
+      );
+    }
+
+    /**
+     * Raw `name=value` pairs whose percent-encoding is not valid UTF-8: a last escape cut short,
+     * a byte that is never UTF-8, an invalid continuation, an encoded surrogate, a sequence
+     * missing its last byte, an overlong form, two malformed escapes, a bad non-title field and a
+     * bad key that no handler reads. Node's `querystring` alone would store each as U+FFFD or as
+     * the literal escape.
+     */
+    const INVALID_ENCODINGS: readonly string[] = [
+      'title=%E0%A4%A',
+      'title=probe%FF',
+      'title=probe%C3%28',
+      'title=probe%ED%A0%80',
+      'title=probe%E0%A4',
+      'title=probe%C0%80',
+      'title=probe%',
+      'title=probe%zz',
+      'description=d%FFd',
+      '%E0%A4%A=1',
+    ];
+
     // Every state-changing case carries a valid session-bound token and fields that would
     // otherwise be accepted, so the malformation alone is what keeps the write from happening.
     const MALFORMED_CASES: readonly MalformedCase[] = [
@@ -647,6 +689,13 @@ describe('failure responses and the purge failure policy', () => {
             'application/x-www-form-urlencoded',
           ),
       },
+      ...INVALID_ENCODINGS.map(
+        (pair): MalformedCase => ({
+          name: `the invalid percent-encoding ${pair} in a POST /tasks/new body`,
+          status: 400,
+          send: (client, csrf) => postRawPairs(client, '/tasks/new', csrf, [pair]),
+        }),
+      ),
     ];
 
     it.each(MALFORMED_CASES)(
@@ -669,6 +718,63 @@ describe('failure responses and the purge failure policy', () => {
         expect(await countRows(pool, 'tasks')).toBe(before + 1);
       },
     );
+
+    it('answers invalid edit-body encoding with 400 and leaves the task unchanged', async () => {
+      const email = 'malformed-edit@example.com';
+      const client = await signUpAndLogIn(healthy, email);
+      const ownerId = await userIdByEmail(pool, email);
+      if (ownerId === null) {
+        throw new Error('the signed-up user was not stored');
+      }
+      const task = await insertTask(pool, ownerId, {
+        title: 'Stored title',
+        description: 'Stored description',
+      });
+      const csrf = await taskFormToken(client);
+      // A minute on, so any update would move `updated_at` off the stored instant.
+      clock.advance(MINUTE_MS);
+
+      const res = await postRawPairs(client, `/tasks/${task.id}/edit`, csrf, [
+        'title=edited%E0%A4%A',
+        'description=d%FFd',
+      ]);
+
+      expectFailurePage(res, 400, 'Bad request.');
+      expect(await tasksForOwner(pool, ownerId)).toEqual([task]);
+      expect(errorEntries(healthyLog)).toEqual([]);
+
+      // Control: the same session and token do update the task from a well-formed body.
+      const edited = await client.post(
+        `/tasks/${task.id}/edit`,
+        { ...VALID_TASK_FIELDS, title: 'Edited title' },
+        { csrf },
+      );
+      expect(edited.status).toBe(303);
+      expect(await tasksForOwner(pool, ownerId)).toMatchObject([
+        { id: task.id, title: 'Edited title', updatedAt: clock.now() },
+      ]);
+    });
+
+    it.each<{ pair: string; title: string }>([
+      { pair: 'title=%C3%A9t%C3%A9', title: 'été' },
+      { pair: 'title=%E0%A4%A4+%F0%9F%93%9D', title: 'त 📝' },
+      // Sent as its raw UTF-8 bytes, unescaped.
+      { pair: 'title=été', title: 'été' },
+      { pair: 'title=100%25', title: '100%' },
+    ])('accepts the valid UTF-8 form encoding $pair and stores $title exactly', async (c) => {
+      const email = 'well-encoded@example.com';
+      const client = await signUpAndLogIn(healthy, email);
+      const ownerId = await userIdByEmail(pool, email);
+      if (ownerId === null) {
+        throw new Error('the signed-up user was not stored');
+      }
+      const csrf = await taskFormToken(client);
+
+      const res = await postRawPairs(client, '/tasks/new', csrf, [c.pair]);
+
+      expect(res.status).toBe(303);
+      expect((await tasksForOwner(pool, ownerId)).map((task) => task.title)).toEqual([c.title]);
+    });
   });
 
   describe('unexpected error (500)', () => {
@@ -1164,7 +1270,7 @@ describe('failure responses and the purge failure policy', () => {
       expect(purgeLog.byMsg('purge completed')).toEqual([]);
     });
 
-    it("purges and logs the counts on the same job's next run, once reachable", async () => {
+    it('purges and logs the counts on the same job\'s next run, once reachable', async () => {
       const job = delegatingJob();
       await job.runOnce();
       expect(purgeLog.byMsg('purge failed')).toHaveLength(1);
@@ -1940,7 +2046,7 @@ describe('server start-up and shutdown', () => {
     await sql(
       pool,
       'INSERT INTO tasks (owner_id, title, description, created_at, updated_at) ' +
-        "SELECT $1::bigint, 'Export task ' || n, repeat('x', $2::int), $3::timestamptz, " +
+        `SELECT $1::bigint, 'Export task ' || n, repeat('x', $2::int), $3::timestamptz, ` +
         '$3::timestamptz FROM generate_series(1, $4::int) AS n',
       [ownerId, EXPORT_DESCRIPTION_CHARS, `${EXPORT_DAY}T12:00:00.000Z`, EXPORT_TASK_COUNT],
     );

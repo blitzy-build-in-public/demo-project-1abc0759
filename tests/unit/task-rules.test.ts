@@ -18,7 +18,9 @@
  * that field's inline message, because those fields reach SQL only as an exact label or a valid
  * date. `assertStorableText` lets valid text through unchanged. On an edit, a title that equals
  * the stored one once its line breaks are written as CRLF, as a browser submits them, is the
- * stored title, kept exactly; any other title is taken as submitted.
+ * stored title, kept exactly; any other title is taken as submitted. `assertFormBodyEncoding`
+ * refuses a raw form body whose bytes or percent-escapes are not valid UTF-8 with
+ * `BadRequestError`, and accepts every body a browser submits.
  */
 
 import {
@@ -38,7 +40,7 @@ import {
   TASK_STATUSES,
 } from '../../src/shared/task-values';
 import { BadRequestError } from '../../src/shared/errors';
-import { assertStorableText } from '../../src/web/validation/params';
+import { assertFormBodyEncoding, assertStorableText } from '../../src/web/validation/params';
 import {
   DESCRIPTION_TOO_LONG_MESSAGE,
   INVALID_DATE_MESSAGE,
@@ -817,5 +819,33 @@ describe('assertStorableText', () => {
 
   it('throws BadRequestError for text containing U+0000', () => {
     expectBadRequest(() => assertStorableText('a\u0000'));
+  });
+});
+
+describe('assertFormBodyEncoding', () => {
+  it.each<{ name: string; body: Buffer }>([
+    { name: 'an empty body', body: Buffer.alloc(0) },
+    { name: 'ASCII pairs with + for a space', body: Buffer.from('title=Buy+milk&status=To+do') },
+    { name: 'two- to four-byte escapes', body: Buffer.from('title=%C3%A9%E0%A4%A4%F0%9F%93%9D') },
+    { name: 'an escaped percent sign', body: Buffer.from('title=100%25') },
+    { name: 'unescaped UTF-8 bytes', body: Buffer.from('title=été 📝', 'utf8') },
+  ])('accepts $name', ({ body }) => {
+    expect(() => assertFormBodyEncoding(body)).not.toThrow();
+  });
+
+  it.each<{ name: string; body: Buffer }>([
+    { name: 'a last escape cut short', body: Buffer.from('title=%E0%A4%A') },
+    { name: 'an escaped sequence missing its last byte', body: Buffer.from('title=probe%E0%A4') },
+    { name: 'an escaped byte that is never UTF-8', body: Buffer.from('title=probe%FF') },
+    { name: 'an escaped invalid continuation', body: Buffer.from('title=probe%C3%28') },
+    { name: 'an escaped surrogate', body: Buffer.from('title=probe%ED%A0%80') },
+    { name: 'an escaped overlong form', body: Buffer.from('title=probe%C0%80') },
+    { name: 'a trailing percent sign', body: Buffer.from('title=probe%') },
+    { name: 'a percent sign without hex digits', body: Buffer.from('title=probe%zz') },
+    { name: 'an invalid escape in a key', body: Buffer.from('%E0%A4%A=1&title=ok') },
+    { name: 'a raw byte that is never UTF-8', body: Buffer.from([0x74, 0x3d, 0xff]) },
+    { name: 'a raw encoded surrogate', body: Buffer.from([0x74, 0x3d, 0xed, 0xa0, 0x80]) },
+  ])('throws BadRequestError for $name', ({ body }) => {
+    expectBadRequest(() => assertFormBodyEncoding(body));
   });
 });
