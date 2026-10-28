@@ -129,6 +129,12 @@ export type NewTaskRow = Omit<TaskRecord, 'id' | 'ownerId'>;
 export type TaskUpdateRow = Omit<TaskRecord, 'id' | 'ownerId' | 'createdAt'>;
 
 /**
+ * A task's place in the list order `due_date ASC NULLS LAST, id ASC`, passed to
+ * `TasksRepo.listNeighbour`: its due date, `null` for an undated task, and its id.
+ */
+export type TaskListKey = Pick<TaskRecord, 'dueDate' | 'id'>;
+
+/**
  * Exact-match filters for `TasksRepo.list`. An absent field means no filter on that column, and the
  * two combine with AND.
  */

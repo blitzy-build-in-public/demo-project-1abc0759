@@ -26,13 +26,13 @@ import {
   DELETE_CONFIRM_FIELD,
   DELETE_CONFIRMED,
   FILTER_ECHO_FIELDS,
-  filtersToQuery,
   LIST_FILTER_KEYS,
   parseListFilters,
   parseStatusValue,
   parseTaskId,
   readField,
   STATUS_CHANGE_FIELD,
+  taskListPath,
 } from '../validation/params';
 import { parseTaskForm, type TaskFormValues } from '../validation/task-form';
 import {
@@ -134,9 +134,13 @@ function toFormValues(task: Task): TaskFormValues {
  * - `POST /tasks/:id/edit`: 303 to `/tasks`; 422 as for creation. A title or description
  *   submitted unchanged, its line breaks sent as CRLF, keeps the stored text exactly.
  * - `POST /tasks/:id/status`: moves the task to `status` (an exact label, else 400) and answers 303
- *   to `/tasks` with the echoed filters.
+ *   to `/tasks` with the echoed filters and the fragment `#task-<id>` of the row to reopen at: the
+ *   task's own while it still matches the filters, else the matching task listed next after it,
+ *   else the one before it, and no fragment when no task matches.
  * - `POST /tasks/:id/delete`: with `confirm=yes` deletes the task and answers 303 to `/tasks` with
- *   the echoed filters; otherwise 200 confirmation page and nothing changed.
+ *   the echoed filters and the fragment of the matching task listed next after the deleted one,
+ *   else the one before it, else none; otherwise 200 confirmation page, whose Cancel link returns
+ *   to the task's own row, and nothing changed.
  *
  * The three `GET` routes stop before their next task query or render once the client has
  * disconnected, and send nothing; the `POST` routes always run to completion.
@@ -313,7 +317,10 @@ export function createTaskRouter(deps: { tasks: TaskService; csrf: Csrf }): Rout
       if (changed === null) {
         throw new NotFoundError('Task not found.');
       }
-      res.redirect(303, `/tasks${filtersToQuery(filters)}`);
+      // The list reopens at the changed row, or where it was when it left the filtered list, so
+      // the result of the one-action change is in view; the path and query stay the same list.
+      const anchor = await tasks.anchorAfterStatusChange(user.id, changed, filters);
+      res.redirect(303, taskListPath(filters, anchor));
     }),
   );
 
@@ -334,7 +341,9 @@ export function createTaskRouter(deps: { tasks: TaskService; csrf: Csrf }): Rout
         if (!deleted) {
           throw new NotFoundError('Task not found.');
         }
-        res.redirect(303, `/tasks${filtersToQuery(filters)}`);
+        // The task read before the delete places it in the list, so the list reopens where it was.
+        const anchor = await tasks.anchorAfterDelete(user.id, task, filters);
+        res.redirect(303, taskListPath(filters, anchor));
         return;
       }
       // No explicit confirmation: without JavaScript every Delete button arrives here, so the

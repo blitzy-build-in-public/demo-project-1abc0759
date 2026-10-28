@@ -146,14 +146,21 @@ button {
 header button, td button { background: var(--color-bg); color: var(--color-accent); }
 
 /* BLITZY [A11Y]: per-row buttons are compact by specification (about 28px tall): above the
-   WCAG 2.2 AA 24px target minimum, below the 44px touch guideline. Flagged for design review. */
+   WCAG 2.2 AA 24px target minimum, below the 44px touch guideline. Flagged for design review.
+   The actions cell's 0.5rem gap keeps them farther apart than the 5px a focus ring reaches (3px
+   outline, 2px offset), so no neighbour paints over a focused button's ring. */
 td button {
-  margin-block: 0 0.25rem;
-  margin-inline: 0 0.25rem;
+  margin: 0;
   padding-block: 0.15rem;
   padding-inline: 0.5rem;
   font-size: 0.875rem;
+  white-space: nowrap;
 }
+
+/* Every "Mark <status>" button is as wide as "Mark In progress", the longest label (14.03ch in
+   Noto Sans; ch follows the font), so every row's buttons have the same sizes and wrap into the
+   same lines. In the row's own 16px ch this is 12.6ch + 1rem + 2px, which the tracks below use. */
+td button[name="status"] { min-inline-size: calc(14.4ch + 1rem + 2px); }
 
 /* Delete buttons; the label already says Delete, so colour is not the only cue. The confirmation
    page's "Delete task" takes .danger, since data-confirm-delete would ask a second time. */
@@ -305,19 +312,35 @@ td {
 thead th { border-block-end: 2px solid var(--color-control); font-weight: 600; }
 tbody th { font-weight: 400; }
 /* Task-table rows are grids on fixed column tracks, so widths never depend on content (as with
-   fixed table layout), and each tbody group of 50 rows (task-pages.ts) skips rendering while off
-   screen: a resize or the breakpoint restyles and lays out only the groups in view. The markup
-   keeps its table semantics. A never-rendered group is sized as 50 rows of 20rem, above the row a
-   200-character title makes at 641px (under 19rem), so a group a scroll renders shrinks rather
-   than pushing the last row past where End stops. A remembered height is exact only at its own
-   width, so the last two groups (the whole list, or at least 51 rows) always render and End
-   lands on real heights. That selector matches groups, never rows. Groups clip their contents,
-   and the margin keeps focus rings whole. */
+   fixed table layout), and every row lays out alike. The markup keeps its table semantics. The
+   Status, Priority and Due date tracks fit their longest value on one line, with the cell
+   padding: "In progress" (9.36ch in Noto Sans), "Medium" (6.81ch) and a YYYY-MM-DD date
+   (9.12ch); ch follows the font, so the tracks do too. Actions takes what leaves the title 35% of
+   the row, from one Mark button wide (its buttons stacked) up to all three on one line (two
+   12.6ch + 1rem + 2px Mark buttons, a Delete under 5ch + 1rem + 2px, two 0.5rem gaps and the
+   padding). Rows carry the separating rule, so a row split over several lines stays one block. */
 .task-table, .task-table thead, .task-table tbody { display: block; }
-.task-table tr { display: grid; grid-template-columns: 30% 13% 11% 14% 32%; }
-.task-table tbody { content-visibility: auto; contain-intrinsic-size: auto 1000rem; }
-.task-table tbody { overflow-clip-margin: 0.5rem; }
-.task-table tbody:nth-last-child(-n + 2) { content-visibility: visible; }
+.task-table tr {
+  display: grid;
+  grid-template-columns:
+    minmax(0, 1fr) calc(9.5ch + 1rem) calc(7ch + 1rem) calc(9.5ch + 1rem)
+    clamp(calc(12.6ch + 2rem + 2px), calc(65% - 26ch - 3rem), calc(30.2ch + 5rem + 6px));
+  border-block-end: 1px solid var(--color-border);
+  /* A list opened at #task-<id> shows that row just below the top edge, never a fraction of a
+     pixel above it, which the browser's rounding of the scroll position otherwise allows. */
+  scroll-margin-block-start: 0.5rem;
+}
+.task-table thead tr { border-block-end-width: 2px; border-block-end-color: var(--color-control); }
+.task-table th, .task-table td { border-block-end: 0; white-space: nowrap; }
+/* Titles wrap, an unbroken one anywhere (th, td above); every other value keeps to one line. */
+.task-table .title { white-space: normal; }
+.task-table .actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-content: flex-start;
+  align-items: flex-start;
+  gap: 0.5rem;
+}
 /* Wraps the hidden inputs and the task table; it must add no space around the table. */
 #task-actions { margin: 0; }
 
@@ -394,12 +417,16 @@ dd { margin: 0; font-weight: 600; }
   .control-pair + .control-pair { margin-block-start: 0.5rem; margin-inline-start: 0; }
   /* A link (Clear filters) keeps its text's width, so its click area and focus ring hug it. */
   .filters > a, form[method="get"] > a { align-self: flex-start; }
-  /* Tighter cells and rebalanced columns keep "In progress", "Medium" and dates from breaking
-     mid-word at phone widths. Rows wrap taller here, so the group-height estimate grows: 50 rows
-     of 40rem, above the row a 200-character title makes at 320px (under 38rem). */
-  table { font-size: 0.8125rem; }
-  th, td { padding-inline: 0.25rem; }
-  td button { padding-inline: 0.375rem; font-size: inherit; }
-  .task-table tr { grid-template-columns: 20% 19% 18% 18% 25%; }
-  .task-table tbody { contain-intrinsic-size: auto 2000rem; }
+  /* Only the completions table tightens its text and cells here. */
+  #completions-table { font-size: 0.8125rem; }
+  #completions-table th, #completions-table td { padding-inline: 0.25rem; }
+  /* Task rows take three lines here: the title across the row, then Status, Priority and Due date
+     on the wide tracks' widths (286px in Noto Sans, of the 296 a 320px screen leaves), then the
+     actions across the row, which fit both Mark buttons on one line from 320px. The header cells
+     are placed the same way, above their columns. Text size, cell padding and buttons stay as on
+     wider screens, so crossing this width re-places cells without re-shaping any title. */
+  .task-table tr {
+    grid-template-columns: calc(9.5ch + 1rem) calc(7ch + 1rem) minmax(calc(9.5ch + 1rem), 1fr);
+  }
+  .task-table .title, .task-table .actions { grid-column: 1 / -1; }
 }

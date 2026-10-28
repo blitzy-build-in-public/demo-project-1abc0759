@@ -16,9 +16,10 @@ import {
   DELETE_CONFIRM_FIELD,
   DELETE_CONFIRMED,
   FILTER_ECHO_FIELDS,
-  filtersToQuery,
   LIST_FILTER_KEYS,
   STATUS_CHANGE_FIELD,
+  taskListPath,
+  taskRowId,
 } from '../validation/params';
 import { TASK_FORM_FIELDS, type TaskFormValues } from '../validation/task-form';
 import { html, type SafeHtml } from './html';
@@ -118,12 +119,6 @@ const OTHER_STATUSES: Readonly<Record<Status, readonly Status[]>> = {
 /** Shown in the due-date column of an undated task. */
 const NO_DUE_DATE = '\u2014';
 
-/**
- * Task rows per `<tbody>` group of the task table. app.css lets an off-screen group skip rendering
- * and sizes a skipped group as this many rows, so the two values change together.
- */
-const TASK_ROW_GROUP_SIZE = 50;
-
 /** Whether a field carries an inline message, using the same rule as {@link fieldError}. */
 function hasError(message: string | undefined): message is string {
   return message !== undefined && message !== '';
@@ -199,7 +194,10 @@ function filterEchoes(filters: TaskFilters): SafeHtml {
  * its own `formaction`, so a row carries no form, CSRF field or hidden input of its own: the list
  * renders every matching task, up to 10,000 rows, within the 2-second page budget. Source line
  * breaks fall only inside `${}` expressions, so a row's markup holds no whitespace beyond single
- * attribute separators.
+ * attribute separators. The `title` and `actions` classes, which the matching header cells also
+ * carry, let app.css place those two cells on their own lines on small screens without
+ * position-based selectors. The row's id ({@link taskRowId}) is the fragment the status-change and
+ * delete redirects and the confirmation page's Cancel link end in, so the list reopens at the row.
  */
 function renderTaskRow(t: Task): SafeHtml {
   const marks = OTHER_STATUSES[t.status].map(
@@ -210,9 +208,11 @@ function renderTaskRow(t: Task): SafeHtml {
   const remove = html`<button type="submit" formaction="/tasks/${
     t.id
   }/delete" data-confirm-delete data-task-title="${t.title}">Delete</button>`;
-  return html`<tr><td><a href="/tasks/${t.id}/edit">${t.title}</a></td><td>${t.status}</td><td>${
-    t.priority
-  }</td><td>${t.dueDate ?? NO_DUE_DATE}</td><td>${marks}${remove}</td></tr>`;
+  return html`<tr id="${taskRowId(t.id)}"><td class="title"><a href="/tasks/${t.id}/edit">${
+    t.title
+  }</a></td><td>${t.status}</td><td>${t.priority}</td><td>${
+    t.dueDate ?? NO_DUE_DATE
+  }</td><td class="actions">${marks}${remove}</td></tr>`;
 }
 
 /**
@@ -230,13 +230,6 @@ function renderTaskListContent(view: TaskListPageView): SafeHtml {
   }
   // Rendered in the order given: the repository already sorts by due date, undated last, then id.
   const rows = tasks.map(renderTaskRow);
-  // Rows sit in <tbody> groups so the browser skips rendering whole off-screen groups: a resize
-  // restyles and lays out only the groups in view, and while scrolling it checks each group, not
-  // each of up to 10,000 rows, for visibility, which per-row skipping costs on every frame.
-  const groups: SafeHtml[] = [];
-  for (let i = 0; i < rows.length; i += TASK_ROW_GROUP_SIZE) {
-    groups.push(html`<tbody>${rows.slice(i, i + TASK_ROW_GROUP_SIZE)}</tbody>`);
-  }
   // The row buttons belong to this one form by ancestry, not through a `form="task-actions"`
   // attribute on each: Chromium associates form-attribute controls at a cost that grows with the
   // square of their number, which measured about 29 s for 10,000 rows (30,000 buttons) against
@@ -248,10 +241,11 @@ function renderTaskListContent(view: TaskListPageView): SafeHtml {
     <input type="hidden" name="${DELETE_CONFIRM_FIELD}" value="">
     <table class="task-table">
       <thead>
-        <tr><th scope="col">Title</th><th scope="col">Status</th><th scope="col">Priority</th><th
-          scope="col">Due date</th><th scope="col">Actions</th></tr>
+        <tr><th scope="col" class="title">Title</th><th scope="col">Status</th><th
+          scope="col">Priority</th><th scope="col">Due date</th><th scope="col"
+          class="actions">Actions</th></tr>
       </thead>
-      ${groups}
+      <tbody>${rows}</tbody>
     </table>
   </form>`;
 }
@@ -493,9 +487,10 @@ export function renderTaskFormPage(view: TaskFormPageView): string {
  *
  * It shows "Delete this task?" and the task's title, a form posting `confirm=yes` with the CSRF
  * field and the list-filter echoes to `/tasks/:id/delete` through a "Delete task" button, and a
- * Cancel link back to the filtered list. The button carries no `data-confirm-delete`, because it
- * is itself the confirmation, and the page loads no script; it takes the danger style of the
- * other Delete buttons through its `danger` class instead.
+ * Cancel link back to the filtered list, scrolled to the task's row (`#task-<id>`), where the
+ * Delete was pressed. The button carries no `data-confirm-delete`, because it is itself the
+ * confirmation, and the page loads no script; it takes the danger style of the other Delete
+ * buttons through its `danger` class instead.
  *
  * @param view - The user, CSRF token, task and active list filters.
  * @returns The complete HTML document.
@@ -508,7 +503,7 @@ export function renderDeleteConfirmPage(view: DeleteConfirmPageView): string {
       <input type="hidden" name="${DELETE_CONFIRM_FIELD}" value="${DELETE_CONFIRMED}">
       ${filterEchoes(filters)}
       <button type="submit" class="danger">Delete task</button>
-      <a href="/tasks${filtersToQuery(filters)}">Cancel</a>
+      <a href="${taskListPath(filters, task.id)}">Cancel</a>
     </form>`;
   return renderLayout({ title: 'Delete task', user, csrfToken, body });
 }

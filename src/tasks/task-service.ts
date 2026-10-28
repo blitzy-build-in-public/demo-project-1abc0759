@@ -1,6 +1,6 @@
 /**
  * Task service: one user's tasks created, read, edited, moved between statuses, deleted and
- * listed (FR-5 to FR-10).
+ * listed (FR-5 to FR-10), and the list row to reopen at after a status change or delete.
  *
  * It orchestrates the pure rules in `./task-rules` and the owner-scoped tasks repository, and it
  * is the only task object the web layer receives. Owner scoping itself lives in the repository:
@@ -19,7 +19,7 @@ import type { DataAccess } from '../db/data-access';
 import type { NewTaskRow, TaskId, TaskRecord, UserId } from '../db/types';
 import type { Clock } from '../shared/clock';
 import type { TaskStatus } from '../shared/task-values';
-import { buildTaskUpdate, nextCompletedAt } from './task-rules';
+import { buildTaskUpdate, matchesTaskFilters, nextCompletedAt } from './task-rules';
 import type { Task, TaskFilters, TaskInput, TaskListResult } from './types';
 
 /**
@@ -100,6 +100,36 @@ export interface TaskService {
    *   another user.
    */
   delete(ownerId: UserId, taskId: TaskId): Promise<boolean>;
+
+  /**
+   * Picks the row the filtered list reopens at after a status change, so the changed task, or
+   * the place it left, stays in view: the task itself while it still matches the filters,
+   * otherwise the matching task listed next after its place, or the last one before it when none
+   * follows. Call it after the change, with the task as {@link TaskService.changeStatus} returned
+   * it.
+   *
+   * @param ownerId - The authenticated user.
+   * @param changed - The task as stored after the change.
+   * @param filters - The filters of the list the change was made from.
+   * @returns The task whose row to show, or `null` when the list has no matching task.
+   */
+  anchorAfterStatusChange(
+    ownerId: UserId,
+    changed: Task,
+    filters: TaskFilters,
+  ): Promise<TaskId | null>;
+
+  /**
+   * Picks the row the filtered list reopens at after a delete: the matching task listed next
+   * after the deleted task's place, or the last one before it when none follows. Call it after
+   * the delete, with the task as it was read before it.
+   *
+   * @param ownerId - The authenticated user.
+   * @param deleted - The deleted task, as read before the delete.
+   * @param filters - The filters of the list the delete was made from.
+   * @returns The task whose row to show, or `null` when no matching task is left.
+   */
+  anchorAfterDelete(ownerId: UserId, deleted: Task, filters: TaskFilters): Promise<TaskId | null>;
 }
 
 /** What {@link createTaskService} needs: the data-access facade and the source of the time. */
@@ -217,6 +247,26 @@ export function createTaskService(deps: TaskServiceDeps): TaskService {
 
     delete(ownerId: UserId, taskId: TaskId): Promise<boolean> {
       return dal.tasks.delete(ownerId, taskId);
+    },
+
+    async anchorAfterStatusChange(
+      ownerId: UserId,
+      changed: Task,
+      filters: TaskFilters,
+    ): Promise<TaskId | null> {
+      // A task still in the list is its own anchor and needs no lookup.
+      if (matchesTaskFilters(changed, filters)) {
+        return changed.id;
+      }
+      return dal.tasks.listNeighbour(ownerId, changed, filters);
+    },
+
+    anchorAfterDelete(
+      ownerId: UserId,
+      deleted: Task,
+      filters: TaskFilters,
+    ): Promise<TaskId | null> {
+      return dal.tasks.listNeighbour(ownerId, deleted, filters);
     },
   };
 }

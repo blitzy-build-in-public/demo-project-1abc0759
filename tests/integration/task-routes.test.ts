@@ -2,7 +2,8 @@
  * Integration tests for the task routes over real HTTP against real PostgreSQL 16: create, edit,
  * one-action status change and delete (SC4), the completion time (SC5), list filters, sort and
  * empty states (SC6), owner isolation with identical 404s (SC7), and the validation, malformed,
- * unauthenticated, CSRF and caching states (SC11).
+ * unauthenticated, CSRF and caching states (SC11). Status-change and delete redirects keep the
+ * list's filters and name, as their fragment, the row the list reopens at.
  *
  * Every request goes through the in-process production stack with a `FakeClock`. Pages are
  * compared with the rows read straight from the `tasks` table. Clock moves stay well inside the
@@ -309,7 +310,8 @@ describe('create, edit, change status and delete (SC4)', () => {
       filterPriority: '',
     });
     expect(moved.status).toBe(303);
-    expect(moved.location).toBe('/tasks');
+    // Still listed, so the list reopens at its row.
+    expect(moved.location).toBe(`/tasks#task-${report.id}`);
     page = await client.get('/tasks');
     const movedRow = rowFor(page.body, report.id);
     expect(movedRow).toContain('<td>In progress</td>');
@@ -331,7 +333,10 @@ describe('create, edit, change status and delete (SC4)', () => {
       filterPriority: '',
     });
     expect(deleted.status).toBe(303);
-    expect(deleted.location).toBe('/tasks');
+    // The undated "Plan trip" is listed right after the dated report, so it takes the report's
+    // place in view.
+    const planTrip = (await tasksForOwner(pool, userA.userId)).find((t) => t.title === 'Plan trip');
+    expect(deleted.location).toBe(`/tasks#task-${planTrip?.id}`);
     page = await client.get('/tasks');
     expect(listIds(page.body)).not.toContain(report.id);
     expect(page.body).not.toContain('Write final report');
@@ -1412,24 +1417,232 @@ describe('task list filters, sort and empty states (SC6)', () => {
   });
 });
 
+/** A task of {@link ANCHOR_TASKS}, named by its letter. */
+type AnchorTask = 'a' | 'b' | 'c' | 'd' | 'e' | 'x';
+
+/**
+ * Tasks for the return-anchor cases, all To do, inserted in this order so their ids ascend. The
+ * list To do + High shows a, b, c, d, e in that order: a and b share a due date, so their ids
+ * order them, d and e are undated, so they come last, and x, which is Low, is listed between b
+ * and c only when the priority is not filtered.
+ */
+const ANCHOR_TASKS: readonly {
+  name: AnchorTask;
+  priority: TaskRow['priority'];
+  dueDate: TaskRow['dueDate'];
+}[] = [
+  { name: 'a', priority: 'High', dueDate: '2030-01-01' },
+  { name: 'b', priority: 'High', dueDate: '2030-01-01' },
+  { name: 'x', priority: 'Low', dueDate: '2030-01-15' },
+  { name: 'c', priority: 'High', dueDate: '2030-02-01' },
+  { name: 'd', priority: 'High', dueDate: null },
+  { name: 'e', priority: 'High', dueDate: null },
+];
+
+/** One return-anchor case: a change to one task of a list, and the row the list reopens at. */
+interface AnchorCase {
+  name: string;
+  /** The {@link ANCHOR_TASKS} stored for the case. */
+  tasks: readonly AnchorTask[];
+  /** `status change` moves `target` to Done; `delete` deletes it with `confirm=yes`. */
+  action: 'status change' | 'delete';
+  target: AnchorTask;
+  /** The posted filter echoes. */
+  echoes: Readonly<Record<string, string>>;
+  /** The redirect's path and query: the list the echoes select. */
+  list: string;
+  /** The task whose row the redirect's fragment names, or `null` for no fragment. */
+  anchor: AnchorTask | null;
+}
+
+/** The echoes of the list To do + High, which a task moved to Done leaves. */
+const TO_DO_HIGH = { filterStatus: 'To do', filterPriority: 'High' } as const;
+
+/** The path and query of the list To do + High. */
+const TO_DO_HIGH_LIST = '/tasks?status=To%20do&priority=High';
+
+/** All five matching tasks of {@link ANCHOR_TASKS} and the Low one outside the list. */
+const ALL_ANCHOR_TASKS: readonly AnchorTask[] = ['a', 'b', 'x', 'c', 'd', 'e'];
+
+/** Inserts the named {@link ANCHOR_TASKS} for user A, in fixture order, and maps names to ids. */
+async function insertAnchorTasks(names: readonly AnchorTask[]): Promise<Map<AnchorTask, number>> {
+  const ids = new Map<AnchorTask, number>();
+  for (const task of ANCHOR_TASKS) {
+    if (names.includes(task.name)) {
+      const stored = await insertTask(pool, userA.userId, {
+        title: `Task ${task.name}`,
+        status: 'To do',
+        priority: task.priority,
+        dueDate: task.dueDate,
+      });
+      ids.set(task.name, stored.id);
+    }
+  }
+  return ids;
+}
+
+/** The id {@link insertAnchorTasks} stored for `name`; fails when it stored none. */
+function anchorId(ids: ReadonlyMap<AnchorTask, number>, name: AnchorTask): number {
+  const id = ids.get(name);
+  if (id === undefined) {
+    throw new Error(`anchorId: task ${name} was not inserted`);
+  }
+  return id;
+}
+
 describe('status change and delete keep the list filters', () => {
-  test.each<{ name: string; echoes: Record<string, string>; location: string }>([
+  test.each<{
+    name: string;
+    echoes: Record<string, string>;
+    location: (id: number) => string;
+  }>([
     {
-      name: 'with filter echoes',
+      name: 'with filter echoes the task no longer matches',
       echoes: { filterStatus: 'To do', filterPriority: 'High' },
-      location: '/tasks?status=To%20do&priority=High',
+      location: () => '/tasks?status=To%20do&priority=High',
     },
     {
       name: 'with empty filter echoes',
       echoes: { filterStatus: '', filterPriority: '' },
-      location: '/tasks',
+      location: (id) => `/tasks#task-${id}`,
     },
   ])('a status change $name redirects to the same list', async ({ echoes, location }) => {
     const task = await insertTask(pool, userA.userId, { status: 'To do', priority: 'High' });
     const res = await postAs(userA, `/tasks/${task.id}/status`, { status: 'Done', ...echoes });
     expect(res.status).toBe(303);
-    expect(res.location).toBe(location);
+    expect(res.location).toBe(location(task.id));
     expect((await storedTask(userA.userId, task.id)).status).toBe('Done');
+  });
+
+  test.each<AnchorCase>([
+    {
+      name: 'of a task that still matches the filters reopens at its row',
+      tasks: ALL_ANCHOR_TASKS,
+      action: 'status change',
+      target: 'b',
+      echoes: { filterStatus: '', filterPriority: 'High' },
+      list: '/tasks?priority=High',
+      anchor: 'b',
+    },
+    {
+      name: 'of a task leaving the list reopens at the next one of its due date',
+      tasks: ALL_ANCHOR_TASKS,
+      action: 'status change',
+      target: 'a',
+      echoes: TO_DO_HIGH,
+      list: TO_DO_HIGH_LIST,
+      anchor: 'b',
+    },
+    {
+      name: 'of a task leaving the list reopens at the next match, past a non-match',
+      tasks: ALL_ANCHOR_TASKS,
+      action: 'status change',
+      target: 'b',
+      echoes: TO_DO_HIGH,
+      list: TO_DO_HIGH_LIST,
+      anchor: 'c',
+    },
+    {
+      name: 'of the last dated task reopens at the first undated one',
+      tasks: ALL_ANCHOR_TASKS,
+      action: 'status change',
+      target: 'c',
+      echoes: TO_DO_HIGH,
+      list: TO_DO_HIGH_LIST,
+      anchor: 'd',
+    },
+    {
+      name: 'of an undated task reopens at the next undated one',
+      tasks: ALL_ANCHOR_TASKS,
+      action: 'status change',
+      target: 'd',
+      echoes: TO_DO_HIGH,
+      list: TO_DO_HIGH_LIST,
+      anchor: 'e',
+    },
+    {
+      name: 'of the last task in list order reopens at the one before it',
+      tasks: ALL_ANCHOR_TASKS,
+      action: 'status change',
+      target: 'e',
+      echoes: TO_DO_HIGH,
+      list: TO_DO_HIGH_LIST,
+      anchor: 'd',
+    },
+    {
+      name: 'of the last of only dated tasks reopens at the dated one before it',
+      tasks: ['a', 'b', 'c'],
+      action: 'status change',
+      target: 'c',
+      echoes: TO_DO_HIGH,
+      list: TO_DO_HIGH_LIST,
+      anchor: 'b',
+    },
+    {
+      name: 'of the only undated task reopens at the last dated one',
+      tasks: ['a', 'x', 'd'],
+      action: 'status change',
+      target: 'd',
+      echoes: TO_DO_HIGH,
+      list: TO_DO_HIGH_LIST,
+      anchor: 'a',
+    },
+    {
+      name: 'of the only matching task reopens at the top',
+      tasks: ['a', 'x'],
+      action: 'status change',
+      target: 'a',
+      echoes: TO_DO_HIGH,
+      list: TO_DO_HIGH_LIST,
+      anchor: null,
+    },
+    {
+      name: 'of a task reopens at the next matching task',
+      tasks: ALL_ANCHOR_TASKS,
+      action: 'delete',
+      target: 'b',
+      echoes: TO_DO_HIGH,
+      list: TO_DO_HIGH_LIST,
+      anchor: 'c',
+    },
+    {
+      name: 'of the last task in list order reopens at the one before it',
+      tasks: ALL_ANCHOR_TASKS,
+      action: 'delete',
+      target: 'e',
+      echoes: TO_DO_HIGH,
+      list: TO_DO_HIGH_LIST,
+      anchor: 'd',
+    },
+    {
+      name: 'of the only matching task reopens at the top',
+      tasks: ['a', 'x'],
+      action: 'delete',
+      target: 'a',
+      echoes: TO_DO_HIGH,
+      list: TO_DO_HIGH_LIST,
+      anchor: null,
+    },
+  ])('a $action $name', async (c) => {
+    const ids = await insertAnchorTasks(c.tasks);
+    const target = anchorId(ids, c.target);
+    const res =
+      c.action === 'status change'
+        ? await postAs(userA, `/tasks/${target}/status`, { status: 'Done', ...c.echoes })
+        : await postAs(userA, `/tasks/${target}/delete`, { confirm: 'yes', ...c.echoes });
+    expect(res.status).toBe(303);
+    const fragment = c.anchor === null ? '' : `#task-${anchorId(ids, c.anchor)}`;
+    expect(res.location).toBe(`${c.list}${fragment}`);
+    // The fragment names a row the list it redirects to shows; the changed task is listed only
+    // when it is its own anchor.
+    const page = await userA.client.get(c.list);
+    expect(page.status).toBe(200);
+    if (c.anchor !== null) {
+      expect(page.body).toContain(`<tr id="task-${anchorId(ids, c.anchor)}">`);
+    }
+    if (c.anchor !== c.target) {
+      expect(page.body).not.toContain(`<tr id="task-${target}">`);
+    }
   });
 
   test.each<{ name: string; confirm: Record<string, string> }>([
@@ -1447,6 +1660,8 @@ describe('status change and delete keep the list filters', () => {
     expect(res.body).toContain('Keep me');
     expect(res.body).toMatch(/<input[^>]*name="confirm"[^>]*value="yes"/);
     expect(res.body).toMatch(/<input[^>]*name="filterStatus"[^>]*value="In progress"/);
+    // Cancel returns to the filtered list at the task's own row.
+    expect(res.body).toContain(`<a href="/tasks?status=In%20progress#task-${task.id}">Cancel</a>`);
     // The button is the confirmation: danger-styled by class, never a second script prompt.
     expect(res.body).toContain('<button type="submit" class="danger">Delete task</button>');
     expect(res.body).not.toContain('data-confirm-delete');

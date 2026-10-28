@@ -6,7 +6,8 @@
  * `nextCompletedAt` (creation as `Done`, entering `Done`, staying `Done`, leaving `Done` and moves
  * between open statuses), and `buildTaskUpdate`: a priority-only change between every pair of
  * priorities, in each of the three statuses, keeps the status and the completion time (set or
- * `null`) unchanged and sets `updatedAt` to now.
+ * `null`) unchanged and sets `updatedAt` to now. `matchesTaskFilters` admits a task exactly when
+ * every set filter equals its value.
  *
  * `parseTaskForm` is where a submitted form takes those defaults and limits. Only a missing status
  * or priority takes its default, which the re-render values then hold; a blank one was submitted,
@@ -23,6 +24,7 @@
 import {
   buildTaskUpdate,
   DESCRIPTION_MAX_CHARS,
+  matchesTaskFilters,
   nextCompletedAt,
   TITLE_MAX_CHARS,
 } from '../../src/tasks/task-rules';
@@ -47,7 +49,7 @@ import {
   TITLE_TOO_LONG_MESSAGE,
 } from '../../src/web/validation/task-form';
 import type { TaskPriority, TaskStatus } from '../../src/shared/task-values';
-import type { TaskInput } from '../../src/tasks/types';
+import type { TaskFilters, TaskInput } from '../../src/tasks/types';
 import type { TaskUpdateRow } from '../../src/db/types';
 import type { TaskFormValues } from '../../src/web/validation/task-form';
 
@@ -286,6 +288,51 @@ describe('buildTaskUpdate', () => {
       'updatedAt',
     ]);
   });
+});
+
+describe('matchesTaskFilters', () => {
+  it.each<{
+    status: TaskStatus;
+    priority: TaskPriority;
+    filters: TaskFilters;
+    matches: boolean;
+  }>([
+    { status: 'To do', priority: 'Low', filters: {}, matches: true },
+    { status: 'Done', priority: 'High', filters: {}, matches: true },
+    { status: 'Done', priority: 'Low', filters: { status: 'Done' }, matches: true },
+    { status: 'To do', priority: 'Low', filters: { status: 'Done' }, matches: false },
+    { status: 'In progress', priority: 'High', filters: { priority: 'High' }, matches: true },
+    { status: 'In progress', priority: 'Medium', filters: { priority: 'High' }, matches: false },
+    {
+      status: 'To do',
+      priority: 'High',
+      filters: { status: 'To do', priority: 'High' },
+      matches: true,
+    },
+    {
+      status: 'To do',
+      priority: 'Low',
+      filters: { status: 'To do', priority: 'High' },
+      matches: false,
+    },
+    {
+      status: 'Done',
+      priority: 'High',
+      filters: { status: 'To do', priority: 'High' },
+      matches: false,
+    },
+    {
+      status: 'Done',
+      priority: 'Low',
+      filters: { status: 'To do', priority: 'High' },
+      matches: false,
+    },
+  ])(
+    'a $status / $priority task against $filters matches: $matches',
+    ({ status, priority, filters, matches }) => {
+      expect(matchesTaskFilters({ status, priority }, filters)).toBe(matches);
+    },
+  );
 });
 
 /** The inline task-form messages, written out so the suite does not trust the constants. */

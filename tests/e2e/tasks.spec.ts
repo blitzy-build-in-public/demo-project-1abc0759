@@ -21,6 +21,7 @@ import {
   type ViewportSize,
 } from '@playwright/test';
 
+import { TASK_PRIORITIES, TASK_STATUSES } from '../../src/shared/task-values';
 import { FIXTURE_TIME, createTestPool, sql, userIdByEmail } from '../helpers/test-db';
 import { createTask, signUpAndLogIn, taskRow, userTasks } from './support';
 
@@ -69,6 +70,23 @@ interface ListScrollState {
   viewportHeight: number;
 }
 
+/** How the task table laid out its rows at one viewport, as {@link readTableLayout} reads it. */
+interface TableLayout {
+  /**
+   * Each header label, Status, Priority or Due date value, button label, or title word of an
+   * ordinary length that the page shows on more than one line.
+   */
+  broken: string[];
+  /** Each body cell whose left edge or width differs from its column's header cell. */
+  misaligned: string[];
+  /** The distinct left edges of the rows' Delete buttons: one when every row lines up. */
+  deleteLefts: number[];
+  /** The distinct sizes of the rows' "Mark <status>" buttons, as `<width>x<height>`. */
+  markSizes: string[];
+  /** Whether the page is wider than the viewport, so it scrolls sideways. */
+  overflows: boolean;
+}
+
 /** Where the long list is shown for Control+End, each press checked on its own. */
 interface EndKeyCase {
   name: string;
@@ -76,7 +94,7 @@ interface EndKeyCase {
   load: ViewportSize;
   /**
    * When given, the list then goes back to its top, is resized to this viewport and gets a second
-   * press, so the groups at its end were last laid out at another width.
+   * press, so the rows at its end were last laid out at another width.
    */
   resizeTo?: ViewportSize;
 }
@@ -113,11 +131,36 @@ const LINE_BREAK_TITLES: readonly { name: string; title: string; shown: string }
 const DESCRIPTION_HINT = 'Up to 5,000 characters (each line break counts as 2)';
 
 /**
- * Tasks in the long list: five of the task table's 50-row groups. The first screen renders the
- * first and the last two always render, so Control+End passes two groups that render only during
- * the scroll before it lands in the last.
+ * Tasks in the long list: with 200-character titles, many screens of rows at every viewport the
+ * specs use, so Control+End, the accessibility tree and a row's return anchor are all checked
+ * far beyond the first screen.
  */
 const LONG_LIST_TASKS = 250;
+
+/** The five-digit number that opens the title of a task {@link insertLongTitledTasks} made. */
+const LONG_TITLE_NUMBER = /^(\d{5}) lorem ipsum/;
+
+/** The due date of every dated task {@link insertLayoutTasks} makes. */
+const LAYOUT_DUE_DATE = '2026-10-01';
+
+/**
+ * The longest title word the layout check requires on one line; a longer one, such as a title of
+ * 200 W's, may and must break anywhere to stay inside its cell.
+ */
+const LONGEST_ORDINARY_WORD = 20;
+
+/**
+ * Viewports for the task-table layout: two phones, 320px being the narrowest, the narrowest
+ * width above the small-screen breakpoint (40rem, 640px) and one inside the range just above it,
+ * where the desktop columns are narrowest, and a desktop.
+ */
+const LAYOUT_VIEWPORTS: readonly ViewportSize[] = [
+  { width: 320, height: 800 },
+  { width: 375, height: 812 },
+  { width: 641, height: 800 },
+  { width: 700, height: 800 },
+  { width: 1280, height: 800 },
+];
 
 /**
  * How long a key-driven scroll may take to come to rest on a busy host. A press scrolls smoothly
@@ -220,6 +263,110 @@ async function insertLongTitledTasks(email: string, count: number): Promise<void
   } finally {
     await pool.end();
   }
+}
+
+/**
+ * Inserts, for the user with `email`, one task per status and priority, each due on
+ * {@link LAYOUT_DUE_DATE} and titled in ordinary words that name both, then one undated task
+ * titled with 200 W's, a single word its title cell has to break.
+ */
+async function insertLayoutTasks(email: string): Promise<void> {
+  const pool = createTestPool();
+  try {
+    const ownerId = await userIdByEmail(pool, email);
+    if (ownerId === null) {
+      throw new Error(`insertLayoutTasks: no user has the email ${email}`);
+    }
+    await sql(
+      pool,
+      'INSERT INTO tasks (owner_id, title, status, priority, due_date, created_at, updated_at, ' +
+        'completed_at) ' +
+        "SELECT $1, 'Review the onboarding description (' || s || ', ' || p || ')', s, p, " +
+        "$3::date, $2, $2, CASE WHEN s = 'Done' THEN $2::timestamptz END " +
+        'FROM unnest($4::text[]) AS s CROSS JOIN unnest($5::text[]) AS p',
+      [ownerId, FIXTURE_TIME, LAYOUT_DUE_DATE, TASK_STATUSES, TASK_PRIORITIES],
+    );
+    await sql(
+      pool,
+      'INSERT INTO tasks (owner_id, title, created_at, updated_at) VALUES ($1, $2, $3, $3)',
+      [ownerId, 'W'.repeat(200), FIXTURE_TIME],
+    );
+  } finally {
+    await pool.end();
+  }
+}
+
+/**
+ * Reads the task table's {@link TableLayout}. A text's line count is the number of distinct line
+ * tops among the boxes of a range over it, so a value broken anywhere, mid-word included, counts
+ * two or more.
+ */
+async function readTableLayout(page: Page): Promise<TableLayout> {
+  return page.evaluate((maxWord) => {
+    const broken: string[] = [];
+    const lineCount = (text: Text, start: number, end: number): number => {
+      const range = document.createRange();
+      range.setStart(text, start);
+      range.setEnd(text, end);
+      return new Set([...range.getClientRects()].map((box) => Math.round(box.top))).size;
+    };
+    const textOf = (element: Element): Text => {
+      const text = element.firstChild;
+      if (!(text instanceof Text)) {
+        throw new Error(`a <${element.localName}> of the task table holds no text`);
+      }
+      return text;
+    };
+    const expectOneLine = (element: Element, what: string): void => {
+      const text = textOf(element);
+      if (lineCount(text, 0, text.length) > 1) {
+        broken.push(`${what} "${text.data}"`);
+      }
+    };
+    const heads = [...document.querySelectorAll('.task-table thead th')];
+    heads.forEach((head) => expectOneLine(head, 'header'));
+    const misaligned: string[] = [];
+    const deleteLefts = new Set<number>();
+    const markSizes = new Set<string>();
+    for (const row of document.querySelectorAll('.task-table tbody tr')) {
+      const cells = [...row.children];
+      cells.forEach((cell, i) => {
+        const head = heads[i]?.getBoundingClientRect();
+        const box = cell.getBoundingClientRect();
+        if (head === undefined || head.left !== box.left || head.width !== box.width) {
+          misaligned.push(`column ${i + 1} of the row of task ${row.id}`);
+        }
+      });
+      cells.slice(1, 4).forEach((cell) => expectOneLine(cell, 'value'));
+      const link = row.querySelector('a');
+      if (link === null) {
+        throw new Error(`the row of task ${row.id} has no title link`);
+      }
+      const title = textOf(link);
+      for (const word of title.data.matchAll(/\S+/g)) {
+        const end = word.index + word[0].length;
+        if (word[0].length <= maxWord && lineCount(title, word.index, end) > 1) {
+          broken.push(`title word "${word[0]}"`);
+        }
+      }
+      for (const button of row.querySelectorAll('button')) {
+        expectOneLine(button, 'button label');
+        const box = button.getBoundingClientRect();
+        if (button.hasAttribute('data-confirm-delete')) {
+          deleteLefts.add(box.left);
+        } else {
+          markSizes.add(`${box.width}x${box.height}`);
+        }
+      }
+    }
+    return {
+      broken,
+      misaligned,
+      deleteLefts: [...deleteLefts],
+      markSizes: [...markSizes],
+      overflows: document.documentElement.scrollWidth > window.innerWidth,
+    };
+  }, LONGEST_ORDINARY_WORD);
 }
 
 /**
@@ -860,6 +1007,91 @@ test.describe('tasks with JavaScript', () => {
       });
     }
   });
+
+  // A screen reader browses the table, or its list of links, through Chromium's accessibility
+  // tree, which leaves out content the browser skips rendering; scripts play no part in it.
+  test(`all ${LONG_LIST_TASKS} title links are in the accessibility tree at load`, async ({
+    page,
+  }) => {
+    const { email } = await signUpAndLogIn(page);
+    await insertLongTitledTasks(email, LONG_LIST_TASKS);
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.goto('/tasks');
+    await expect(page.locator('table tbody tr')).toHaveCount(LONG_LIST_TASKS);
+    const cdp = await page.context().newCDPSession(page);
+    try {
+      await cdp.send('Accessibility.enable');
+      const { nodes } = await cdp.send('Accessibility.getFullAXTree');
+      const numbers: string[] = [];
+      for (const node of nodes) {
+        const name: unknown = node.name?.value;
+        if (!node.ignored && node.role?.value === 'link' && typeof name === 'string') {
+          const number = LONG_TITLE_NUMBER.exec(name)?.[1];
+          if (number !== undefined) {
+            numbers.push(number);
+          }
+        }
+      }
+      // Task n is titled n as five digits, so the sorted numbers list every task exactly once.
+      const expected = Array.from({ length: LONG_LIST_TASKS }, (_, i) =>
+        String(i + 1).padStart(5, '0'),
+      );
+      expect(numbers.sort()).toEqual(expected);
+    } finally {
+      await cdp.detach();
+    }
+  });
+
+  // The redirect's fragment is scrolled to by the browser itself, so this one run covers both.
+  test('a status change far down a long list reopens the list at the changed row', async ({
+    page,
+  }) => {
+    const { email } = await signUpAndLogIn(page);
+    await insertLongTitledTasks(email, LONG_LIST_TASKS);
+    // Undated tasks are listed by id, which follows creation, so this is the list's 200th row.
+    const target = (await userTasks(email))[199];
+    if (target === undefined) {
+      throw new Error('the long list has fewer than 200 tasks');
+    }
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.goto('/tasks');
+    const row = page.locator(`#task-${target.id}`);
+    await expect(row).not.toBeInViewport();
+    const changed = await clickAndAwaitPost(
+      page,
+      row.getByRole('button', { name: 'Mark Done', exact: true }),
+      `/tasks/${target.id}/status`,
+    );
+    expect(changed.status()).toBe(303);
+    await expect(page).toHaveURL(
+      (u) => u.pathname === '/tasks' && u.search === '' && u.hash === `#task-${target.id}`,
+    );
+    await expect(row.getByRole('cell').nth(1)).toHaveText('Done');
+    await expect(row).toBeInViewport();
+  });
+
+  // Layout is the stylesheet's alone, so this one run covers pages with and without scripts.
+  test('task rows lay out alike with every value and label on one line, 320px to desktop', async ({
+    page,
+  }) => {
+    const { email } = await signUpAndLogIn(page);
+    await insertLayoutTasks(email);
+    for (const viewport of LAYOUT_VIEWPORTS) {
+      await test.step(`${viewport.width}x${viewport.height}`, async () => {
+        await page.setViewportSize(viewport);
+        await page.goto('/tasks');
+        await expect(page.locator('table tbody tr')).toHaveCount(
+          TASK_STATUSES.length * TASK_PRIORITIES.length + 1,
+        );
+        const layout = await readTableLayout(page);
+        expect(layout.broken, 'texts shown on more than one line').toEqual([]);
+        expect(layout.misaligned, 'cells not under their headers').toEqual([]);
+        expect(layout.deleteLefts, 'left edges of the Delete buttons').toHaveLength(1);
+        expect(layout.markSizes, 'sizes of the Mark buttons').toHaveLength(1);
+        expect(layout.overflows, 'the page scrolls sideways').toBe(false);
+      });
+    }
+  });
 });
 
 test.describe('tasks without JavaScript', () => {
@@ -904,9 +1136,10 @@ test.describe('tasks without JavaScript', () => {
 
     const task = await storedTask(email, 'Fix the roof');
     await openConfirmationPage(page, task);
+    // Cancel returns to the same filtered list, at the task's own row.
     await expect(page.getByRole('link', { name: 'Cancel', exact: true })).toHaveAttribute(
       'href',
-      '/tasks?priority=High',
+      `/tasks?priority=High#task-${task.id}`,
     );
     const deleted = await clickAndAwaitPost(
       page,

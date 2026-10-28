@@ -1,5 +1,6 @@
 /**
- * Pure task rules: the field-length limits and the completion-time rule (FR-10).
+ * Pure task rules: the field-length limits, the completion-time rule (FR-10) and the list-filter
+ * match.
  *
  * Every function is free of I/O and never reads the system time; the current instant arrives as
  * the `now` argument, which the task service takes from the injected clock. Status and priority
@@ -9,7 +10,7 @@
 
 import type { TaskRecord, TaskUpdateRow } from '../db/types';
 import type { TaskStatus } from '../shared/task-values';
-import type { TaskInput } from './types';
+import type { TaskFilters, TaskInput } from './types';
 
 // HTML `maxlength` counts UTF-16 code units, so a title of 200 code points that uses characters
 // outside the Basic Multilingual Plane would be blocked by the browser although it is valid. No
@@ -68,6 +69,25 @@ export function nextCompletedAt(
   // `(status = 'Done') = (completed_at IS NOT NULL)`), so the fallback never fires for one; it only
   // keeps the result non-null for a caller-built value, preserving the `Done` ⇔ time invariant.
   return previous.completedAt ?? now;
+}
+
+/**
+ * Tells whether a task belongs to the list that `filters` select: each filter that is set must
+ * equal the task's value exactly, and the two combine with AND. This is the rule `TasksRepo.list`
+ * applies in SQL, so a task that passes it is a row of that list.
+ *
+ * @param task - The task's status and priority.
+ * @param filters - Exact-match status and priority filters; an absent field matches every task.
+ * @returns Whether every set filter matches.
+ */
+export function matchesTaskFilters(
+  task: Pick<TaskRecord, 'status' | 'priority'>,
+  filters: TaskFilters,
+): boolean {
+  return (
+    (filters.status === undefined || filters.status === task.status) &&
+    (filters.priority === undefined || filters.priority === task.priority)
+  );
 }
 
 /**

@@ -206,8 +206,8 @@ export function parseStatusValue(raw: unknown): TaskStatus {
 /**
  * Builds the query string that reproduces a set of list filters.
  *
- * Used for the 303 redirect after a status change or delete (`'/tasks' + filtersToQuery(f)`) and
- * for the filtered Cancel link on the delete confirmation page.
+ * {@link taskListPath} builds every path back to the list with it: the 303 redirect after a
+ * status change or delete and the filtered Cancel link on the delete confirmation page.
  *
  * @param filters - The active filters.
  * @returns `''` when no filter is set, otherwise `?` followed by `status` then `priority`, the
@@ -223,6 +223,32 @@ export function filtersToQuery(filters: TaskFilters): string {
     parts.push(`${LIST_FILTER_KEYS.priority}=${encodeURIComponent(filters.priority)}`);
   }
   return parts.length === 0 ? '' : `?${parts.join('&')}`;
+}
+
+/**
+ * The element id of the task-list row that shows a task, `task-<id>`. Each row carries it, so a
+ * URL ending in `#task-<id>` opens the list scrolled to that row without any script.
+ *
+ * @param id - The task's id.
+ * @returns The row's id, for example `task-42`.
+ */
+export function taskRowId(id: TaskId): string {
+  return `task-${id}`;
+}
+
+/**
+ * The path back to the task list that `filters` select, scrolled to one of its rows: `/tasks`,
+ * then {@link filtersToQuery}, then `#` and the {@link taskRowId} of `anchor`. The path and query
+ * are exactly the filtered list; the fragment only moves the view, so a fragment whose row is not
+ * listed leaves the list at its top.
+ *
+ * @param filters - The active filters.
+ * @param anchor - The task whose row to show, or `null` to open the list at its top.
+ * @returns For example `/tasks?status=To%20do#task-42`, or `/tasks` with neither.
+ */
+export function taskListPath(filters: TaskFilters, anchor: TaskId | null): string {
+  const fragment = anchor === null ? '' : `#${taskRowId(anchor)}`;
+  return `/tasks${filtersToQuery(filters)}${fragment}`;
 }
 
 /**

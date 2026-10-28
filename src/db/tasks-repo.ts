@@ -19,6 +19,7 @@ import type {
   OpenTaskGroup,
   TaskId,
   TaskListFilters,
+  TaskListKey,
   TaskRecord,
   TaskUpdateRow,
   UserId,
@@ -89,6 +90,26 @@ export interface TasksRepo {
    * @returns The matching tasks in list order, empty when none match.
    */
   list(ownerId: UserId, filters: TaskListFilters): Promise<TaskRecord[]>;
+
+  /**
+   * Finds the owner's task that {@link TasksRepo.list} shows nearest to a place in its order:
+   * the first matching task after `key` in list order (due date soonest first, undated tasks
+   * last, then id), or, when no matching task follows it, the last one before it.
+   *
+   * The task `key` belongs to is never the result, whether it still exists, still matches the
+   * filters or was just deleted, so the same lookup serves a task that left the filtered list and
+   * one that is gone.
+   *
+   * @param ownerId - The owning user.
+   * @param key - The due date and id that place a task in the list order.
+   * @param filters - The filters of the list, applied as by {@link TasksRepo.list}.
+   * @returns The id of the nearest matching task, or `null` when no other task matches.
+   */
+  listNeighbour(
+    ownerId: UserId,
+    key: TaskListKey,
+    filters: TaskListFilters,
+  ): Promise<TaskId | null>;
 
   /**
    * Tells whether the owner has any task at all, which separates the two empty list states.
@@ -183,6 +204,11 @@ interface DeletedRow {
   id: number;
 }
 
+/** A row of {@link LIST_NEIGHBOUR_SQL}. */
+interface NeighbourRow {
+  id: number;
+}
+
 /** Maps a snake_case row to the camelCase record the layers above receive. */
 function mapTask(row: TaskRow): TaskRecord {
   return {
@@ -251,6 +277,52 @@ const LIST_SQL = `
      AND ($2::text IS NULL OR status = $2)
      AND ($3::text IS NULL OR priority = $3)
    ORDER BY due_date ASC NULLS LAST, id ASC`;
+
+/**
+ * `$2` and `$3` are the key's due date (`NULL` when undated) and id; `$4` and `$5` filter as in
+ * {@link LIST_SQL}. A row comparison with a `NULL` due date is never true, so undated tasks get
+ * branches of their own. Each of the four branches reads one stretch of `tasks_owner_due_idx
+ * (owner_id, due_date ASC NULLS LAST, id)` in index order, forward or backward, and stops at its
+ * first match:
+ *
+ * 1. a dated key: the dated tasks after it;
+ * 2. the undated tasks after it (all of them after a dated key);
+ * 3. an undated key: the undated tasks before it;
+ * 4. the dated tasks before it (all of them before an undated key).
+ *
+ * Branches 1 and 2 follow the key and 3 and 4 precede it, each pair nearest first, so the lowest
+ * `nearness` is the next task in list order, or the previous one when nothing follows. Strict
+ * comparisons leave out the key's own task.
+ */
+const LIST_NEIGHBOUR_SQL = `
+  SELECT id FROM (
+    (SELECT id, 1 AS nearness FROM tasks
+      WHERE owner_id = $1
+        AND ($4::text IS NULL OR status = $4) AND ($5::text IS NULL OR priority = $5)
+        AND $2::date IS NOT NULL AND (due_date, id) > ($2::date, $3::bigint)
+      ORDER BY due_date ASC NULLS LAST, id ASC LIMIT 1)
+    UNION ALL
+    (SELECT id, 2 AS nearness FROM tasks
+      WHERE owner_id = $1
+        AND ($4::text IS NULL OR status = $4) AND ($5::text IS NULL OR priority = $5)
+        AND due_date IS NULL AND ($2::date IS NOT NULL OR id > $3::bigint)
+      ORDER BY due_date ASC NULLS LAST, id ASC LIMIT 1)
+    UNION ALL
+    (SELECT id, 3 AS nearness FROM tasks
+      WHERE owner_id = $1
+        AND ($4::text IS NULL OR status = $4) AND ($5::text IS NULL OR priority = $5)
+        AND $2::date IS NULL AND due_date IS NULL AND id < $3::bigint
+      ORDER BY due_date DESC NULLS FIRST, id DESC LIMIT 1)
+    UNION ALL
+    (SELECT id, 4 AS nearness FROM tasks
+      WHERE owner_id = $1
+        AND ($4::text IS NULL OR status = $4) AND ($5::text IS NULL OR priority = $5)
+        AND due_date IS NOT NULL
+        AND ($2::date IS NULL OR (due_date, id) < ($2::date, $3::bigint))
+      ORDER BY due_date DESC NULLS FIRST, id DESC LIMIT 1)
+  ) AS neighbours
+  ORDER BY nearness
+  LIMIT 1`;
 
 const OPEN_TASK_GROUPS_SQL = `
   SELECT status, priority, due_date, count(*) AS count
@@ -351,6 +423,21 @@ export function createTasksRepo(db: Queryable): TasksRepo {
         filters.priority ?? null,
       ]);
       return rows.map(mapTask);
+    },
+
+    async listNeighbour(
+      ownerId: UserId,
+      key: TaskListKey,
+      filters: TaskListFilters,
+    ): Promise<TaskId | null> {
+      const rows = await query<NeighbourRow>(db, LIST_NEIGHBOUR_SQL, [
+        ownerId,
+        key.dueDate,
+        key.id,
+        filters.status ?? null,
+        filters.priority ?? null,
+      ]);
+      return rows[0]?.id ?? null;
     },
 
     async exists(ownerId: UserId): Promise<boolean> {
