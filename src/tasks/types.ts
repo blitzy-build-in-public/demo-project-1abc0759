@@ -8,8 +8,12 @@ import type { TaskListFilters, TaskRecord } from '../db/types';
 import type { IsoDate } from '../shared/dates';
 import type { TaskPriority, TaskStatus } from '../shared/task-values';
 
-// The web layer must never import `src/db/**`, so it reaches the id aliases through this module.
-// `isolatedModules` requires the `export type` form for a type-only re-export.
+/**
+ * The numeric user and task id aliases, re-exported unchanged from the data-access types.
+ *
+ * The web layer must never import `src/db/**`, so it reaches the id aliases through this module.
+ * `isolatedModules` requires the `export type` form for a type-only re-export.
+ */
 export type { TaskId, UserId } from '../db/types';
 
 /**

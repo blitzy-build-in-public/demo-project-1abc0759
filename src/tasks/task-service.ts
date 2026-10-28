@@ -111,7 +111,7 @@ export interface TaskService {
    * @param ownerId - The authenticated user.
    * @param changed - The task as stored after the change.
    * @param filters - The filters of the list the change was made from.
-   * @returns The task whose row to show, or `null` when the list has no matching task.
+   * @returns The id of the task whose row to show, or `null` when no matching task remains.
    */
   anchorAfterStatusChange(
     ownerId: UserId,
@@ -127,7 +127,7 @@ export interface TaskService {
    * @param ownerId - The authenticated user.
    * @param deleted - The deleted task, as read before the delete.
    * @param filters - The filters of the list the delete was made from.
-   * @returns The task whose row to show, or `null` when no matching task is left.
+   * @returns The id of the task whose row to show, or `null` when no matching task remains.
    */
   anchorAfterDelete(ownerId: UserId, deleted: Task, filters: TaskFilters): Promise<TaskId | null>;
 }

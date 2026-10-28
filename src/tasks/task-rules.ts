@@ -44,7 +44,8 @@ const DONE: TaskStatus = 'Done';
  *   transition between open statuses leaves it `null`.
  * - Creation (`previous` is `null`) as `Done`: `now`.
  * - Entering `Done` from another status: `now`.
- * - Staying `Done`: the original completion time, `previous.completedAt`.
+ * - Staying `Done`: preserves a non-null `previous.completedAt`; a caller-built `Done` value with
+ *   no completion time (`completedAt` is `null`) gets `now`.
  *
  * The returned `Date` is the very instance passed in (`now` or `previous.completedAt`), never a
  * copy.

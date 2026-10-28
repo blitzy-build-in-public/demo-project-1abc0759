@@ -243,7 +243,7 @@ export function taskRowId(id: TaskId): string {
  * listed leaves the list at its top.
  *
  * @param filters - The active filters.
- * @param anchor - The task whose row to show, or `null` to open the list at its top.
+ * @param anchor - The id of the task whose row to show, or `null` to open the list at its top.
  * @returns For example `/tasks?status=To%20do#task-42`, or `/tasks` with neither.
  */
 export function taskListPath(filters: TaskFilters, anchor: TaskId | null): string {

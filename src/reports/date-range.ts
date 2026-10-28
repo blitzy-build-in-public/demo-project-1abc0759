@@ -60,7 +60,8 @@ export function defaultRange(today: IsoDate): DateRange {
  * @param input - The raw `from` and `to` values, each a string or `undefined` when absent.
  * @param today - The current UTC day.
  * @returns The accepted range, or the message for the first rule that failed.
- * @throws RangeError only from {@link defaultRange}, when `today` is not a valid {@link IsoDate}.
+ * @throws RangeError only from {@link defaultRange}, so only when both values are absent: when
+ *   `today` is not a valid {@link IsoDate} or the default start would fall before year `0001`.
  */
 export function parseDateRange(
   input: { from?: string; to?: string },

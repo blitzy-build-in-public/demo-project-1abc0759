@@ -24,10 +24,10 @@ export const CSV_HEADER = [
 ] as const;
 
 /**
- * UTF-8 byte-order mark written before the header. Excel decodes a CSV file as UTF-8, rather than
- * the system code page, only when the file begins with this mark, so non-ASCII titles and
- * descriptions display correctly. It belongs to the file, not to any value: parsers strip it before
- * reading the first field.
+ * UTF-8 byte-order mark (`EF BB BF`), written before the header. It lets Excel recognise the file
+ * as UTF-8 automatically when it opens the CSV, so non-ASCII task titles and descriptions display
+ * correctly. It is an encoding signature that belongs to the file, not to any field value: parsers
+ * strip it before reading the first field.
  */
 const BYTE_ORDER_MARK = '\uFEFF';
 
