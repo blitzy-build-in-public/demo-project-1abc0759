@@ -1,28 +1,28 @@
 /*
  * Completions bar chart for the reports page, a progressive enhancement.
  *
- * Builds one SVG bar per row of #completions-table and then reveals #completions-chart. The
- * rendered table rows are the chart's only data source, so the chart cannot disagree with the
- * table. Without JavaScript, or if anything below throws, the figure keeps its hidden attribute
- * and the table alone is the report. For an invalid range the page renders neither element, and
- * the script does nothing.
+ * Builds one SVG bar per row of #completions-table, with HTML labels for the first day, the last
+ * day and the maximum value, and then reveals #completions-chart. The rendered table rows are the
+ * chart's only data source, so the chart cannot disagree with the table. Without JavaScript, or
+ * if anything below throws, the figure keeps its hidden attribute and the table alone is the
+ * report. For an invalid range the page renders neither element, and the script does nothing.
  */
 (() => {
   'use strict';
 
   const SVG_NS = 'http://www.w3.org/2000/svg';
 
-  // A fixed 3:1 viewBox that CSS scales to the available width, whatever the number of bars.
+  // A fixed 3:1 viewBox that CSS scales to the available width, whatever the number of bars. The
+  // SVG holds only the plot; the labels are HTML beside and below it, so they keep their CSS size
+  // however far the SVG is scaled.
   const WIDTH = 720;
   const HEIGHT = 240;
-  const PAD_LEFT = 40; // Room for the maximum-value label.
-  const PAD_RIGHT = 8;
-  const PAD_TOP = 12;
-  const PAD_BOTTOM = 24; // Room for the first and last day labels.
-  const PLOT_W = WIDTH - PAD_LEFT - PAD_RIGHT;
-  const PLOT_H = HEIGHT - PAD_TOP - PAD_BOTTOM;
-  const BASELINE_Y = PAD_TOP + PLOT_H;
-  const LABEL_OFFSET = 6;
+  const PLOT_W = WIDTH;
+  // Bars stand on the axis line, whose 1-unit stroke fills the bottom unit row.
+  const BASELINE_Y = HEIGHT - 1;
+  const PLOT_H = BASELINE_Y;
+  // Caps a short range's bars, so a single day reads as a bar rather than a filled panel.
+  const MAX_BAR_W = 48;
 
   const ARIA_LABEL =
     'Bar chart of tasks completed per day. The same data is shown in the completions table.';
@@ -39,14 +39,17 @@
     return element;
   }
 
-  /** Creates a `text.chart-label` whose content is set as text, never parsed as markup. */
-  function textLabel(text, x, y, anchor) {
-    const label = svgElement('text', {
-      class: 'chart-label',
-      x,
-      y,
-      'text-anchor': anchor,
-    });
+  /** Appends a `<title>` tooltip whose content is set as text, never parsed as markup. */
+  function appendTitle(element, text) {
+    const title = document.createElementNS(SVG_NS, 'title');
+    title.textContent = text;
+    element.appendChild(title);
+  }
+
+  /** Creates an HTML `span.chart-label` with `modifier` whose content is set as text. */
+  function htmlLabel(text, modifier) {
+    const label = document.createElement('span');
+    label.className = `chart-label ${modifier}`;
     label.textContent = text;
     return label;
   }
@@ -68,7 +71,11 @@
     return bars;
   }
 
-  /** Builds the complete chart off-DOM: bars, then the baseline axis, then the labels. */
+  /**
+   * Builds the complete chart off-DOM as a `div.chart-area`: the SVG plot (each bar's hit area
+   * and bar, then the baseline axis), then the HTML value labels and day labels that app.css
+   * places beside and below it.
+   */
   function buildChart(bars) {
     let maxCount = 0;
     for (const bar of bars) {
@@ -77,12 +84,13 @@
       }
     }
     // The scale's floor of 1 makes an all-zero range draw zero-height bars instead of dividing
-    // by zero. The maximum label still shows the true maximum, 0 included.
+    // by zero.
     const scale = Math.max(1, maxCount);
     const n = bars.length;
     const slot = PLOT_W / n;
     const gap = Math.min(slot * 0.2, 4);
-    const barWidth = round2(Math.max(slot - gap, 0.5));
+    // Each bar is centred in its slot; only ranges under 14 days reach the cap.
+    const barWidth = round2(Math.max(Math.min(slot - gap, MAX_BAR_W), 0.5));
 
     const svg = svgElement('svg', {
       viewBox: `0 0 ${WIDTH} ${HEIGHT}`,
@@ -90,53 +98,79 @@
       'aria-label': ARIA_LABEL,
       class: 'completions-chart-svg',
       focusable: 'false',
-      // PAD_LEFT fits a three-digit maximum at the small-screen label size. A larger maximum
-      // extends into the page padding instead of being clipped at the SVG's edge.
-      overflow: 'visible',
     });
 
     // Bars are the chart's only rect elements: the tests require exactly one rect per table
-    // row, so the axis is a line and nothing else (background, frame, legend) is a rect.
+    // row, so the axis is a line, each hit area a path, and nothing else is a rect.
     bars.forEach((bar, i) => {
+      const tooltip = `${bar.day}: ${bar.countText}`;
+      // The bar's whole slot answers the pointer with its tooltip, so a zero-height or thin bar
+      // can still be hovered. It precedes the rect, which therefore stays on top where drawn.
+      // fill and pointer-events are attributes, so no stylesheet is needed to keep it unpainted.
+      const x0 = round2(i * slot);
+      const x1 = round2((i + 1) * slot);
+      const hit = svgElement('path', {
+        class: 'chart-hit',
+        d: `M${x0} 0H${x1}V${BASELINE_Y}H${x0}Z`,
+        fill: 'none',
+        'pointer-events': 'all',
+      });
+      appendTitle(hit, tooltip);
+      svg.appendChild(hit);
+
       const height = round2((bar.count / scale) * PLOT_H);
       const rect = svgElement('rect', {
         class: 'chart-bar',
-        x: round2(PAD_LEFT + i * slot + gap / 2),
+        x: round2(i * slot + (slot - barWidth) / 2),
         y: round2(BASELINE_Y - height),
         width: barWidth,
         height,
         'data-day': bar.day,
         'data-count': bar.countText,
       });
-      const title = document.createElementNS(SVG_NS, 'title');
-      title.textContent = `${bar.day}: ${bar.countText}`;
-      rect.appendChild(title);
+      appendTitle(rect, tooltip);
       svg.appendChild(rect);
     });
 
     svg.appendChild(
       svgElement('line', {
         class: 'chart-axis',
-        x1: PAD_LEFT,
-        y1: BASELINE_Y,
-        x2: WIDTH - PAD_RIGHT,
-        y2: BASELINE_Y,
+        x1: 0,
+        y1: BASELINE_Y + 0.5,
+        x2: WIDTH,
+        y2: BASELINE_Y + 0.5,
       }),
     );
 
-    const dayLabelY = HEIGHT - LABEL_OFFSET;
-    const valueLabelX = PAD_LEFT - LABEL_OFFSET;
-    svg.appendChild(textLabel(bars[0].day, PAD_LEFT, dayLabelY, 'start'));
+    // The labels repeat what the image's aria-label and the table already convey, so assistive
+    // technology skips them, as it skipped them as presentational children of the role=img SVG.
+    const yLabels = document.createElement('div');
+    yLabels.className = 'chart-y-labels';
+    yLabels.setAttribute('aria-hidden', 'true');
+    // The top of the plot is the maximum. When every count is 0, the scale's floor makes the top
+    // stand for 1, so it stays unlabelled and the baseline's 0 is the maximum, labelled once.
+    if (maxCount > 0) {
+      yLabels.appendChild(htmlLabel(String(maxCount), 'chart-label-max'));
+    }
+    yLabels.appendChild(htmlLabel('0', 'chart-label-zero'));
+
+    const xLabels = document.createElement('div');
+    xLabels.className = 'chart-x-labels';
+    xLabels.setAttribute('aria-hidden', 'true');
+    // A day label is one slot wide, so it centres under its bar when its text fits the slot.
+    xLabels.style.setProperty('--chart-slot', `${round2(100 / n)}%`);
+    xLabels.appendChild(htmlLabel(bars[0].day, 'chart-label-day'));
     // A one-day range has a single day, labelled once.
     if (n > 1) {
-      svg.appendChild(textLabel(bars[n - 1].day, WIDTH - PAD_RIGHT, dayLabelY, 'end'));
+      xLabels.appendChild(htmlLabel(bars[n - 1].day, 'chart-label-day'));
     }
-    const maxLabel = textLabel(String(maxCount), valueLabelX, PAD_TOP + 4, 'end');
-    maxLabel.setAttribute('dominant-baseline', 'hanging');
-    svg.appendChild(maxLabel);
-    svg.appendChild(textLabel('0', valueLabelX, BASELINE_Y, 'end'));
 
-    return svg;
+    const area = document.createElement('div');
+    area.className = 'chart-area';
+    area.appendChild(svg);
+    area.appendChild(yLabels);
+    area.appendChild(xLabels);
+    return area;
   }
 
   function render() {

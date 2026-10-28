@@ -512,6 +512,51 @@ test.describe('reports page', () => {
     await expectBarsToScale(page, expected);
   });
 
+  test('the chart labels an all-zero range once and every day answers the pointer', async ({
+    page,
+  }) => {
+    await signUpAndLogIn(page);
+    const today = todayUtc(new Date());
+    await openReports(page);
+    await expectServerToday(page, today);
+    await expect(page.locator('#completions-chart')).toBeVisible();
+    // The scale's floor makes the plot's top stand for 1, so an all-zero range labels only the
+    // baseline, whose 0 is then the maximum.
+    const valueLabels = page.locator('.chart-y-labels .chart-label');
+    await expect(valueLabels).toHaveCount(1);
+    await expect(valueLabels).toHaveText('0');
+
+    await createTask(page, { title: 'Finished for the tooltips', status: 'Done' });
+    await openReports(page);
+    await expectServerToday(page, today);
+    await expect(page.locator('#completions-chart')).toBeVisible();
+    await expect(chartBars(page)).toHaveCount(DEFAULT_RANGE_DAYS);
+    // `elementFromPoint` sees only the viewport.
+    await page.locator('#completions-chart svg').scrollIntoViewIfNeeded();
+    // Each bar's horizontal centre, halfway up the plot: a zero-count bar draws nothing there, so
+    // whatever answers the pointer must still carry that day's tooltip as its own <title>.
+    const tooltips = await chartBars(page).evaluateAll((bars) =>
+      bars.map((bar) => {
+        const plot = bar.closest('svg');
+        if (plot === null) {
+          return null;
+        }
+        const barBox = bar.getBoundingClientRect();
+        const plotBox = plot.getBoundingClientRect();
+        const hit = document.elementFromPoint(
+          barBox.left + barBox.width / 2,
+          plotBox.top + plotBox.height / 2,
+        );
+        return hit?.querySelector(':scope > title')?.textContent ?? null;
+      }),
+    );
+    expect(tooltips, 'tooltip under each bar, halfway up the plot').toEqual(
+      expectedRows(defaultRangeDays(today), new Map([[today, 1]])).map(
+        ({ day, count }) => `${day}: ${count}`,
+      ),
+    );
+  });
+
   test('a start date after the end date shows the message and no data', async ({ page }) => {
     await signUpAndLogIn(page);
     const today = todayUtc(new Date());

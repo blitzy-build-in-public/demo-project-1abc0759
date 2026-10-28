@@ -313,12 +313,25 @@ tbody th { font-weight: 400; }
 dl { display: grid; grid-template-columns: max-content auto; gap: 0.25rem 1rem; }
 dd { margin: 0; font-weight: 600; }
 
-/* Chart: completions-chart.js builds the SVG from the completions table rows. */
+/* Chart: completions-chart.js builds the plot and its labels from the completions table rows. */
 
 #completions-chart { margin-block: 1rem; margin-inline: 0; }
 #completions-chart figcaption { margin-block-end: 0.5rem; color: var(--color-muted); }
 
+/* Value labels beside the plot and day labels below it. The top padding is half a label line,
+   room for the maximum label centred on the plot's top edge. */
+.chart-area {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 54rem);
+  grid-template-areas: "y plot" ". x";
+  column-gap: 0.375rem;
+  padding-block-start: 0.625em;
+  font-size: 0.875rem;
+  line-height: 1.25;
+}
+
 #completions-chart svg {
+  grid-area: plot;
   display: block;
   width: 100%;
   /* 18rem x the script's 3:1 viewBox: a wider box would letterbox and centre the bars. */
@@ -328,10 +341,23 @@ dd { margin: 0; font-weight: 600; }
 }
 
 .chart-bar { fill: var(--color-chart); }
-/* px here are SVG user units that scale with the viewBox, so labels stay in the space reserved
-   for them; rem would follow user font settings instead. */
-.chart-label { fill: var(--color-text); font-size: 12px; }
 .chart-axis { stroke: var(--color-control); stroke-width: 1; }
+.chart-y-labels { grid-area: y; display: flex; flex-direction: column; text-align: end; }
+/* Centred on the plot's top edge, where the tallest bar ends. */
+.chart-label-max { transform: translateY(-50%); }
+/* Centred on the axis, and at the bottom even when it is the only value label. */
+.chart-label-zero { margin-block-start: auto; transform: translateY(50%); }
+.chart-x-labels {
+  grid-area: x;
+  display: flex;
+  justify-content: space-between;
+  padding-block-start: 0.25rem;
+}
+/* HTML text sized by .chart-area, so labels keep one size however far the SVG is scaled. */
+.chart-label { color: var(--color-text); white-space: nowrap; font-variant-numeric: tabular-nums; }
+/* A day label spans its day's slot (--chart-slot, set by the script), so it centres under its
+   bar when it fits and otherwise grows to its text from the plot's edge. */
+.chart-label-day { width: var(--chart-slot); min-width: max-content; text-align: center; }
 
 /* Error page */
 
@@ -354,7 +380,4 @@ dd { margin: 0; font-weight: 600; }
   td button { padding-inline: 0.375rem; font-size: inherit; }
   .task-table tr { grid-template-columns: 20% 19% 18% 18% 25%; }
   .task-table tbody { contain-intrinsic-size: auto 2000rem; }
-  /* The chart renders at about half size here. 17 user units is the largest label size whose
-     hinted glyphs still leave a blank pixel row below the axis at 1x pixel density. */
-  .chart-label { font-size: 17px; }
 }
