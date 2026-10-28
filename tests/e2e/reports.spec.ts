@@ -305,14 +305,17 @@ async function showCompletions(page: Page, from: IsoDate, to: IsoDate): Promise<
 
 /**
  * Submits From = today and To = yesterday and requires the rejected-range page: 422, the range
- * message, no table and no chart (an invalid range displays no data), the summary still shown,
- * and both dates kept as entered.
+ * message focused on load and wholly in view, no table and no chart (an invalid range displays
+ * no data), the summary still shown, and both dates kept as entered.
  */
 async function expectStartAfterEndRejected(page: Page, today: IsoDate): Promise<void> {
   const yesterday = addDays(today, -1);
   const status = await showCompletions(page, today, yesterday);
   expect(status, 'GET /reports with From after To').toBe(422);
-  await expect(page.getByRole('alert')).toHaveText(START_AFTER_END_MESSAGE);
+  const message = page.getByRole('alert');
+  await expect(message).toHaveText(START_AFTER_END_MESSAGE);
+  await expect(message, 'the range message takes focus on load').toBeFocused();
+  await expect(message, 'focus scrolls the range message into view').toBeInViewport({ ratio: 1 });
   await expect(page.locator('#completions-table')).toHaveCount(0);
   await expect(page.locator('#completions-chart')).toHaveCount(0);
   await expect(page.getByText(NO_COMPLETIONS_MESSAGE, { exact: true })).toHaveCount(0);
@@ -322,6 +325,47 @@ async function expectStartAfterEndRejected(page: Page, today: IsoDate): Promise<
   const form = completionsForm(page);
   await expect(form.getByLabel('From', { exact: true })).toHaveValue(today);
   await expect(form.getByLabel('To', { exact: true })).toHaveValue(yesterday);
+}
+
+/** A box's vertical edges in CSS pixels. */
+interface VerticalEdges {
+  top: number;
+  bottom: number;
+}
+
+/** A focused element's box, how far its focus ring reaches past it, and the viewport. */
+interface FocusRingGeometry {
+  /** The border box (`getBoundingClientRect`), from the viewport's top-left corner. */
+  box: VerticalEdges & { left: number; right: number };
+  /** The computed outline width plus outline offset: the ring's reach past every edge. */
+  reach: number;
+  scrollY: number;
+  viewportWidth: number;
+  viewportHeight: number;
+}
+
+/**
+ * Measures the focus ring the element of `locator` draws. The reach is read from the computed
+ * outline rather than assumed, so the check follows app.css however it draws the ring.
+ *
+ * @throws Error when the element does not match `:focus-visible`, so a ring that is not drawn
+ *   fails the test rather than passing as trivially in view.
+ */
+function focusRingGeometry(locator: Locator): Promise<FocusRingGeometry> {
+  return locator.evaluate((el) => {
+    if (!el.matches(':focus-visible')) {
+      throw new Error('the element does not match :focus-visible, so it draws no focus ring');
+    }
+    const style = getComputedStyle(el);
+    const { top, bottom, left, right } = el.getBoundingClientRect();
+    return {
+      box: { top, bottom, left, right },
+      reach: parseFloat(style.outlineWidth) + parseFloat(style.outlineOffset),
+      scrollY: window.scrollY,
+      viewportWidth: document.documentElement.clientWidth,
+      viewportHeight: document.documentElement.clientHeight,
+    };
+  });
 }
 
 /** Clicks "Download CSV" in the export form and returns the download it starts. */
@@ -560,10 +604,60 @@ test.describe('reports page', () => {
   test('a start date after the end date shows the message and no data', async ({ page }) => {
     await signUpAndLogIn(page);
     const today = todayUtc(new Date());
+    // A phone viewport, where From is in view on load and the message below the form is not.
+    await page.setViewportSize({ width: 375, height: 812 });
     await openReports(page);
     await expectServerToday(page, today);
     await expectStartAfterEndRejected(page, today);
   });
+
+  // Focusing the range message on load scrolls only as far as its box needs: not at all when the
+  // box is wholly in view, and until the box's edge meets the viewport's when it is partly in view.
+  // The focus ring reaches past the box, so each case puts the viewport's bottom edge just past
+  // the message, or across it, as a tall viewport first places it, then loads the page afresh.
+  const RING_EDGE_CASES = [
+    {
+      where: 'ends just inside the viewport',
+      viewportHeight: (message: VerticalEdges): number => Math.ceil(message.bottom) + 2,
+    },
+    {
+      where: 'is partly below the viewport',
+      viewportHeight: (message: VerticalEdges): number => Math.floor(message.top) + 20,
+    },
+  ] as const;
+  for (const { where, viewportHeight } of RING_EDGE_CASES) {
+    test(`the focused range message's whole focus ring is in view when it ${where}`, async ({
+      page,
+    }) => {
+      await signUpAndLogIn(page);
+      const today = todayUtc(new Date());
+      await page.setViewportSize({ width: 375, height: 1600 });
+      await openReports(page);
+      await expectServerToday(page, today);
+      expect(await showCompletions(page, today, addDays(today, -1))).toBe(422);
+      await expect(page.getByRole('alert')).toBeFocused();
+      const tall = await focusRingGeometry(page.getByRole('alert'));
+      const height = viewportHeight({
+        top: tall.box.top + tall.scrollY,
+        bottom: tall.box.bottom + tall.scrollY,
+      });
+
+      // A new page in the same session, so no scroll position is restored from the first load.
+      const fresh = await page.context().newPage();
+      await fresh.setViewportSize({ width: 375, height });
+      const response = await fresh.goto(page.url());
+      expect(response?.status(), 'GET /reports with From after To').toBe(422);
+      const message = fresh.getByRole('alert');
+      await expect(message).toHaveText(START_AFTER_END_MESSAGE);
+      await expect(message, 'the range message takes focus on load').toBeFocused();
+      const { box, reach, viewportWidth, viewportHeight: shown } = await focusRingGeometry(message);
+      expect(reach, 'the focus ring reaches past the box').toBeGreaterThan(0);
+      expect(box.top - reach, 'ring top').toBeGreaterThanOrEqual(0);
+      expect(box.left - reach, 'ring left').toBeGreaterThanOrEqual(0);
+      expect(box.bottom + reach, `ring bottom, ${height}px viewport`).toBeLessThanOrEqual(shown);
+      expect(box.right + reach, 'ring right').toBeLessThanOrEqual(viewportWidth);
+    });
+  }
 
   test.describe('without JavaScript', () => {
     test.use({ javaScriptEnabled: false });

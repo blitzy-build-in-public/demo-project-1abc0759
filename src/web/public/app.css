@@ -205,8 +205,9 @@ main form[method="post"] > button + a { margin-inline-start: 1rem; }
 .form-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 1rem; }
 .hint { margin-block: 0.25rem 0; color: var(--color-muted); font-size: 0.875rem; }
 
-/* GET forms (task filters, report range, export) lay out as one wrapping row. Label and control
-   pairs are direct children, so items are centred rather than bottom-aligned. */
+/* GET forms (task filters, report range, export) lay out as one wrapping row of centred items.
+   Each label and its control share a .control-pair, which never wraps inside, so the row breaks
+   only between pairs and buttons, and a label always stays beside its control. */
 .filters,
 form[method="get"] {
   display: flex;
@@ -216,10 +217,22 @@ form[method="get"] {
 }
 
 .filters label, form[method="get"] label { margin: 0; }
-.filters label:not(:first-child),
-form[method="get"] label:not(:first-child) { margin-inline-start: 0.75rem; }
-.filters input, form[method="get"] input { width: auto; }
-.filters p, form[method="get"] p { flex-basis: 100%; margin: 0; }
+/* One width for a date field and for the text field that re-renders an invalid date, so neither
+   shifts what follows it; 11rem holds Chrome's date control. */
+.filters input, form[method="get"] input { width: 11rem; }
+/* A hint takes its own line. The row's 0.5rem gap less 0.25rem puts it 0.25rem below the
+   controls, the .hint spacing of POST forms, in the row and in the stacked column alike. */
+.filters p,
+form[method="get"] p {
+  flex-basis: 100%;
+  margin-block: calc(0.25rem - 0.5rem) 0;
+  margin-inline: 0;
+}
+/* At most the row's width: a select as wide as a long "(invalid)" option shrinks inside its pair
+   rather than leaving its label. */
+.control-pair { display: flex; align-items: center; gap: 0.5rem; min-width: 0; max-width: 100%; }
+.control-pair + .control-pair { margin-inline-start: 0.75rem; }
+.control-pair > input, .control-pair > select { min-width: 0; }
 
 /* Messages */
 
@@ -238,6 +251,10 @@ form[method="get"] label:not(:first-child) { margin-inline-start: 0.75rem; }
 }
 
 .field-error { margin-block: 0.25rem 0; padding-block: 0.25rem; }
+/* The focusable range message takes focus on load. Focus scrolling brings only its box into view,
+   but the :focus-visible outline and offset reach 5px past it. A margin of the skip link's inset
+   brings them in too, with room for the scroll position rounding to whole pixels. */
+[role="alert"][tabindex] { scroll-margin: 0.5rem; }
 
 /* The error summary opening a re-rendered task form. It is not an alert (its field messages are),
    so it takes the bands' error shape by class; its links keep the error colour in every state. */
@@ -317,6 +334,8 @@ dd { margin: 0; font-weight: 600; }
 
 #completions-chart { margin-block: 1rem; margin-inline: 0; }
 #completions-chart figcaption { margin-block-end: 0.5rem; color: var(--color-muted); }
+/* The caption's dates: a narrow caption wraps between words, never after a date's hyphen. */
+#completions-chart time { white-space: nowrap; }
 
 /* Value labels beside the plot and day labels below it. The top padding is half a label line,
    room for the maximum label centred on the plot's top edge. */
@@ -369,9 +388,12 @@ dd { margin: 0; font-weight: 600; }
   header, .site-header { padding-inline: 0.75rem; }
   main { padding-block-start: 1rem; padding-inline: 0.75rem; }
   .signed-in { margin-inline-start: 0; }
-  .filters, form[method="get"] { flex-direction: column; align-items: stretch; }
-  .filters label:not(:first-child),
-  form[method="get"] label:not(:first-child) { margin-block: 0.5rem 0; margin-inline: 0; }
+  /* GET-form pairs, fields and buttons stack at full width, each label above its control. */
+  .filters, form[method="get"], .control-pair { flex-direction: column; align-items: stretch; }
+  .filters input, form[method="get"] input { width: auto; }
+  .control-pair + .control-pair { margin-block-start: 0.5rem; margin-inline-start: 0; }
+  /* A link (Clear filters) keeps its text's width, so its click area and focus ring hug it. */
+  .filters > a, form[method="get"] > a { align-self: flex-start; }
   /* Tighter cells and rebalanced columns keep "In progress", "Medium" and dates from breaking
      mid-word at phone widths. Rows wrap taller here, so the group-height estimate grows: 50 rows
      of 40rem, above the row a 200-character title makes at 320px (under 38rem). */

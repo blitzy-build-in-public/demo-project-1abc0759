@@ -150,6 +150,21 @@ interface RangeFailureCase {
   fields: readonly [DateField, DateField];
 }
 
+/** A reports page and how its completions date fields are described and where it puts focus. */
+interface CompletionsFocusCase {
+  name: string;
+  path: string;
+  status: number;
+  /** The `aria-describedby` value of both completions date fields. */
+  describedBy: string;
+  /** Whether both completions date fields carry `aria-invalid="true"`. */
+  invalid: boolean;
+  /** The role of `#completions-message`: the range message or the empty-period notice. */
+  messageRole: 'alert' | 'status';
+  /** The id of the page's one `autofocus` element. */
+  autofocus: string | null;
+}
+
 /** Open-task counts straight from the table; `$2` is today's UTC date. */
 const SUMMARY_TRUTH_SQL = `
   SELECT
@@ -190,6 +205,14 @@ const COUNT_TEXT = /^\d+$/;
 /** The opening tag of the chart figure, whatever its attribute order. */
 const CHART_FIGURE_TAG = /<figure\b[^>]*\sid="completions-chart"[^>]*>/;
 
+/** The content of the chart figure's caption, its first child, up to the closing tag. */
+const CHART_CAPTION = new RegExp(
+  `${CHART_FIGURE_TAG.source}\\s*<figcaption>([\\s\\S]*?)</figcaption>`,
+);
+
+/** A `<time>` element: its `datetime` value and its text. */
+const TIME_ELEMENT = /<time datetime="([^"]*)">([^<]*)<\/time>/g;
+
 /** The export section's message element and its text, whatever its attribute order. */
 const EXPORT_MESSAGE = /<p\b[^>]*\sid="export-message"[^>]*>([^<]*)<\/p>/;
 
@@ -198,6 +221,12 @@ const EXPORT_STATUS_SELECT = /<select\b[^>]*\sid="export-status"[^>]*>([\s\S]*?)
 
 /** One `<option>` element, from its opening tag to its closing tag. */
 const OPTION = /<option\b[^>]*>[^<]*<\/option>/g;
+
+/** Every `autofocus` attribute on a page. */
+const AUTOFOCUS_ALL = /\sautofocus(?=[\s>])/g;
+
+/** An `autofocus` attribute within one tag. */
+const AUTOFOCUS = /\sautofocus(?=[\s>])/;
 
 /** Returns the instant an ISO 8601 timestamp names. */
 function at(iso: string): Date {
@@ -302,6 +331,15 @@ function inputTag(body: string, id: string): string {
   const tag = new RegExp(`<input\\b(?=[^>]*\\sid="${id}")[^>]*>`).exec(body)?.[0];
   if (tag === undefined) {
     throw new Error(`input "${id}" not found on the page`);
+  }
+  return tag;
+}
+
+/** Returns the start tag of any element carrying `id="<id>"`, whatever its attribute order. */
+function startTag(body: string, id: string): string {
+  const tag = new RegExp(`<[a-z]+\\b(?=[^>]*\\sid="${id}")[^>]*>`).exec(body)?.[0];
+  if (tag === undefined) {
+    throw new Error(`element "${id}" not found on the page`);
   }
   return tag;
 }
@@ -761,12 +799,89 @@ describe('report routes', () => {
       { query: 'from=2025-01-01&to=2026-01-01', from: '2025-01-01', to: '2026-01-01', days: 366 },
       { query: 'from=2026-10-21&to=2026-10-21', from: '2026-10-21', to: '2026-10-21', days: 1 },
     ])(
-      'GET /reports?$query is accepted with one row per day ($days)',
+      'GET /reports?$query is accepted with one row per day ($days) and the range as its caption',
       async ({ query, from, to, days }) => {
-        const rows = completionRows(await getPage(a.client, `/reports?${query}`, 200));
+        const body = await getPage(a.client, `/reports?${query}`, 200);
+        const rows = completionRows(body);
 
         expect(rows).toHaveLength(days);
         expect(rows.map((row) => row.day)).toEqual(expectedDays(from, to));
+        // Each date is its own `<time>` element, which CSS keeps on one line, and the caption
+        // still reads as plain text.
+        const caption = CHART_CAPTION.exec(body)?.[1] ?? '';
+        const times = [...caption.matchAll(TIME_ELEMENT)].map(([, datetime, text]) => [
+          datetime,
+          text,
+        ]);
+        expect(times).toEqual([
+          [from, from],
+          [to, to],
+        ]);
+        expect(caption.replace(/<[^>]*>/g, '')).toBe(
+          `Tasks completed per day, ${from} to ${to} (UTC)`,
+        );
+      },
+    );
+
+    // The range message is what describes the dates and takes focus: the browser scrolls a
+    // focused element into view, and the message sits below the form, out of view on a phone.
+    // The empty-period notice shares the message's id but describes neither date, and a failed
+    // export focuses its own field.
+    it.each<CompletionsFocusCase>([
+      {
+        name: 'a valid range with no completions',
+        path: '/reports?from=2026-11-01&to=2026-11-30',
+        status: 200,
+        describedBy: 'completions-hint',
+        invalid: false,
+        messageRole: 'status',
+        autofocus: null,
+      },
+      {
+        name: 'a start date after the end date',
+        path: '/reports?from=2026-10-21&to=2026-10-01',
+        status: 422,
+        describedBy: 'completions-hint completions-message',
+        invalid: true,
+        messageRole: 'alert',
+        autofocus: 'completions-message',
+      },
+      {
+        name: 'blank dates',
+        path: '/reports?from=&to=',
+        status: 422,
+        describedBy: 'completions-hint completions-message',
+        invalid: true,
+        messageRole: 'alert',
+        autofocus: 'completions-message',
+      },
+      {
+        name: 'a failed export beside a default range with no completions',
+        path: '/reports/export?from=2026-10-21&to=2026-10-01&status=',
+        status: 422,
+        describedBy: 'completions-hint',
+        invalid: false,
+        messageRole: 'status',
+        autofocus: 'export-from',
+      },
+    ])(
+      '$name: the dates are described by "$describedBy"; autofocus: $autofocus',
+      async ({ path, status, describedBy, invalid, messageRole, autofocus }) => {
+        const body = await getPage(a.client, path, status);
+
+        for (const id of ['completions-from', 'completions-to']) {
+          const tag = inputTag(body, id);
+          expect(tag).toMatch(new RegExp(`\\saria-describedby="${describedBy}"`));
+          expect(/\saria-invalid="true"/.test(tag)).toBe(invalid);
+        }
+        const message = startTag(body, 'completions-message');
+        expect(message).toMatch(new RegExp(`\\srole="${messageRole}"`));
+        // Only the range message is focusable, and `-1` keeps it out of the tab order.
+        expect(/\stabindex="-1"/.test(message)).toBe(messageRole === 'alert');
+        expect(body.match(AUTOFOCUS_ALL) ?? []).toHaveLength(autofocus === null ? 0 : 1);
+        if (autofocus !== null) {
+          expect(startTag(body, autofocus)).toMatch(AUTOFOCUS);
+        }
       },
     );
   });

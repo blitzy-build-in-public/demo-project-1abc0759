@@ -126,17 +126,17 @@ function summarySection(summary: SummaryReport): SafeHtml {
 function completionsSection(completions: ReportsPageView['completions']): SafeHtml {
   const from = completions.ok ? completions.report.range.from : completions.from;
   const to = completions.ok ? completions.report.range.to : completions.to;
-  const hasMessage = !completions.ok || completions.report.total === 0;
-  const described = [COMPLETIONS_HINT_ID, hasMessage && COMPLETIONS_MESSAGE_ID];
   const invalid = !completions.ok;
-  // An invalid range focuses From, which announces the range message it is described by.
+  // The dates are described by the range message only: the empty-period notice that shares its
+  // id reports the result, not a problem with either date, so it is never read as their help.
+  const described = [COMPLETIONS_HINT_ID, invalid && COMPLETIONS_MESSAGE_ID];
+  // An invalid range focuses its message (see `rangeError`), not From.
   const fromInput = dateInput({
     id: 'completions-from',
     name: 'from',
     value: from,
     describedBy: described,
     invalid,
-    autofocus: invalid,
     emptyIsValid: false,
   });
   const toInput = dateInput({
@@ -155,10 +155,14 @@ function completionsSection(completions: ReportsPageView['completions']): SafeHt
     <section aria-labelledby="completions-heading">
       <h2 id="completions-heading">Completed tasks per day</h2>
       <form method="get" action="/reports">
-        <label for="completions-from">From</label>
-        ${fromInput}
-        <label for="completions-to">To</label>
-        ${toInput}
+        <span class="control-pair">
+          <label for="completions-from">From</label>
+          ${fromInput}
+        </span>
+        <span class="control-pair">
+          <label for="completions-to">To</label>
+          ${toInput}
+        </span>
         <button type="submit">Show</button>
         <p class="hint" id="${COMPLETIONS_HINT_ID}">Days are UTC calendar days, and both dates are
           included.</p>
@@ -171,10 +175,16 @@ function completionsSection(completions: ReportsPageView['completions']): SafeHt
  *
  * It uses `role="alert"` rather than the `role="status"` of the empty-period notice: it is a
  * validation error, so it takes the same error semantics and styling as the export message.
+ *
+ * It is the page's one `autofocus` target, made focusable by `tabindex="-1"` (out of the tab
+ * order). The message sits below the form, so on a phone From is already in view and focusing
+ * it would not scroll; focusing the message makes the browser scroll it into view and announce
+ * it. From and To keep `aria-invalid` and stay described by it.
  */
 function rangeError(message: string): SafeHtml {
   return html`
-      <p id="${COMPLETIONS_MESSAGE_ID}" class="message" role="alert">${message}</p>`;
+      <p id="${COMPLETIONS_MESSAGE_ID}" class="message" role="alert" tabindex="-1"
+        autofocus>${message}</p>`;
 }
 
 /**
@@ -196,10 +206,14 @@ function completionsData(report: CompletionsReport): SafeHtml {
             <th scope="row">${day}</th><td>${count}</td></tr>`,
   );
   const { from, to } = report.range;
+  // A browser may break a line after a hyphen, splitting a date. Each date is therefore a
+  // `<time>` element, which app.css keeps on one line; the caption text itself is unchanged.
+  const fromTime = html`<time datetime="${from}">${from}</time>`;
+  const toTime = html`<time datetime="${to}">${to}</time>`;
 
   return html`${notice}
       <figure id="completions-chart" hidden>
-        <figcaption>Tasks completed per day, ${from} to ${to} (UTC)</figcaption>
+        <figcaption>Tasks completed per day, ${fromTime} to ${toTime} (UTC)</figcaption>
       </figure>
       <table id="completions-table" aria-labelledby="completions-heading">
         <thead>
@@ -253,14 +267,20 @@ function exportSection(form: ReportsPageView['exportForm']): SafeHtml {
     <section aria-labelledby="export-heading">
       <h2 id="export-heading">Export tasks (CSV)</h2>
       <form method="get" action="/reports/export">
-        <label for="export-from">From</label>
-        ${exportFrom}
-        <label for="export-to">To</label>
-        ${exportTo}
-        <label for="export-status">Status</label>
-        <select id="export-status" name="status"${selectDescribed}${selectInvalid}>
-          ${statusOptions}
-        </select>
+        <span class="control-pair">
+          <label for="export-from">From</label>
+          ${exportFrom}
+        </span>
+        <span class="control-pair">
+          <label for="export-to">To</label>
+          ${exportTo}
+        </span>
+        <span class="control-pair">
+          <label for="export-status">Status</label>
+          <select id="export-status" name="status"${selectDescribed}${selectInvalid}>
+            ${statusOptions}
+          </select>
+        </span>
         <button type="submit">Download CSV</button>
         <p class="hint" id="${EXPORT_HINT_ID}">Exports tasks created in this date range (UTC),
           both dates included.</p>

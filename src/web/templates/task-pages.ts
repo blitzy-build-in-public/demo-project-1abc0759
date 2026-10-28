@@ -276,16 +276,20 @@ export function renderTaskListPage(view: TaskListPageView): string {
   const body = html`<h1>Tasks</h1>
     <p><a href="/tasks/new">New task</a></p>
     <form method="get" action="/tasks" class="filters">
-      <label for="filter-status">Status</label>
-      <select id="filter-status" name="${LIST_FILTER_KEYS.status}">${selectOptions(
-        STATUS_FILTER_OPTIONS,
-        filters.status ?? '',
-      )}</select>
-      <label for="filter-priority">Priority</label>
-      <select id="filter-priority" name="${LIST_FILTER_KEYS.priority}">${selectOptions(
-        PRIORITY_FILTER_OPTIONS,
-        filters.priority ?? '',
-      )}</select>
+      <span class="control-pair">
+        <label for="filter-status">Status</label>
+        <select id="filter-status" name="${LIST_FILTER_KEYS.status}">${selectOptions(
+          STATUS_FILTER_OPTIONS,
+          filters.status ?? '',
+        )}</select>
+      </span>
+      <span class="control-pair">
+        <label for="filter-priority">Priority</label>
+        <select id="filter-priority" name="${LIST_FILTER_KEYS.priority}">${selectOptions(
+          PRIORITY_FILTER_OPTIONS,
+          filters.priority ?? '',
+        )}</select>
+      </span>
       <button type="submit">Apply filters</button>
       <a href="/tasks">Clear filters</a>
     </form>
